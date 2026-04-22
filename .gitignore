@@ -1,0 +1,30 @@
+# Python / env
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.nicegui/
+
+# Experiment artifacts (large, regenerable)
+wandb/
+*.ckpt
+*.pth
+
+# IDE / local
+.idea/
+.vscode/
+.claude/
+
+# Data directories — never commit
+images_raw/
+images_filtered/
+images_640/
+*_images/
+
+# Specsin / prediction CSVs generated per run
+*_specsin.csv
+predictions.csv
+predictions/
+
+# Local logs / scratch
+*.log
