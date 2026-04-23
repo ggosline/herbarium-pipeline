@@ -159,7 +159,7 @@ restore() {
   echo "Restored checkpoints to $CKPT"
 }
 
-case "${1:?usage: $0 {setup|download|prep|train|identify|backup|restore}}" in
+case "${1:?usage: $0 [setup|download|prep|train|identify|backup|restore]}" in
   setup)    setup ;;
   download) download ;;
   prep)     prep ;;
