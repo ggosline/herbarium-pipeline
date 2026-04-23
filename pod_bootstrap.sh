@@ -12,7 +12,8 @@ set -euo pipefail
 
 # ─── paths on the Network Volume ──────────────────────────────────────────
 WS=/workspace
-REPO=$WS/Pipeline
+# REPO = directory containing this script, so the name on disk doesn't matter
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA=$WS/data
 IMG_RAW=$DATA/images_raw
 IMG_FILT=$DATA/images_filtered
