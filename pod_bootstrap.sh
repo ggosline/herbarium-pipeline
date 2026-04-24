@@ -20,8 +20,9 @@ IMG_FILT=$DATA/images_filtered
 IMG_640=$DATA/images_640
 CKPT=$DATA/checkpoints
 SPECSIN=$DATA/specsin.csv
+DWCA=$DATA/gbif.zip               # set to "" to use API (--family) instead
 
-TAXON_FAMILY="Rubiaceae"          # edit per run
+TAXON_FAMILY="Rubiaceae"          # used only when DWCA is empty
 WANDB_PROJECT="herbarium"
 R2_REMOTE="r2:herbarium-backup"
 REPO_URL="https://github.com/ggosline/herbarium-pipeline.git"
@@ -84,11 +85,21 @@ activate() { source /root/venv/bin/activate; }
 # ─── step 1: download (runs fine on a CPU pod) ────────────────────────────
 download() {
   activate
-  python "$REPO/download_gbif_images.py" \
-    --family "$TAXON_FAMILY" \
-    --output-dir "$IMG_RAW" \
-    --specsin "$SPECSIN" \
-    --workers 16
+  if [ -n "$DWCA" ] && [ -f "$DWCA" ]; then
+    echo "Using local DwC-A: $DWCA"
+    python "$REPO/download_gbif_images.py" \
+      --dwca "$DWCA" \
+      --output-dir "$IMG_RAW" \
+      --specsin "$SPECSIN" \
+      --workers 16
+  else
+    echo "No DWCA zip at $DWCA — falling back to GBIF API (--family $TAXON_FAMILY)"
+    python "$REPO/download_gbif_images.py" \
+      --family "$TAXON_FAMILY" \
+      --output-dir "$IMG_RAW" \
+      --specsin "$SPECSIN" \
+      --workers 16
+  fi
 }
 
 # ─── step 2: filter + crop + resize ───────────────────────────────────────
