@@ -85,12 +85,16 @@ activate() { source /root/venv/bin/activate; }
 # ─── step 1: download (runs fine on a CPU pod) ────────────────────────────
 download() {
   activate
+  # IIIF size cap — GBIF/IIIF servers return a downscaled image. 1200 keeps
+  # plenty of headroom over the 640px training size while cutting disk ~10×.
+  IIIF=1200
   if [ -n "$DWCA" ] && [ -f "$DWCA" ]; then
-    echo "Using local DwC-A: $DWCA"
+    echo "Using local DwC-A: $DWCA (iiif-size=$IIIF)"
     python "$REPO/download_gbif_images.py" \
       --dwca "$DWCA" \
       --output-dir "$IMG_RAW" \
       --specsin "$SPECSIN" \
+      --iiif-size "$IIIF" \
       --workers 16
   else
     echo "No DWCA zip at $DWCA — falling back to GBIF API (--family $TAXON_FAMILY)"
@@ -98,6 +102,7 @@ download() {
       --family "$TAXON_FAMILY" \
       --output-dir "$IMG_RAW" \
       --specsin "$SPECSIN" \
+      --iiif-size "$IIIF" \
       --workers 16
   fi
 }
