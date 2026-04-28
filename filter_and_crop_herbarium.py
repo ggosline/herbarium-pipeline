@@ -323,10 +323,21 @@ def filter_crop_clip(paths: list[Path],
     model     = CLIPModel.from_pretrained(model_name).to(device)
     model.eval()
 
+    def _as_tensor(out):
+        # Some transformers versions / model cards make CLIPModel.get_*_features
+        # return a structured output (e.g. BaseModelOutputWithPooling) rather
+        # than a plain tensor. Unwrap both shapes so the rest of the pipeline
+        # doesn't care.
+        if hasattr(out, "pooler_output"):
+            return out.pooler_output
+        if hasattr(out, "last_hidden_state"):
+            return out.last_hidden_state.mean(dim=1)
+        return out
+
     with torch.no_grad():
         text_inputs   = processor(text=CLIP_PROMPTS, return_tensors="pt",
                                   padding=True).to(device)
-        text_features = model.get_text_features(**text_inputs)
+        text_features = _as_tensor(model.get_text_features(**text_inputs))
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
     logit_scale = model.logit_scale.exp()
 
@@ -355,7 +366,7 @@ def filter_crop_clip(paths: list[Path],
     def _classify_and_crop(arr_list: list, path_list: list[Path]):
         img_tensor = torch.from_numpy(np.stack(arr_list)).to(device)
         with torch.no_grad():
-            img_features = model.get_image_features(pixel_values=img_tensor)
+            img_features = _as_tensor(model.get_image_features(pixel_values=img_tensor))
             img_features = img_features / img_features.norm(dim=-1, keepdim=True)
             probs = (logit_scale * (img_features @ text_features.T)) \
                         .softmax(dim=-1).cpu().numpy()

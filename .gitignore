@@ -19,6 +19,7 @@ wandb/
 images_raw/
 images_filtered/
 images_640/
+images_1024/
 *_images/
 
 # Specsin / prediction CSVs generated per run

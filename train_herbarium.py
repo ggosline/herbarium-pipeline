@@ -22,9 +22,15 @@ Resume after crash:
 import argparse
 import json
 import math
+import os
 import sys
 from collections import Counter
 from pathlib import Path
+
+# Must be set before torch initializes the CUDA allocator. Reduces fragmentation
+# from variable-size activations (DALI + gradient checkpointing), letting batch=12
+# fit on 24 GB cards at ViT-Large / 640px.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import pandas as pd
@@ -365,6 +371,10 @@ class TimmModelHierarchical(nn.Module):
 class LitHerbarium(pl.LightningModule):
     def __init__(self, model, data: HerbariumData, config: dict):
         super().__init__()
+        # Embed config (model_name etc.) into the checkpoint so identify_herbarium.py
+        # can autodetect the architecture without --model.
+        # ignore non-serializable members; "model" and "data" are not hyperparams.
+        self.save_hyperparameters(config, ignore=[])
         self.model  = model
         self.data   = data
         self.config = config
@@ -871,7 +881,7 @@ def train(config: dict):
 
         s1_ckpt_cb = ModelCheckpoint(
             dirpath=str(output_dir / "checkpoints"),
-            filename="s1-epoch={epoch:02d}-val_loss={valid_loss:.4f}",
+            filename="s1-{epoch:02d}-{valid_loss:.4f}",
             monitor="valid_loss", save_top_k=1, save_last=True, mode="min",
         )
         print(f"\n{'='*50}\n"
@@ -909,7 +919,7 @@ def train(config: dict):
 
         checkpoint_cb = ModelCheckpoint(
             dirpath=str(output_dir / "checkpoints"),
-            filename="epoch={epoch:02d}-val_loss={valid_loss:.4f}",
+            filename="{epoch:02d}-{valid_loss:.4f}",
             monitor="valid_loss", save_top_k=1, save_last=True, mode="min",
         )
 
@@ -960,7 +970,7 @@ def train(config: dict):
 
         cooldown_ckpt_cb = ModelCheckpoint(
             dirpath=str(output_dir / "checkpoints"),
-            filename="cd-epoch={epoch:02d}-val_loss={valid_loss:.4f}",
+            filename="cd-{epoch:02d}-{valid_loss:.4f}",
             monitor="valid_loss", save_top_k=1, save_last=True, mode="min",
         )
         cooldown_trainer = build_trainer(
@@ -1002,8 +1012,8 @@ DEFAULT_CONFIG = dict(
     stage2_lr=0.0001,
     stage2_epochs=20,
     min_lr=1e-6,
-    batch_size=4,
-    accum=2,
+    batch_size=12,
+    accum=1,
     cooldown_epochs=0,
     cooldown_batch_size=5,
     cooldown_lr=0.0001,

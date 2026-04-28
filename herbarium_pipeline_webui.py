@@ -15,10 +15,21 @@ import asyncio
 import json
 import shlex
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
 from nicegui import app, ui
+
+from cloud import secrets as cloud_secrets
+from cloud.orchestrator import (
+    CloudOrchestrator,
+    DEFAULT_DATACENTER,
+    DEFAULT_VOLUME_GB,
+    GPU_BY_PURPOSE,
+    PodHandle,
+)
+from cloud.runpod_client import RunPodAPIError
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1825,16 +1836,22 @@ def _build_review() -> tuple:
 
     # ── UI ───────────────────────────────────────────────────────────────────
 
-    _section("Predictions CSV")
-    rev_csv  = _path_input("predictions.csv:", mode="file",
-                           value=app.storage.general.get("review_csv", ""))
-    rev_csv.bind_value(app.storage.general, "review_csv")
-    rev_imgs = _path_input("Images dir (if CSV has relative paths):", mode="dir",
-                           value=app.storage.general.get("review_imgs", ""))
-    rev_imgs.bind_value(app.storage.general, "review_imgs")
-    with ui.row().classes("w-full items-center gap-2 mt-1 ml-48"):
-        load_btn = (ui.button("Load", icon="upload_file")
-                    .props("color=primary unelevated"))
+    # Data-source settings collapse once a CSV is loaded so the image area
+    # gets most of the vertical real estate. Header summary stays visible.
+    _initial_csv = app.storage.general.get("review_csv", "")
+    settings_exp = (ui.expansion("⚙ Data source", icon="settings",
+                                 value=not bool(_initial_csv))
+                    .classes("w-full"))
+    with settings_exp:
+        rev_csv  = _path_input("predictions.csv:", mode="file",
+                               value=_initial_csv)
+        rev_csv.bind_value(app.storage.general, "review_csv")
+        rev_imgs = _path_input("Images dir (if CSV has relative paths):", mode="dir",
+                               value=app.storage.general.get("review_imgs", ""))
+        rev_imgs.bind_value(app.storage.general, "review_imgs")
+        with ui.row().classes("w-full items-center gap-2 mt-1 ml-48"):
+            load_btn = (ui.button("Load", icon="upload_file")
+                        .props("color=primary unelevated"))
     summary_lbl = ui.label("").classes("text-caption text-grey-7 mt-1")
 
     _section("Filter & Sort")
@@ -1864,26 +1881,30 @@ def _build_review() -> tuple:
                     .classes("self-end ml-auto")
                     .tooltip("Open full-screen review in a new tab"))
 
-    # Free-form AI filter
-    with ui.row().classes("w-full items-center gap-2 mt-2"):
-        ai_filter_inp = (ui.input(
-            placeholder="e.g.  genus Uvaria · confidence < 30% · none of top 5 correct")
-            .classes("flex-1").props("dense outlined clearable"))
-        ai_filter_btn = (ui.button("AI Filter", icon="auto_awesome")
-                         .props("unelevated dense color=deep-purple-4")
-                         .tooltip("Use Claude to interpret your query"))
-    ai_filter_lbl = ui.label("").classes("text-caption text-grey-6 mt-0")
+    # Free-form AI filter — collapsed by default; rarely changed mid-session.
+    with ui.expansion("✨ AI filter", icon="auto_awesome").classes("w-full"):
+        with ui.row().classes("w-full items-center gap-2"):
+            ai_filter_inp = (ui.input(
+                placeholder="e.g.  genus Uvaria · confidence < 30% · none of top 5 correct")
+                .classes("flex-1").props("dense outlined clearable"))
+            ai_filter_btn = (ui.button("AI Filter", icon="auto_awesome")
+                             .props("unelevated dense color=deep-purple-4")
+                             .tooltip("Use Claude to interpret your query"))
+        ai_filter_lbl = ui.label("").classes("text-caption text-grey-6 mt-0")
 
-    ui.separator().classes("my-3")
+    ui.separator().classes("my-2")
 
     # Carousel layout
     with ui.row().classes("w-full gap-4 items-start"):
 
-        # Left: image + nav
+        # Left: image + nav. Image grows with the viewport (carousel-like)
+        # rather than being pinned at 400px so the user can actually read
+        # the specimen labels without leaving the tab.
         with ui.column().classes("items-center gap-2").style(
-                "min-width:490px; max-width:490px"):
+                "min-width:560px; max-width:720px; flex:1 1 auto"):
             img_el = ui.image("").style(
-                "width:480px; height:400px; object-fit:contain;"
+                "width:100%; height:calc(100vh - 280px); min-height:420px;"
+                "object-fit:contain;"
                 "background:#f0f0f0; border-radius:6px; border:1px solid #ddd")
             counter_lbl = ui.label("").classes("text-caption text-grey-6")
             with ui.row().classes("gap-2 items-center"):
@@ -1896,7 +1917,15 @@ def _build_review() -> tuple:
                 open_btn = (ui.button(icon="open_in_new",
                                       on_click=lambda: _open_file())
                             .props("round flat dense")
-                            .tooltip("Open full image"))
+                            .tooltip("Open local 640px image"))
+                gbif_btn = (ui.button(icon="public",
+                                      on_click=lambda: _open_gbif())
+                            .props("round flat dense")
+                            .tooltip("Open occurrence on gbif.org"))
+                origin_btn = (ui.button(icon="zoom_out_map",
+                                        on_click=lambda: _open_original())
+                              .props("round flat dense")
+                              .tooltip("Open original full-resolution image"))
 
         # Right: info + bars + actions
         with ui.column().classes("flex-1 gap-1").style("min-width:280px"):
@@ -1920,16 +1949,26 @@ def _build_review() -> tuple:
     # ── logic ────────────────────────────────────────────────────────────────
 
     def _resolve_path(row) -> str:
-        """Return absolute image path, trying abs_path → filename → imgs_dir/fname."""
-        for col in ("abs_path", "filename"):
-            v = row.get(col, "")
-            if v and v == v and str(v) not in ("", "nan"):  # non-NaN, non-empty
-                return str(v)
+        """Return absolute image path.
+
+        Priority: imgs_dir/fname (if imgs_dir is configured — handles cloud
+        predictions whose abs_path points at the pod) → abs_path → filename.
+        The first existing file wins; otherwise the first non-empty candidate
+        is returned so missing-image errors surface instead of being silenced.
+        """
         fname = str(row.get("fname", ""))
         imgs  = _v(rev_imgs)
+        candidates: list[str] = []
         if fname and imgs:
-            return str(Path(imgs) / fname)
-        return ""
+            candidates.append(str(Path(imgs) / fname))
+        for col in ("abs_path", "filename"):
+            v = row.get(col, "")
+            if v and v == v and str(v) not in ("", "nan"):
+                candidates.append(str(v))
+        for c in candidates:
+            if Path(c).is_file():
+                return c
+        return candidates[0] if candidates else ""
 
     def _get_top5(row) -> list[str]:
         if "top1_name" in row.index:
@@ -2146,11 +2185,36 @@ def _build_review() -> tuple:
         view = _st["view"]
         if view is None or len(view) == 0:
             return
-        import subprocess as _sp
         row  = view.iloc[_st["idx"]]
-        path = str(row.get("abs_path", row.get("filename", "")))
-        if path and Path(path).is_file():
-            _sp.Popen(["xdg-open", path], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        path = _resolve_path(row)
+        if not path or not Path(path).is_file():
+            ui.notify(f"Local image not found: {path or '(no path)'}", type="warning")
+            return
+        # Open via the same static route the carousel uses — works cross-platform,
+        # no xdg-open / wslview dependency.
+        ui.navigate.to(_review_img_url(path), new_tab=True)
+
+    def _row_field(name: str) -> str:
+        view = _st["view"]
+        if view is None or len(view) == 0:
+            return ""
+        v = view.iloc[_st["idx"]].get(name, "")
+        s = str(v).strip()
+        return "" if s.lower() in ("nan", "none") else s
+
+    def _open_gbif():
+        gid = _row_field("gbifID")
+        if not gid:
+            ui.notify("No gbifID on this row.", type="warning"); return
+        ui.navigate.to(f"https://www.gbif.org/occurrence/{gid}", new_tab=True)
+
+    def _open_original():
+        url = _row_field("image_url")
+        if not url:
+            ui.notify("No image_url on this row — re-download with the new schema to populate it.",
+                      type="warning")
+            return
+        ui.navigate.to(url, new_tab=True)
 
     def _write_back(op: str):
         """Shared write-back logic for confirm and mark-invalid."""
@@ -2530,6 +2594,569 @@ def _build_confusion() -> "ui.input":
     return conf_csv
 
 
+# ---------------------------------------------------------------------------
+# Cloud tab — orchestrates a RunPod GPU pod from this UI for users without
+# a local GPU. Wraps the cloud/ subpackage; nothing here knows about REST or
+# SSH directly.
+# ---------------------------------------------------------------------------
+
+# Per-process cloud state. NiceGUI runs in a single asyncio loop so a plain
+# dict is safe; we keep it scoped to the cloud tab to avoid interfering with
+# the local pipeline globals (_proc, _stop_btn).
+_cloud: dict = {"orch": None, "pod": None, "task": None}
+
+
+def _cloud_log(line: str) -> None:
+    """Adapter: orchestrator emits plain strings, log widget wants newlines."""
+    try:
+        _log.push(line if line.endswith("\n") else line + "\n")
+    except RuntimeError:
+        pass  # client navigated away
+
+
+def _build_cloud() -> None:
+    gs = app.storage.general
+
+    # ── Setup card: API key + SSH key ────────────────────────────────────
+    _section("RunPod credentials  (stored in your OS keyring, never on disk)")
+
+    with ui.row().classes("w-full items-center gap-2"):
+        ui.label("API key:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
+        api_inp = (ui.input(placeholder="rpa_…  (create at runpod.io → Settings → API Keys)")
+                   .classes("flex-1").props("dense outlined type=password"))
+        api_status = ui.label("").classes("text-caption")
+
+        def _refresh_key_status() -> None:
+            if cloud_secrets.get_runpod_api_key():
+                api_status.set_text("✓ saved")
+                api_status.style("color:#2e7d32")
+            else:
+                api_status.set_text("not set")
+                api_status.style("color:#c62828")
+        _refresh_key_status()
+
+        def _save_key() -> None:
+            v = (api_inp.value or "").strip()
+            if not v:
+                ui.notify("Paste a key first.", type="warning"); return
+            try:
+                cloud_secrets.set_runpod_api_key(v)
+            except Exception as e:
+                ui.notify(f"Keyring save failed: {e}", type="negative"); return
+            api_inp.value = ""  # don't leave plaintext in the field
+            _refresh_key_status()
+            # Force orchestrator to reload from keyring next provision
+            _cloud["orch"] = None
+            ui.notify("API key saved to OS keyring.", type="positive")
+
+        def _forget_key() -> None:
+            cloud_secrets.delete_runpod_api_key()
+            _refresh_key_status()
+            _cloud["orch"] = None
+            ui.notify("API key removed from keyring.", type="info")
+
+        ui.button("Save", on_click=_save_key).props("flat dense color=primary")
+        ui.button("Forget", on_click=_forget_key).props("flat dense")
+
+    with ui.row().classes("w-full items-center gap-2"):
+        ui.label("WandB key:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
+        wb_inp = (ui.input(placeholder="wandb API key — find at wandb.ai/authorize")
+                  .classes("flex-1").props("dense outlined type=password"))
+        wb_status = ui.label("").classes("text-caption")
+
+        def _refresh_wb_status() -> None:
+            if cloud_secrets.get_wandb_api_key():
+                wb_status.set_text("✓ saved")
+                wb_status.style("color:#2e7d32")
+            else:
+                wb_status.set_text("not set — training will log to CSV only")
+                wb_status.style("color:#c62828")
+        _refresh_wb_status()
+
+        def _save_wb() -> None:
+            v = (wb_inp.value or "").strip()
+            if not v:
+                ui.notify("Paste a key first.", type="warning"); return
+            try:
+                cloud_secrets.set_wandb_api_key(v)
+            except Exception as e:
+                ui.notify(f"Keyring save failed: {e}", type="negative"); return
+            wb_inp.value = ""
+            _refresh_wb_status()
+            ui.notify("WandB key saved. It'll be pushed to /workspace/.wandb_key on next code sync.",
+                      type="positive")
+
+        def _forget_wb() -> None:
+            cloud_secrets.delete_wandb_api_key()
+            _refresh_wb_status()
+            ui.notify("WandB key removed from keyring.", type="info")
+
+        ui.button("Save", on_click=_save_wb).props("flat dense color=primary")
+        ui.button("Forget", on_click=_forget_wb).props("flat dense")
+
+    default_key = str(Path.home() / ".ssh" / "id_ed25519_herbarium")
+    ssh_key_inp = (_path_input("SSH private key:", value=default_key, mode="file",
+                               hint="Passwordless key whose .pub is registered in RunPod → Settings → SSH Keys")
+                   .bind_value(gs, "cloud_ssh_key"))
+
+    ui.label(
+        "RunPod auto-injects whatever public keys you've registered into every pod. "
+        "Use a passwordless automation key here so steps don't pause for a passphrase."
+    ).classes("text-caption text-grey-7 ml-40")
+
+    # ── Project & resources ──────────────────────────────────────────────
+    _section("Pod settings")
+
+    with ui.row().classes("w-full items-center gap-2"):
+        ui.label("Project name:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
+        proj_lbl = ui.label("").classes("flex-1 font-medium").style("color:#1a237e")
+
+        def _refresh_proj() -> None:
+            proj_lbl.set_text(gs.get("main_proj") or "— set Project name at the top of the page —")
+        _refresh_proj()
+
+    with ui.row().classes("w-full items-center gap-4 flex-wrap"):
+        with ui.row().classes("items-center gap-1"):
+            ui.label("Purpose:").classes("text-sm")
+            purpose_radio = (ui.radio({"light": "light (L4) — download / prep / identify",
+                                       "train": "train (RTX 4090) — long GPU run"},
+                                      value="light").props("inline dense")
+                             .bind_value(gs, "cloud_purpose"))
+
+    with ui.row().classes("w-full items-center gap-4 flex-wrap"):
+        with ui.row().classes("items-center gap-1"):
+            ui.label("GPU type override:").classes("text-sm")
+            gpu_inp = (ui.input(placeholder="(blank = use purpose default)").classes("w-56")
+                       .props("dense outlined")
+                       .bind_value(gs, "cloud_gpu_override"))
+        with ui.row().classes("items-center gap-1"):
+            ui.label("Datacenter:").classes("text-sm")
+            dc_inp = (ui.input(value=DEFAULT_DATACENTER).classes("w-32")
+                      .props("dense outlined")
+                      .bind_value(gs, "cloud_datacenter"))
+        with ui.row().classes("items-center gap-1"):
+            ui.label("Volume size (GB):").classes("text-sm")
+            vol_inp = (ui.input(value=str(DEFAULT_VOLUME_GB)).classes("w-20")
+                       .props("dense outlined")
+                       .bind_value(gs, "cloud_volume_gb"))
+
+    _section("Download caps  (apply only to the Download step)")
+    with ui.row().classes("w-full items-center gap-4 flex-wrap"):
+        with ui.row().classes("items-center gap-1"):
+            ui.label("Max per species:").classes("text-sm")
+            cl_max_per_sp = (ui.input(value="").classes("w-20")
+                             .props("dense outlined placeholder=all")
+                             .bind_value(gs, "cloud_max_per_sp"))
+        with ui.row().classes("items-center gap-1"):
+            ui.label("Total limit:").classes("text-sm")
+            cl_limit = (ui.input(value="").classes("w-20")
+                        .props("dense outlined placeholder=all")
+                        .bind_value(gs, "cloud_limit"))
+        with ui.row().classes("items-center gap-1"):
+            ui.label("IIIF size (px):").classes("text-sm")
+            cl_iiif = (ui.input(value="1200").classes("w-24")
+                       .props("dense outlined")
+                       .bind_value(gs, "cloud_iiif"))
+        with ui.row().classes("items-center gap-1"):
+            ui.label("Resize after download (px):").classes("text-sm")
+            cl_max_size = (ui.input(value="1200").classes("w-24")
+                           .props("dense outlined")
+                           .bind_value(gs, "cloud_max_size"))
+    ui.label(
+        "Tip: many institutions ignore the IIIF size param and serve full scans, "
+        "so set Resize-after-download as well — it shrinks each image with PIL "
+        "right after fetch, regardless of what the server returned."
+    ).classes("text-caption text-grey-7 ml-2")
+    ui.label(
+        "Tip: re-export your DwC-A from GBIF with tighter geographic / dataset "
+        "filters for the cleanest cut. The caps above are a quick second-line defence."
+    ).classes("text-caption text-grey-7 ml-2")
+
+    # ── Live status ──────────────────────────────────────────────────────
+    _section("Status")
+    with ui.row().classes("w-full items-center gap-4 flex-wrap"):
+        pod_lbl = ui.label("No active pod").style("color:#455a64")
+        cost_lbl = ui.label("$0.0000").classes("font-mono").style("color:#00695c; font-weight:600")
+        step_lbl = ui.label("").style("color:#455a64")
+
+    # SFTP transfer progress (shown only while a transfer is in flight).
+    progress_bar = ui.linear_progress(value=0.0, show_value=False).classes("w-full")
+    progress_lbl = ui.label("").classes("text-caption text-grey-7 font-mono")
+    progress_bar.visible = False
+    progress_lbl.visible = False
+
+    def _make_progress_cb(prefix: str):
+        """Thread-safe progress callback for paramiko SFTP transfers.
+
+        paramiko invokes the callback from its IO thread; we marshal updates
+        onto the asyncio loop via ``call_soon_threadsafe`` and throttle to
+        ~10 Hz so a fast network doesn't flood the websocket. The bar only
+        appears once bytes actually start flowing — short-circuited uploads
+        (e.g. DwC-A unchanged) leave it hidden.
+        """
+        loop = asyncio.get_running_loop()
+        last_t = [0.0]
+        shown = [False]
+
+        def cb(transferred: int, total: int) -> None:
+            if not shown[0]:
+                shown[0] = True
+                loop.call_soon_threadsafe(_show_progress)
+            now = time.monotonic()
+            # Always emit the final 100% update; throttle the rest.
+            if transferred < total and (now - last_t[0]) < 0.1:
+                return
+            last_t[0] = now
+            mb_t = transferred / (1 << 20)
+            text = (f"{prefix}: {mb_t:.1f} / {total / (1 << 20):.1f} MB"
+                    if total else f"{prefix}: {mb_t:.1f} MB")
+            value = (transferred / total) if total > 0 else 0.0
+
+            def _apply():
+                progress_bar.value = value
+                progress_lbl.set_text(text)
+            loop.call_soon_threadsafe(_apply)
+        return cb
+
+    def _show_progress() -> None:
+        progress_bar.visible = True
+        progress_lbl.visible = True
+
+    def _hide_progress() -> None:
+        progress_bar.value = 0.0
+        progress_bar.visible = False
+        progress_lbl.set_text("")
+        progress_lbl.visible = False
+
+    def _refresh_status() -> None:
+        orch: CloudOrchestrator | None = _cloud["orch"]
+        pod: PodHandle | None = _cloud["pod"]
+        if pod and orch:
+            pod_lbl.set_text(f"pod {pod.pod_id}  {pod.ssh_host}:{pod.ssh_port}  "
+                             f"${pod.cost_per_hr:.2f}/hr")
+            cost_lbl.set_text(f"${orch.current_cost_usd():.4f}")
+            step_lbl.set_text(f"step: {orch.state.current_step or '(idle)'}")
+        else:
+            pod_lbl.set_text("No active pod")
+            cost_lbl.set_text("$0.0000")
+            step_lbl.set_text("")
+
+    ui.timer(30.0, _refresh_status)
+
+    # ── Pipeline buttons ─────────────────────────────────────────────────
+    _section("Pipeline")
+
+    def _running() -> bool:
+        t = _cloud["task"]
+        return t is not None and not t.done()
+
+    def _warn(msg: str) -> None:
+        """Background-task-safe replacement for ui.notify(type='warning')."""
+        _cloud_log(f"⚠ {msg}")
+
+    def _err(msg: str) -> None:
+        _cloud_log(f"✗ {msg}")
+
+    def _info(msg: str) -> None:
+        _cloud_log(f"• {msg}")
+
+    def _ensure_orch() -> Optional[CloudOrchestrator]:
+        if _cloud["orch"] is not None:
+            return _cloud["orch"]
+        api_key = cloud_secrets.get_runpod_api_key()
+        if not api_key:
+            _warn("Save your RunPod API key first."); return None
+        proj = (gs.get("main_proj") or "").strip()
+        if not proj:
+            _warn("Set the Project name at the top of the page first."); return None
+        ssh_key = (ssh_key_inp.value or "").strip() or None
+        _cloud["orch"] = CloudOrchestrator(api_key, proj, key_filename=ssh_key)
+        return _cloud["orch"]
+
+    def _wrap(coro_factory):
+        """Run an orchestrator coroutine as the single in-flight cloud task.
+
+        ui.notify is unsafe inside a background task (it creates a transient
+        UI element and needs a current slot context), so the task body
+        reports through ``_cloud_log`` instead. Only synchronous click
+        handlers should call ui.notify directly.
+        """
+        if _running():
+            ui.notify("A cloud step is already running.", type="warning"); return
+        async def _run():
+            try:
+                await coro_factory()
+            except asyncio.CancelledError:
+                _cloud_log("[cancelled]")
+                raise
+            except Exception as e:
+                _err(f"Cloud step failed: {e!r}")
+            finally:
+                _hide_progress()
+                _refresh_status()
+        _cloud["task"] = asyncio.create_task(_run())
+
+    # --- Provision / lifecycle ---
+    async def _do_provision() -> None:
+        orch = _ensure_orch()
+        if orch is None: return
+        gpu = (gpu_inp.value or "").strip() or None
+        dc = (dc_inp.value or "").strip() or DEFAULT_DATACENTER
+        try:
+            vol_gb = int((vol_inp.value or DEFAULT_VOLUME_GB))
+        except ValueError:
+            _warn("Volume size must be an integer."); return
+        pod = await orch.provision(
+            purpose=purpose_radio.value, gpu_type=gpu,
+            data_center_id=dc, volume_gb=vol_gb,
+            on_log=_cloud_log,
+        )
+        _cloud["pod"] = pod
+        # First action on a fresh pod: push our local code up so the bootstrap
+        # script the orchestrator invokes is the one running on this machine.
+        await orch.sync_code(pod, on_log=_cloud_log)
+        _refresh_status()
+
+    async def _do_step(step: str) -> None:
+        orch = _cloud["orch"]; pod = _cloud["pod"]
+        if not (orch and pod):
+            _warn("Provision a pod first."); return
+        env: dict[str, str] = {}
+        if step == "download":
+            mps = (cl_max_per_sp.value or "").strip()
+            lim = (cl_limit.value or "").strip()
+            iiif = (cl_iiif.value or "").strip()
+            mxs = (cl_max_size.value or "").strip()
+            if mps:  env["MAX_PER_SP"] = mps
+            if lim:  env["LIMIT"] = lim
+            if iiif: env["IIIF"] = iiif
+            if mxs:  env["MAX_SIZE"] = mxs
+        elif step == "train":
+            # Pull from the same gs[…] keys the Train tab binds to. The pod
+            # bootstrap's train() reads each var with a hardcoded fallback,
+            # so any absent key just keeps the default.
+            mapping = {
+                "MODEL":               gs.get("tr_model"),
+                "IMAGE_SZ":            gs.get("tr_imgsz"),
+                "BATCH_SIZE":          gs.get("tr_batch"),
+                "ACCUM":               gs.get("tr_accum"),
+                "STAGE2_BATCH_SIZE":   gs.get("tr_s2_batch"),
+                "STAGE1_EPOCHS":       gs.get("tr_s1ep"),
+                "STAGE1_LR":           gs.get("tr_s1lr"),
+                "STAGE2_EPOCHS":       gs.get("tr_s2ep"),
+                "STAGE2_LR":           gs.get("tr_s2lr"),
+                "COOLDOWN_EPOCHS":     gs.get("tr_cd_ep"),
+                "COOLDOWN_LR":         gs.get("tr_cd_lr"),
+                "COOLDOWN_BATCH_SIZE": gs.get("tr_cd_batch"),
+                "COOLDOWN_ACCUM":      gs.get("tr_cd_accum"),
+                "NUM_GPUS":            gs.get("tr_gpus"),
+                "MAX_PER_SP":          gs.get("tr_max_per_sp"),
+                "LABEL_LEVEL":         gs.get("tr_label_level"),
+                "GEO_DIM":             gs.get("tr_geo_dim"),
+                "SPECIES_WEIGHT":      gs.get("tr_w_sp"),
+                "GENUS_WEIGHT":        gs.get("tr_w_ge"),
+                "FAMILY_WEIGHT":       gs.get("tr_w_fa"),
+                "WANDB_RUN_NAME":      gs.get("tr_wandb_name"),
+            }
+            for k, v in mapping.items():
+                s = (str(v).strip() if v is not None else "")
+                if s:
+                    env[k] = s
+            if gs.get("tr_hier"):           env["HIERARCHICAL"]    = "1"
+            if gs.get("tr_use_location"):   env["USE_LOCATION"]    = "1"
+            if gs.get("tr_reset_optimizer"): env["RESET_OPTIMIZER"] = "1"
+            # Show the user what's about to ship
+            _cloud_log("Train env: " + " ".join(f"{k}={v}" for k, v in env.items()))
+        rc = await orch.run_step(pod, step, env=env, on_log=_cloud_log)
+        if rc != 0:
+            _err(f"Step {step} exited {rc}")
+
+    async def _do_upload_dwca() -> None:
+        orch = _cloud["orch"]; pod = _cloud["pod"]
+        if not (orch and pod):
+            _warn("Provision a pod first."); return
+        local = (gs.get("dl_dwca") or "").strip()
+        if not local:
+            _warn("No DwC-A path. Set it in Tab 1 (Download)."); return
+        cb = _make_progress_cb(f"upload {Path(local).name}")
+        await orch.upload_dwca(pod, local, on_log=_cloud_log, on_progress=cb)
+
+    async def _do_download_results() -> None:
+        orch = _cloud["orch"]; pod = _cloud["pod"]
+        if not (orch and pod):
+            _warn("Provision a pod first."); return
+        base = gs.get("main_base_dir") or str(Path.home())
+        proj = gs.get("main_proj") or orch.project
+        local_dir = Path(base) / proj / "cloud_results"
+        cb = _make_progress_cb("download")
+        written = await orch.download_results(pod, local_dir, on_log=_cloud_log, on_progress=cb)
+        # Auto-populate Identify + Review tab fields with the freshly-pulled paths
+        # so the user can move on without re-typing them.
+        names = {p.name: str(p) for p in written}
+        if "last.ckpt" in names:        gs["id_ckpt"]    = names["last.ckpt"]
+        if "nameslist.json" in names:   gs["id_nl"]      = names["nameslist.json"]
+        if "predictions.csv" in names:
+            gs["review_csv"] = names["predictions.csv"]
+        _info(f"Downloaded {len(written)} file(s) to {local_dir}")
+
+    async def _do_download_images() -> None:
+        orch = _cloud["orch"]; pod = _cloud["pod"]
+        if not (orch and pod):
+            _warn("Provision a pod first."); return
+        base = gs.get("main_base_dir") or str(Path.home())
+        proj = gs.get("main_proj") or orch.project
+        local_dir = Path(base) / proj / "cloud_results"
+        cb = _make_progress_cb("images_1024.tar")
+        out = await orch.download_images(pod, local_dir, on_log=_cloud_log, on_progress=cb)
+        gs["review_imgs"] = str(out)
+        _info(f"Pulled images → {out}")
+
+    async def _do_terminate(*, keep_volume: bool) -> None:
+        orch = _cloud["orch"]; pod = _cloud["pod"]
+        if not (orch and pod):
+            _info("No active pod."); return
+        # Non-dismissible modal so the user can't close the window mid-call
+        # and leave the pod running. We control its lifecycle by hand —
+        # only close it ourselves after the API call returns.
+        with ui.dialog().props("persistent no-esc-dismiss no-backdrop-dismiss") as dlg, ui.card():
+            ui.label("Terminating pod…").classes("text-h6")
+            ui.label("DO NOT close this window until termination is confirmed.")\
+                .classes("text-caption text-red-9")
+            ui.spinner(size="lg").classes("self-center my-2")
+            status = ui.label("Calling RunPod API…").classes("text-caption")
+            close_btn = ui.button("Close", on_click=dlg.close).props("flat")
+            close_btn.disable()
+        dlg.open()
+        try:
+            await orch.terminate(pod, keep_volume=keep_volume, on_log=_cloud_log)
+            _cloud["pod"] = None
+            status.text = "✓ Pod terminated. Safe to close."
+        except Exception as e:
+            status.text = f"✗ Terminate failed: {e!r}  — check RunPod console."
+            _err(f"Terminate failed: {e!r}")
+        finally:
+            close_btn.enable()
+            _refresh_status()
+
+    def _confirm_terminate(keep_volume: bool) -> None:
+        label = "Terminate (keep volume)" if keep_volume else "Terminate + DELETE volume"
+        with ui.dialog() as dlg, ui.card():
+            ui.label(label + "?").classes("text-h6")
+            if not keep_volume:
+                ui.label("Volume deletion is irreversible — all images and "
+                         "checkpoints not previously downloaded will be lost.")\
+                    .classes("text-caption text-red-9")
+            with ui.row().classes("w-full justify-end gap-2 mt-2"):
+                ui.button("Cancel", on_click=dlg.close).props("flat")
+                def _ok() -> None:
+                    dlg.close()
+                    _wrap(lambda: _do_terminate(keep_volume=keep_volume))
+                ui.button("Terminate", on_click=_ok).props("color=negative unelevated")
+        dlg.open()
+
+    async def _do_wipe(target: str) -> None:
+        """Run ``rm -rf`` against a known pod-side path. ``target`` keys a
+        whitelist so the user can't accidentally type a destructive command."""
+        orch = _cloud["orch"]; pod = _cloud["pod"]
+        if not (orch and pod):
+            _warn("Provision a pod first."); return
+        targets = {
+            "images_raw":      "/workspace/data/images_raw",
+            "images_filtered": "/workspace/data/images_filtered",
+            "images_1024":      "/workspace/data/images_1024",
+            "predictions":     "/workspace/data/predictions",
+        }
+        path = targets[target]
+        from cloud.pod_session import PodSession
+        # Reuse the orchestrator's cached session.
+        session = await orch._ensure_session(pod, on_log=_cloud_log)  # type: ignore[attr-defined]
+        _cloud_log(f"$ rm -rf {path} && mkdir -p {path}")
+        rc, out = await session.exec_capture(
+            f"rm -rf {path} && mkdir -p {path} && echo cleared"
+        )
+        if rc == 0:
+            _info(f"Wiped {path}")
+        else:
+            _err(f"Wipe failed (rc={rc}): {out.strip()}")
+
+    def _confirm_wipe(target: str, label: str) -> None:
+        """Open a confirmation dialog from a sync click handler, then wrap
+        the actual wipe as a background task on OK."""
+        with ui.dialog() as dlg, ui.card():
+            ui.label(f"Delete {label} on the pod?").classes("text-h6")
+            ui.label(f"Path: /workspace/data/{target}").classes("text-caption")
+            ui.label("This is irreversible. Files not previously downloaded "
+                     "to this machine will be lost.").classes("text-caption text-red-9")
+            with ui.row().classes("w-full justify-end gap-2 mt-2"):
+                ui.button("Cancel", on_click=dlg.close).props("flat")
+                def _ok() -> None:
+                    dlg.close()
+                    _wrap(lambda: _do_wipe(target))
+                ui.button("Wipe", on_click=_ok).props("color=negative unelevated")
+        dlg.open()
+
+    def _cancel_running() -> None:
+        t = _cloud["task"]
+        if t is not None and not t.done():
+            t.cancel()
+            ui.notify("Cancellation requested.", type="info")
+
+    # Buttons — laid out by flow stage
+    with ui.row().classes("w-full gap-2 mt-2 flex-wrap"):
+        ui.button("Provision + sync code", icon="cloud_upload",
+                  on_click=lambda: _wrap(_do_provision)
+                  ).props("color=primary unelevated")
+        ui.button("Upload DwC-A", icon="archive",
+                  on_click=lambda: _wrap(_do_upload_dwca)
+                  ).props("flat color=primary")
+
+    with ui.row().classes("w-full gap-2 mt-1 flex-wrap"):
+        for step in ("setup", "download", "prep", "train", "identify"):
+            ui.button(step.capitalize(),
+                      on_click=lambda s=step: _wrap(lambda s=s: _do_step(s))
+                      ).props("flat dense")
+
+    with ui.row().classes("w-full gap-2 mt-1 flex-wrap items-center"):
+        ui.label("Wipe on pod:").classes("text-sm text-grey-7")
+        ui.button("images_raw",
+                  on_click=lambda: _confirm_wipe("images_raw", "raw downloaded images")
+                  ).props("flat dense color=negative")
+        ui.button("images_filtered",
+                  on_click=lambda: _confirm_wipe("images_filtered", "filter+crop output")
+                  ).props("flat dense color=negative")
+        ui.button("images_1024",
+                  on_click=lambda: _confirm_wipe("images_1024", "resized training images")
+                  ).props("flat dense color=negative")
+        ui.button("predictions",
+                  on_click=lambda: _confirm_wipe("predictions", "identify output")
+                  ).props("flat dense color=negative")
+
+    with ui.row().classes("w-full gap-2 mt-1 flex-wrap"):
+        ui.button("Download results", icon="download",
+                  on_click=lambda: _wrap(_do_download_results)
+                  ).props("flat color=primary")
+        ui.button("Pull images_1024", icon="image",
+                  on_click=lambda: _wrap(_do_download_images)
+                  ).props("flat color=primary")
+        ui.button("Cancel running step", icon="stop",
+                  on_click=_cancel_running).props("flat color=warning")
+        ui.button("Terminate (keep volume)", icon="power_settings_new",
+                  on_click=lambda: _confirm_terminate(keep_volume=True)
+                  ).props("flat color=negative")
+        ui.button("Terminate + delete volume", icon="delete_forever",
+                  on_click=lambda: _confirm_terminate(keep_volume=False)
+                  ).props("flat color=negative")
+
+    ui.label(
+        "Suggested order:  Provision → Upload DwC-A → Setup → Download → Prep → "
+        "(re-Provision with purpose=train) → Train → Identify → Download results → Terminate. "
+        "State persists in ~/.herbarium-cloud — closing the desktop app and reopening picks the pod back up."
+    ).classes("text-caption text-grey-7 mt-2")
+
+    # Surface the project-name change without a full page reload.
+    ui.timer(2.0, _refresh_proj)
+
+
 def _build_run_all(dl_cmd, fc_cmd, rs_cmd, tr_cmd, id_cmd) -> None:
     ui.label("Runs steps in sequence using the settings configured in each tab."
              ).classes("text-body1 mt-2")
@@ -2654,14 +3281,21 @@ def carousel_page():
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _resolve(row) -> str:
+        # Mirror Review tab: imgs_dir/fname wins when configured, since
+        # cloud predictions have abs_path pointing at the pod (e.g.
+        # /workspace/data/images_1024/...) which doesn't exist locally.
+        fname = str(row.get("fname", ""))
+        candidates: list[str] = []
+        if fname and imgs_dir:
+            candidates.append(str(Path(imgs_dir) / fname))
         for col in ("abs_path", "filename"):
             v = row.get(col, "")
             if v and v == v and str(v) not in ("", "nan"):
-                return str(v)
-        fname = str(row.get("fname", ""))
-        if fname and imgs_dir:
-            return str(Path(imgs_dir) / fname)
-        return ""
+                candidates.append(str(v))
+        for c in candidates:
+            if Path(c).is_file():
+                return c
+        return candidates[0] if candidates else ""
 
     def _top5(row) -> list[tuple[str, float]]:
         if "top1_name" in row.index:
@@ -2887,6 +3521,7 @@ def main_page():
                     t_rs     = ui.tab("3  Resize")
                     t_tr     = ui.tab("4  Train")
                     t_id     = ui.tab("5  Identify")
+                    t_cloud    = ui.tab("☁ Cloud")
                     t_review   = ui.tab("Review")
                     t_conf     = ui.tab("Analysis")
                     t_qi       = ui.tab("Quick ID")
@@ -2910,6 +3545,9 @@ def main_page():
 
                     with ui.tab_panel(t_id).classes("p-4"):
                         id_cmd, id_ckpt, id_nl, id_out, id_sources = _build_identify(tr_model)
+
+                    with ui.tab_panel(t_cloud).classes("p-4"):
+                        _build_cloud()
 
                     with ui.tab_panel(t_review).classes("p-4"):
                         review_csv, review_imgs = _build_review()

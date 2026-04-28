@@ -56,6 +56,7 @@ class InferenceDataset(Dataset):
                  geo_coords: torch.Tensor | None = None):
         self.paths = paths
         self.geo   = geo_coords  # [N, 4] or None
+        self.image_sz = image_sz
         self.transform = transforms.Compose([
             transforms.Resize(image_sz),
             transforms.CenterCrop(image_sz),
@@ -73,8 +74,7 @@ class InferenceDataset(Dataset):
             img = Image.open(path).convert("RGB")
             return self.transform(img), str(path), geo
         except Exception:
-            blank = torch.zeros(3, self.transform.transforms[1].size,
-                                self.transform.transforms[1].size)
+            blank = torch.zeros(3, self.image_sz, self.image_sz)
             return blank, str(path), geo
 
 
@@ -441,6 +441,13 @@ def identify(args):
         frames.append(df)
     df_all = pd.concat(frames, ignore_index=True)
     df_all = df_all[df_all["hasfile"].astype(str).str.lower().isin(("true", "1"))]
+    # Defensive: hasfile may be stale (resize failures, manual deletes). Drop rows
+    # whose image is actually missing on disk so workers don't crash mid-batch.
+    exists = df_all["abs_path"].apply(lambda p: Path(p).is_file())
+    n_missing = int((~exists).sum())
+    if n_missing:
+        print(f"  WARNING: {n_missing} rows have hasfile=True but file is missing on disk — skipping")
+    df_all = df_all[exists].copy()
     print(f"Total images with files: {len(df_all):,}")
 
     # Build species → family lookup from specsin metadata (may be absent in older CSVs)
@@ -500,6 +507,8 @@ def identify(args):
                 "abs_path":       row.abs_path,
                 "specsin_file":   row.specsin_file,
                 "source":         row.img_dir,
+                "gbifID":         str(getattr(row, "gbifID", "") or ""),
+                "image_url":      str(getattr(row, "image_url", "") or ""),
                 "decimalLatitude":  getattr(row, "decimalLatitude",  ""),
                 "decimalLongitude": getattr(row, "decimalLongitude", ""),
                 "true_species":   "",
@@ -546,6 +555,8 @@ def identify(args):
                 "abs_path":       row.abs_path,
                 "specsin_file":   row.specsin_file,
                 "source":         row.img_dir,
+                "gbifID":         str(getattr(row, "gbifID", "") or ""),
+                "image_url":      str(getattr(row, "image_url", "") or ""),
                 "decimalLatitude":  getattr(row, "decimalLatitude",  ""),
                 "decimalLongitude": getattr(row, "decimalLongitude", ""),
                 "true_species":   true_species,

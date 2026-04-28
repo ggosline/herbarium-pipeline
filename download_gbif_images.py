@@ -48,7 +48,8 @@ SPECSIN_COLS = [
     "catalogNumber", "species", "verbatimName", "family", "genus",
     "institutionID", "institutionCode", "countryCode",
     "decimalLatitude", "decimalLongitude", "coordinateUncertaintyInMeters",
-    "gbifID", "indet", "fname", "hasfile", "sparse", "outlier", "invalid",
+    "gbifID", "image_url",
+    "indet", "fname", "hasfile", "sparse", "outlier", "invalid",
 ]
 
 VALID_CONTINENTS = {
@@ -277,7 +278,7 @@ def get_image_urls(record: dict) -> list[str]:
     ]
 
 
-def record_to_row(record: dict, fname: str, hasfile: bool) -> dict:
+def record_to_row(record: dict, fname: str, hasfile: bool, image_url: str = "") -> dict:
     """Convert a GBIF occurrence dict to a specsin-compatible row dict."""
     species = (record.get("species") or "").strip()
     genus   = (record.get("genus")   or "").strip()
@@ -298,6 +299,7 @@ def record_to_row(record: dict, fname: str, hasfile: bool) -> dict:
         "decimalLongitude": record.get("decimalLongitude", ""),
         "coordinateUncertaintyInMeters": record.get("coordinateUncertaintyInMeters", ""),
         "gbifID":   str(record.get("key", "")),
+        "image_url": image_url,
         "indet":    indet,
         "fname":    fname,
         "hasfile":  hasfile,
@@ -443,6 +445,7 @@ def process_record(record: dict, out_dir: Path, max_size: int | None = None,
     urls = get_image_urls(record)
     downloaded = failed = 0
     present_fnames: list[str] = []
+    present_urls: list[str] = []
 
     for i, url in enumerate(urls):
         suffix = f"_{i}" if len(urls) > 1 else ""
@@ -454,6 +457,7 @@ def process_record(record: dict, out_dir: Path, max_size: int | None = None,
 
         if ok:
             present_fnames.append(fname)
+            present_urls.append(url)
             if not already_existed:
                 downloaded += 1
         else:
@@ -463,7 +467,8 @@ def process_record(record: dict, out_dir: Path, max_size: int | None = None,
         failed = 1
 
     primary_fname = present_fnames[0] if present_fnames else make_fname(family, verbatim_name, catalog)
-    row = record_to_row(record, primary_fname, bool(present_fnames))
+    primary_url   = present_urls[0]   if present_urls   else (urls[0] if urls else "")
+    row = record_to_row(record, primary_fname, bool(present_fnames), image_url=primary_url)
     return row, catalog, downloaded, failed
 
 
