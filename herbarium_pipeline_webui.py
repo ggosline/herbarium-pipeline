@@ -683,6 +683,26 @@ def _section(title: str) -> None:
             "border-radius:0 3px 3px 0; display:block"))
 
 
+def _accordion(title: str, *, opened: bool = True):
+    """Collapsible section that styles its header like _section().
+
+    Use as a context manager:
+
+        with _accordion("Model & batch"):
+            ui.label(...)
+
+    Pass ``opened=False`` for a section collapsed by default — useful for
+    advanced / rarely-touched options. Returns the ui.expansion so the
+    caller can ``with`` it.
+    """
+    exp = (ui.expansion(title, value=opened)
+           .classes("w-full")
+           .props("dense expand-separator header-class=accordion-header")
+           .style("margin:8px 0 4px;border-radius:0 3px 3px 0;"
+                  "border-left:3px solid #00897b;background:#f0f7f6"))
+    return exp
+
+
 def _path_input(label: str, value: str = "", mode: str = "dir",
                 hint: str = "") -> ui.input:
     """Label + text input + browse button row. Returns the input."""
@@ -934,115 +954,123 @@ def _build_train() -> tuple:
     _section("Output")
     tr_out = _path_input("Output / run dir:", mode="dir").bind_value(gs, "tr_out")
 
-    _section("Model")
-    with ui.row().classes("w-full items-center gap-2"):
-        ui.label("timm model:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
-        tr_model = (ui.input(value=TIMM_MODELS[0],
-                             placeholder="timm model name")
-                    .props("dense outlined clearable")
-                    .classes("flex-1")
-                    .bind_value(gs, "tr_model"))
-        with ui.menu() as _model_menu:
-            for _m in TIMM_MODELS:
-                ui.menu_item(_m, on_click=lambda _, m=_m: tr_model.set_value(m))
-        ui.button(icon="arrow_drop_down", on_click=_model_menu.open).props("flat dense")
+    with _accordion("Model & batch size", opened=True):
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.label("timm model:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
+            tr_model = (ui.input(value=TIMM_MODELS[0],
+                                 placeholder="timm model name")
+                        .props("dense outlined clearable")
+                        .classes("flex-1")
+                        .bind_value(gs, "tr_model"))
+            with ui.menu() as _model_menu:
+                for _m in TIMM_MODELS:
+                    ui.menu_item(_m, on_click=lambda _, m=_m: tr_model.set_value(m))
+            ui.button(icon="arrow_drop_down", on_click=_model_menu.open).props("flat dense")
 
-    with ui.row().classes("w-full items-center gap-4 flex-wrap mt-1"):
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Image size (px):").classes("text-sm")
-            tr_imgsz = ui.input(value="640").classes("w-20").props("dense outlined").bind_value(gs, "tr_imgsz")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Batch size:").classes("text-sm")
-            tr_batch = ui.input(value="4").classes("w-16").props("dense outlined").bind_value(gs, "tr_batch")
-            ui.tooltip("Stage 1 batch size (backbone frozen). Can be larger than stage 2.")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Stage 2 batch (0=same):").classes("text-sm")
-            tr_s2_batch = ui.input(value="0").classes("w-16").props("dense outlined").bind_value(gs, "tr_s2_batch")
-            ui.tooltip("Override batch size for stage 2 (full fine-tune). Use a smaller value if stage 2 runs out of VRAM. 0 = use the same batch size as stage 1.")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Grad accum:").classes("text-sm")
-            tr_accum = ui.input(value="2").classes("w-16").props("dense outlined").bind_value(gs, "tr_accum")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("GPUs:").classes("text-sm")
-            tr_gpus = ui.input(value="2").classes("w-16").props("dense outlined").bind_value(gs, "tr_gpus")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Max per species (0=all):").classes("text-sm")
-            tr_max_per_sp = ui.input(value="0").classes("w-20").props("dense outlined").bind_value(gs, "tr_max_per_sp")
-        nccl_p2p_disable = (ui.checkbox(
-            "NCCL_P2P_DISABLE (only for multi-GPU without NVLink)", value=False)
-            .tooltip("Sets NCCL_P2P_DISABLE=1 — do NOT enable if NVLink is present")
-            .bind_value(gs, "tr_nccl_p2p"))
+        with ui.row().classes("w-full items-center gap-4 flex-wrap mt-1"):
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Image size (px):").classes("text-sm")
+                tr_imgsz = ui.input(value="640").classes("w-20").props("dense outlined").bind_value(gs, "tr_imgsz")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Batch size:").classes("text-sm")
+                tr_batch = ui.input(value="4").classes("w-16").props("dense outlined").bind_value(gs, "tr_batch")
+                ui.tooltip("Stage 1 batch size (backbone frozen). Can be larger than stage 2.")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Stage 2 batch (0=same):").classes("text-sm")
+                tr_s2_batch = ui.input(value="0").classes("w-16").props("dense outlined").bind_value(gs, "tr_s2_batch")
+                ui.tooltip("Override batch size for stage 2 (full fine-tune). Use a smaller value if stage 2 runs out of VRAM. 0 = use the same batch size as stage 1.")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Grad accum:").classes("text-sm")
+                tr_accum = ui.input(value="2").classes("w-16").props("dense outlined").bind_value(gs, "tr_accum")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("GPUs:").classes("text-sm")
+                tr_gpus = ui.input(value="2").classes("w-16").props("dense outlined").bind_value(gs, "tr_gpus")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Max per species (0=all):").classes("text-sm")
+                tr_max_per_sp = ui.input(value="0").classes("w-20").props("dense outlined").bind_value(gs, "tr_max_per_sp")
+            nccl_p2p_disable = (ui.checkbox(
+                "NCCL_P2P_DISABLE (only for multi-GPU without NVLink)", value=False)
+                .tooltip("Sets NCCL_P2P_DISABLE=1 — do NOT enable if NVLink is present")
+                .bind_value(gs, "tr_nccl_p2p"))
 
-    _section("Training stages")
-    with ui.row().classes("w-full items-center gap-4 flex-wrap"):
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Stage 1 epochs:").classes("text-sm")
-            s1ep = ui.input(value="4").classes("w-20").props("dense outlined").bind_value(gs, "tr_s1ep")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Stage 1 LR:").classes("text-sm")
-            s1lr = ui.input(value="0.005").classes("w-24").props("dense outlined").bind_value(gs, "tr_s1lr")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Stage 2 epochs:").classes("text-sm")
-            s2ep = ui.input(value="15").classes("w-20").props("dense outlined").bind_value(gs, "tr_s2ep")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Stage 2 LR:").classes("text-sm")
-            s2lr = ui.input(value="0.0001").classes("w-24").props("dense outlined").bind_value(gs, "tr_s2lr")
+    with _accordion("Schedule (epochs, learning rates, cool-down)", opened=True):
+        with ui.row().classes("w-full items-center gap-4 flex-wrap"):
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Stage 1 epochs:").classes("text-sm")
+                s1ep = ui.input(value="4").classes("w-20").props("dense outlined").bind_value(gs, "tr_s1ep")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Stage 1 LR:").classes("text-sm")
+                s1lr = ui.input(value="0.005").classes("w-24").props("dense outlined").bind_value(gs, "tr_s1lr")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Stage 2 epochs:").classes("text-sm")
+                s2ep = ui.input(value="15").classes("w-20").props("dense outlined").bind_value(gs, "tr_s2ep")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Stage 2 LR:").classes("text-sm")
+                s2lr = ui.input(value="0.0001").classes("w-24").props("dense outlined").bind_value(gs, "tr_s2lr")
 
-    with ui.row().classes("w-full items-center gap-4 flex-wrap"):
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Cool-down epochs (0=off):").classes("text-sm")
-            cd_ep = ui.input(value="0").classes("w-20").props("dense outlined").bind_value(gs, "tr_cd_ep")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Cool-down LR:").classes("text-sm")
-            cd_lr = ui.input(value="0.0001").classes("w-24").props("dense outlined").bind_value(gs, "tr_cd_lr")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Cool-down batch:").classes("text-sm")
-            cd_batch = ui.input(value="5").classes("w-16").props("dense outlined").bind_value(gs, "tr_cd_batch")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Cool-down accum:").classes("text-sm")
-            cd_accum = ui.input(value="2").classes("w-16").props("dense outlined").bind_value(gs, "tr_cd_accum")
-    ui.label("Cool-down runs after stage 2 with reduced batch/LR — helps settle into flatter minima"
-             ).classes("text-caption text-grey-7")
+        with ui.row().classes("w-full items-center gap-4 flex-wrap"):
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Cool-down epochs (0=off):").classes("text-sm")
+                cd_ep = ui.input(value="0").classes("w-20").props("dense outlined").bind_value(gs, "tr_cd_ep")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Cool-down LR:").classes("text-sm")
+                cd_lr = ui.input(value="0.0001").classes("w-24").props("dense outlined").bind_value(gs, "tr_cd_lr")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Cool-down batch:").classes("text-sm")
+                cd_batch = ui.input(value="5").classes("w-16").props("dense outlined").bind_value(gs, "tr_cd_batch")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Cool-down accum:").classes("text-sm")
+                cd_accum = ui.input(value="2").classes("w-16").props("dense outlined").bind_value(gs, "tr_cd_accum")
+        ui.label("Cool-down runs after stage 2 with reduced batch/LR — helps settle into flatter minima"
+                 ).classes("text-caption text-grey-7")
 
-    _section("Classification target")
-    with ui.row().classes("w-full items-center gap-4 flex-wrap"):
-        label_level = (ui.radio(
-            {"species": "Species", "genus": "Genus", "family": "Family"},
-            value="species").props("inline dense")
-            .bind_value(gs, "tr_label_level"))
-        hier = ui.checkbox("Hierarchical multi-head", value=False).bind_value(gs, "tr_hier")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Species w:").classes("text-sm")
-            w_sp = ui.input(value="1.0").classes("w-16").props("dense outlined").bind_value(gs, "tr_w_sp")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Genus w:").classes("text-sm")
-            w_ge = ui.input(value="0.5").classes("w-16").props("dense outlined").bind_value(gs, "tr_w_ge")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Family w:").classes("text-sm")
-            w_fa = ui.input(value="0.0").classes("w-16").props("dense outlined").bind_value(gs, "tr_w_fa")
+    with _accordion("Loss & hierarchy (species / genus / family)", opened=False):
+        with ui.row().classes("w-full items-center gap-4 flex-wrap"):
+            label_level = (ui.radio(
+                {"species": "Species", "genus": "Genus", "family": "Family"},
+                value="species").props("inline dense")
+                .bind_value(gs, "tr_label_level"))
+            hier = ui.checkbox("Hierarchical multi-head", value=False).bind_value(gs, "tr_hier")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Species w:").classes("text-sm")
+                w_sp = ui.input(value="1.0").classes("w-16").props("dense outlined").bind_value(gs, "tr_w_sp")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Genus w:").classes("text-sm")
+                w_ge = ui.input(value="0.5").classes("w-16").props("dense outlined").bind_value(gs, "tr_w_ge")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Family w:").classes("text-sm")
+                w_fa = ui.input(value="0.0").classes("w-16").props("dense outlined").bind_value(gs, "tr_w_fa")
+        ui.label("Hierarchical multi-head adds genus + family classifiers; weights "
+                 "blend the three losses. Off by default — only useful when the "
+                 "checkpoint will be queried at multiple ranks."
+                 ).classes("text-caption text-grey-7")
 
-    _section("Location")
-    with ui.row().classes("w-full items-center gap-4 flex-wrap"):
-        use_location = (ui.checkbox("Use lat/lon during training (--use-location)", value=False)
-                        .bind_value(gs, "tr_use_location"))
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Geo MLP dim:").classes("text-sm")
-            geo_dim = ui.input(value="64").classes("w-20").props("dense outlined").bind_value(gs, "tr_geo_dim")
-        geo_dim.bind_enabled_from(use_location, "value")
+    with _accordion("Geo features (lat/lon)", opened=False):
+        with ui.row().classes("w-full items-center gap-4 flex-wrap"):
+            use_location = (ui.checkbox("Use lat/lon during training (--use-location)", value=False)
+                            .bind_value(gs, "tr_use_location"))
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Geo MLP dim:").classes("text-sm")
+                geo_dim = ui.input(value="64").classes("w-20").props("dense outlined").bind_value(gs, "tr_geo_dim")
+            geo_dim.bind_enabled_from(use_location, "value")
+        ui.label("Adds a small MLP that consumes encoded coordinates alongside "
+                 "the image features — helps when distinct species share the "
+                 "same morphology but live in different ranges."
+                 ).classes("text-caption text-grey-7")
 
-    _section("Logging")
-    with ui.row().classes("w-full items-center gap-2"):
-        ui.label("WandB project:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
-        wandb_proj = ui.input(value="").classes("w-48").props("dense outlined").bind_value(gs, "tr_wandb_proj")
-        ui.label("Run name:").classes("text-sm ml-4")
-        wandb_name = ui.input(value="herbarium_run").classes("w-48").props("dense outlined").bind_value(gs, "tr_wandb_name")
-    resume = _path_input("Resume checkpoint:", mode="file").bind_value(gs, "tr_resume")
-    reset_opt = (ui.checkbox(
-        "Reset optimizer  (load weights only — use when starting a fresh stage 2 from a stage-1 checkpoint)",
-        value=False).bind_value(gs, "tr_reset_optimizer")
-        .tooltip("Discards the saved optimizer/LR-schedule state so stage 2 starts "
-                 "with a clean optimizer at the LR you specify above. "
-                 "Leave unticked to continue an interrupted stage-2 run."))
+    with _accordion("Logging & resume", opened=False):
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.label("WandB project:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
+            wandb_proj = ui.input(value="").classes("w-48").props("dense outlined").bind_value(gs, "tr_wandb_proj")
+            ui.label("Run name:").classes("text-sm ml-4")
+            wandb_name = ui.input(value="herbarium_run").classes("w-48").props("dense outlined").bind_value(gs, "tr_wandb_name")
+        resume = _path_input("Resume checkpoint:", mode="file").bind_value(gs, "tr_resume")
+        reset_opt = (ui.checkbox(
+            "Reset optimizer  (load weights only — use when starting a fresh stage 2 from a stage-1 checkpoint)",
+            value=False).bind_value(gs, "tr_reset_optimizer")
+            .tooltip("Discards the saved optimizer/LR-schedule state so stage 2 starts "
+                     "with a clean optimizer at the LR you specify above. "
+                     "Leave unticked to continue an interrupted stage-2 run."))
 
     # ── Remote training (optional) ────────────────────────────────────────────
     ui.separator().classes("my-3")
@@ -1525,33 +1553,37 @@ def _build_identify(tr_model=None) -> tuple:
     _section("Output")
     id_out = _path_input("Review output dir:", mode="dir").bind_value(gs, "id_out")
 
-    _section("Thresholds")
-    with ui.row().classes("w-full items-center gap-4 flex-wrap"):
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Mismatch threshold:").classes("text-sm")
-            id_thresh = ui.input(value="0.7").classes("w-20").props("dense outlined").bind_value(gs, "id_thresh")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Low-conf flag (0=off):").classes("text-sm")
-            id_lowconf = ui.input(value="0.3").classes("w-20").props("dense outlined").bind_value(gs, "id_lowconf")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Image size (px):").classes("text-sm")
-            id_imgsz = ui.input(value="640").classes("w-20").props("dense outlined").bind_value(gs, "id_imgsz")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Batch size:").classes("text-sm")
-            id_batch = ui.input(value="32").classes("w-20").props("dense outlined").bind_value(gs, "id_batch")
-    with ui.row().classes("w-full items-center gap-4 flex-wrap mt-1"):
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Geo rerank weight (0=off):").classes("text-sm")
-            id_geo_weight = (ui.input(value="0.0").classes("w-20").props("dense outlined")
-                             .bind_value(gs, "id_geo_weight"))
-            ui.tooltip("Blend model probability with geographic range from training occurrences. "
-                       "0 = off, 0.3 is a good starting point. Only applied when lat/lon is present.").props("max-width=320px")
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Geo sigma (km):").classes("text-sm")
-            id_geo_sigma = (ui.input(value="500").classes("w-20").props("dense outlined")
-                            .bind_value(gs, "id_geo_sigma"))
-            ui.tooltip("Kernel bandwidth for geographic scoring. Larger = broader range influence. "
-                       "500 km suits most plant families; use 200–300 for highly localised taxa.").props("max-width=320px")
+    with _accordion("Advanced — thresholds, image size, geo re-rank", opened=False):
+        ui.label("Defaults work for most runs. Adjust if you need stricter "
+                 "mismatch flagging, smaller batches for VRAM, or want geo-aware "
+                 "re-ranking on top of the model probability."
+                 ).classes("text-caption text-grey-7")
+        with ui.row().classes("w-full items-center gap-4 flex-wrap mt-1"):
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Mismatch threshold:").classes("text-sm")
+                id_thresh = ui.input(value="0.7").classes("w-20").props("dense outlined").bind_value(gs, "id_thresh")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Low-conf flag (0=off):").classes("text-sm")
+                id_lowconf = ui.input(value="0.3").classes("w-20").props("dense outlined").bind_value(gs, "id_lowconf")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Image size (px):").classes("text-sm")
+                id_imgsz = ui.input(value="640").classes("w-20").props("dense outlined").bind_value(gs, "id_imgsz")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Batch size:").classes("text-sm")
+                id_batch = ui.input(value="32").classes("w-20").props("dense outlined").bind_value(gs, "id_batch")
+        with ui.row().classes("w-full items-center gap-4 flex-wrap mt-1"):
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Geo rerank weight (0=off):").classes("text-sm")
+                id_geo_weight = (ui.input(value="0.0").classes("w-20").props("dense outlined")
+                                 .bind_value(gs, "id_geo_weight"))
+                ui.tooltip("Blend model probability with geographic range from training occurrences. "
+                           "0 = off, 0.3 is a good starting point. Only applied when lat/lon is present.").props("max-width=320px")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Geo sigma (km):").classes("text-sm")
+                id_geo_sigma = (ui.input(value="500").classes("w-20").props("dense outlined")
+                                .bind_value(gs, "id_geo_sigma"))
+                ui.tooltip("Kernel bandwidth for geographic scoring. Larger = broader range influence. "
+                           "500 km suits most plant families; use 200–300 for highly localised taxa.").props("max-width=320px")
 
     ui.button("Run Identify", icon="manage_search",
               on_click=lambda: _launch(_id_cmd())
