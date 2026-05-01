@@ -2595,6 +2595,313 @@ def _build_confusion() -> "ui.input":
 
 
 # ---------------------------------------------------------------------------
+# Setup tab — one-time configuration: credentials, SSH key, environment.
+# Everything here persists across runs; once the four sections show ✓ the
+# user shouldn't need to revisit this tab.
+# ---------------------------------------------------------------------------
+
+def _pill(text: str, kind: str) -> "ui.label":
+    """Status pill rendered as a coloured Quasar chip-style label.
+
+    kind: 'ok' (green), 'warn' (amber), 'err' (red), 'neutral' (grey).
+    Returns the label so callers can update its text/style later via _set_pill.
+    """
+    palette = {
+        "ok":      ("#e8f5e9", "#2e7d32"),
+        "warn":    ("#fff3e0", "#e65100"),
+        "err":     ("#ffebee", "#c62828"),
+        "neutral": ("#eceff1", "#455a64"),
+    }
+    bg, fg = palette.get(kind, palette["neutral"])
+    return (ui.label(text)
+            .classes("rounded text-caption")
+            .style(f"background:{bg};color:{fg};padding:2px 10px;"
+                   f"font-weight:600;letter-spacing:.2px"))
+
+
+def _set_pill(lbl: "ui.label", text: str, kind: str) -> None:
+    palette = {
+        "ok":      ("#e8f5e9", "#2e7d32"),
+        "warn":    ("#fff3e0", "#e65100"),
+        "err":     ("#ffebee", "#c62828"),
+        "neutral": ("#eceff1", "#455a64"),
+    }
+    bg, fg = palette.get(kind, palette["neutral"])
+    lbl.set_text(text)
+    lbl.style(f"background:{bg};color:{fg};padding:2px 10px;"
+              f"font-weight:600;letter-spacing:.2px")
+
+
+def _setup_card(icon: str, title: str, subtitle: str = ""):
+    """Open a setup-section card returning (card, pill_label) so the caller
+    can fill the body and update the pill when state changes."""
+    card = ui.card().classes("w-full mt-2").style("border-left:3px solid #00897b")
+    with card:
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.icon(icon).style("color:#00897b;font-size:22px")
+            ui.label(title).classes("text-subtitle1 font-bold").style("color:#00695c")
+            if subtitle:
+                ui.label(subtitle).classes("text-caption text-grey-6")
+            pill = _pill("…", "neutral")
+            pill.classes("ml-auto")
+    return card, pill
+
+
+def _build_setup() -> None:
+    """One-time setup: local environment check + cloud credentials.
+
+    All credentials persist in the OS keyring (RunPod / WandB / R2) and the
+    SSH key path persists in app.storage.general. Once everything is green
+    the user only needs to come back here to rotate credentials.
+    """
+    import platform as _platform
+    gs = app.storage.general
+
+    with ui.row().classes("w-full items-baseline gap-2 mb-2"):
+        ui.icon("settings").style("color:#00897b;font-size:26px")
+        ui.label("One-time setup").classes("text-h6").style("color:#00695c")
+    ui.label(
+        "Configure credentials and check your environment. Once everything below "
+        "is green you can switch to the ☁ Cloud tab and forget this exists. "
+        "Full step-by-step guide: cloud_setup.md."
+    ).classes("text-body2").style("color:#455a64;max-width:820px")
+
+    # ── Local environment ───────────────────────────────────────────────
+    env_card, env_pill = _setup_card("computer", "Local environment")
+    with env_card:
+        env_html = ui.html("").classes("w-full mt-1").style("font-size:14px")
+
+        def _refresh_env() -> None:
+            rows: list[tuple[str, str, bool]] = []
+            rows.append(("Python", _platform.python_version(), True))
+            try:
+                import nicegui as _ng
+                ng_ver = getattr(_ng, "__version__", "?")
+                rows.append(("NiceGUI", ng_ver, ng_ver != "?"))
+            except Exception:
+                rows.append(("NiceGUI", "not importable", False))
+
+            cuda_ok = False
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    n = _torch.cuda.device_count()
+                    name = _torch.cuda.get_device_name(0) if n else "?"
+                    rows.append(("PyTorch GPU", f"{n}× {name}", True))
+                    cuda_ok = True
+                else:
+                    rows.append(("PyTorch GPU",
+                                 "CPU only — fine for local Quick ID, "
+                                 "use ☁ Cloud tab for training", False))
+            except ImportError:
+                rows.append(("PyTorch", "not installed", False))
+
+            base = (gs.get("main_base_dir") or str(Path.home())).strip()
+            try:
+                import shutil as _shutil
+                free = _shutil.disk_usage(base).free // (1 << 30)
+                rows.append(("Projects root",
+                             f"{base} ({free} GB free)", free > 5))
+            except Exception:
+                rows.append(("Projects root", base, False))
+
+            html_rows = []
+            for label, value, ok in rows:
+                tick = "✓" if ok else "—"
+                color = "#2e7d32" if ok else "#9e9e9e"
+                html_rows.append(
+                    f"<tr>"
+                    f"<td style='padding:4px 14px 4px 0;color:#666'>{label}</td>"
+                    f"<td style='padding:4px 8px 4px 0'>"
+                    f"<code style='background:#f5f5f5;padding:2px 8px;"
+                    f"border-radius:3px;color:#263238'>{value}</code></td>"
+                    f"<td style='color:{color};font-weight:700;font-size:15px'>{tick}</td>"
+                    f"</tr>"
+                )
+            env_html.set_content(
+                "<table style='border-collapse:collapse'>" + "".join(html_rows) + "</table>"
+            )
+            _set_pill(env_pill, "ready" if cuda_ok else "CPU only", "ok" if cuda_ok else "warn")
+
+        _refresh_env()
+        ui.button("Re-check", icon="refresh", on_click=_refresh_env
+                  ).props("flat dense").classes("mt-2")
+
+    # ── RunPod ──────────────────────────────────────────────────────────
+    rp_card, rp_pill = _setup_card("cloud", "RunPod (the GPU host)")
+    with rp_card:
+        ui.label(
+            "Sign up at runpod.io and add billing. Create an API key at "
+            "Settings → API Keys (starts with rpa_…). Also generate an SSH "
+            "key-pair on this machine and register the public key at "
+            "Settings → SSH Public Keys — RunPod auto-injects it into every "
+            "pod, which is how the pipeline runs commands without prompts."
+        ).classes("text-body2").style("color:#455a64")
+
+        api_inp = (ui.input(label="API key",
+                            placeholder="rpa_… (paste once, saved to OS keyring)")
+                   .classes("w-full mt-3").props("dense outlined type=password"))
+
+        default_key = str(Path.home() / ".ssh" / "id_ed25519_herbarium")
+        with ui.row().classes("w-full items-center gap-2 mt-2"):
+            ssh_inp = (ui.input(label="SSH private key",
+                                value=gs.get("cloud_ssh_key") or default_key,
+                                placeholder=default_key)
+                       .classes("flex-1").props("dense outlined clearable")
+                       .bind_value(gs, "cloud_ssh_key"))
+
+            async def _browse_ssh() -> None:
+                cur = (ssh_inp.value or default_key)
+                result = await FilePicker(cur, mode="file")
+                if result:
+                    ssh_inp.value = result
+                    _refresh_rp_pill()
+
+            ui.button(icon="folder_open", on_click=_browse_ssh
+                      ).props("flat dense round").tooltip("Browse")
+
+        ui.label("Use a passwordless automation key — pipeline steps shouldn't "
+                 "stop for a passphrase prompt.").classes("text-caption text-grey-7 mt-1")
+
+        def _refresh_rp_pill() -> None:
+            has_key = bool(cloud_secrets.get_runpod_api_key())
+            ssh_path = (gs.get("cloud_ssh_key") or "").strip()
+            has_ssh = bool(ssh_path) and Path(ssh_path).expanduser().is_file()
+            if has_key and has_ssh:
+                _set_pill(rp_pill, "✓ ready", "ok")
+            elif has_key:
+                _set_pill(rp_pill, "API key saved · SSH key path missing", "warn")
+            else:
+                _set_pill(rp_pill, "not configured", "err")
+        _refresh_rp_pill()
+        ssh_inp.on("blur", lambda: _refresh_rp_pill())
+
+        def _save_rp() -> None:
+            v = (api_inp.value or "").strip()
+            if not v:
+                ui.notify("Paste your RunPod API key first.", type="warning"); return
+            try:
+                cloud_secrets.set_runpod_api_key(v)
+            except Exception as e:
+                ui.notify(f"Keyring save failed: {e}", type="negative"); return
+            api_inp.value = ""
+            _refresh_rp_pill()
+            _cloud["orch"] = None
+            ui.notify("RunPod API key saved to OS keyring.", type="positive")
+
+        def _forget_rp() -> None:
+            cloud_secrets.delete_runpod_api_key()
+            _refresh_rp_pill()
+            _cloud["orch"] = None
+            ui.notify("RunPod API key removed.", type="info")
+
+        with ui.row().classes("gap-2 mt-2"):
+            ui.button("Save", on_click=_save_rp).props("unelevated dense color=primary")
+            ui.button("Forget", on_click=_forget_rp).props("flat dense")
+
+    # ── WandB ───────────────────────────────────────────────────────────
+    wb_card, wb_pill = _setup_card("insights", "WandB", "optional · live training graphs")
+    with wb_card:
+        ui.label(
+            "Free for academic use. Adds live loss/accuracy curves in your "
+            "browser during training; without it, training falls back to CSV logs. "
+            "Find your key at wandb.ai/authorize."
+        ).classes("text-body2").style("color:#455a64")
+
+        wb_inp = (ui.input(label="API key", placeholder="from wandb.ai/authorize")
+                  .classes("w-full mt-3").props("dense outlined type=password"))
+
+        def _refresh_wb_pill() -> None:
+            if cloud_secrets.get_wandb_api_key():
+                _set_pill(wb_pill, "✓ saved", "ok")
+            else:
+                _set_pill(wb_pill, "not set", "warn")
+        _refresh_wb_pill()
+
+        def _save_wb() -> None:
+            v = (wb_inp.value or "").strip()
+            if not v:
+                ui.notify("Paste a key first.", type="warning"); return
+            try:
+                cloud_secrets.set_wandb_api_key(v)
+            except Exception as e:
+                ui.notify(f"Keyring save failed: {e}", type="negative"); return
+            wb_inp.value = ""
+            _refresh_wb_pill()
+            ui.notify("WandB key saved (pushed to pod on next provision).", type="positive")
+
+        def _forget_wb() -> None:
+            cloud_secrets.delete_wandb_api_key()
+            _refresh_wb_pill()
+            ui.notify("WandB key removed.", type="info")
+
+        with ui.row().classes("gap-2 mt-2"):
+            ui.button("Save", on_click=_save_wb).props("unelevated dense color=primary")
+            ui.button("Forget", on_click=_forget_wb).props("flat dense")
+
+    # ── Cloudflare R2 ───────────────────────────────────────────────────
+    r2_card, r2_pill = _setup_card("cloud_done", "Cloudflare R2",
+                                   "optional · 50× faster pod setup + project archives")
+    with r2_card:
+        ui.label(
+            "10 GB free tier. Two uses: (1) per-project Archive/Restore so you "
+            "can delete RunPod volumes and pull projects back later; "
+            "(2) a shared wheel + model-weight cache that makes a fresh pod "
+            "~50× faster to set up. Create the API token at Cloudflare → R2 → "
+            "Manage R2 API Tokens with permission Object Read & Write."
+        ).classes("text-body2").style("color:#455a64")
+
+        r2_acct = (ui.input(label="Account ID",
+                            placeholder="32-char hex from your R2 dashboard URL")
+                   .classes("w-full mt-3").props("dense outlined"))
+        r2_akid = (ui.input(label="Access Key ID")
+                   .classes("w-full").props("dense outlined type=password"))
+        r2_sec  = (ui.input(label="Secret Access Key",
+                            placeholder="shown once at token-creation time")
+                   .classes("w-full").props("dense outlined type=password"))
+        r2_buck = (ui.input(label="Default backup bucket", value="herbarium-backup")
+                   .classes("w-full").props("dense outlined"))
+
+        def _refresh_r2_pill() -> None:
+            creds = cloud_secrets.get_r2_credentials()
+            if creds:
+                _set_pill(r2_pill, f"✓ {creds.bucket}", "ok")
+            else:
+                _set_pill(r2_pill, "not set", "warn")
+        _refresh_r2_pill()
+
+        def _save_r2() -> None:
+            acct = (r2_acct.value or "").strip()
+            ak   = (r2_akid.value or "").strip()
+            sk   = (r2_sec.value or "").strip()
+            bk   = (r2_buck.value or "").strip() or "herbarium-backup"
+            if not (acct and ak and sk):
+                ui.notify("Fill Account ID, Access Key, and Secret.", type="warning"); return
+            try:
+                cloud_secrets.set_r2_credentials(cloud_secrets.R2Credentials(
+                    account_id=acct, access_key_id=ak,
+                    secret_access_key=sk, bucket=bk,
+                ))
+            except Exception as e:
+                ui.notify(f"Keyring save failed: {e}", type="negative"); return
+            r2_akid.value = ""
+            r2_sec.value = ""
+            _refresh_r2_pill()
+            ui.notify("R2 credentials saved (pushed to pod on next provision).",
+                      type="positive")
+
+        def _forget_r2() -> None:
+            cloud_secrets.delete_r2_credentials()
+            _refresh_r2_pill()
+            ui.notify("R2 credentials removed.", type="info")
+
+        with ui.row().classes("gap-2 mt-2"):
+            ui.button("Save R2 creds", on_click=_save_r2
+                      ).props("unelevated dense color=primary")
+            ui.button("Forget", on_click=_forget_r2).props("flat dense")
+
+
+# ---------------------------------------------------------------------------
 # Cloud tab — orchestrates a RunPod GPU pod from this UI for users without
 # a local GPU. Wraps the cloud/ subpackage; nothing here knows about REST or
 # SSH directly.
@@ -2617,244 +2924,63 @@ def _cloud_log(line: str) -> None:
 def _build_cloud() -> None:
     gs = app.storage.general
 
-    # ── Setup card: API key + SSH key ────────────────────────────────────
-    _section("RunPod credentials  (stored in your OS keyring, never on disk)")
-
-    with ui.row().classes("w-full items-center gap-2"):
-        ui.label("API key:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
-        api_inp = (ui.input(placeholder="rpa_…  (create at runpod.io → Settings → API Keys)")
-                   .classes("flex-1").props("dense outlined type=password"))
-        api_status = ui.label("").classes("text-caption")
-
-        def _refresh_key_status() -> None:
-            if cloud_secrets.get_runpod_api_key():
-                api_status.set_text("✓ saved")
-                api_status.style("color:#2e7d32")
-            else:
-                api_status.set_text("not set")
-                api_status.style("color:#c62828")
-        _refresh_key_status()
-
-        def _save_key() -> None:
-            v = (api_inp.value or "").strip()
-            if not v:
-                ui.notify("Paste a key first.", type="warning"); return
-            try:
-                cloud_secrets.set_runpod_api_key(v)
-            except Exception as e:
-                ui.notify(f"Keyring save failed: {e}", type="negative"); return
-            api_inp.value = ""  # don't leave plaintext in the field
-            _refresh_key_status()
-            # Force orchestrator to reload from keyring next provision
-            _cloud["orch"] = None
-            ui.notify("API key saved to OS keyring.", type="positive")
-
-        def _forget_key() -> None:
-            cloud_secrets.delete_runpod_api_key()
-            _refresh_key_status()
-            _cloud["orch"] = None
-            ui.notify("API key removed from keyring.", type="info")
-
-        ui.button("Save", on_click=_save_key).props("flat dense color=primary")
-        ui.button("Forget", on_click=_forget_key).props("flat dense")
-
-    with ui.row().classes("w-full items-center gap-2"):
-        ui.label("WandB key:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
-        wb_inp = (ui.input(placeholder="wandb API key — find at wandb.ai/authorize")
-                  .classes("flex-1").props("dense outlined type=password"))
-        wb_status = ui.label("").classes("text-caption")
-
-        def _refresh_wb_status() -> None:
-            if cloud_secrets.get_wandb_api_key():
-                wb_status.set_text("✓ saved")
-                wb_status.style("color:#2e7d32")
-            else:
-                wb_status.set_text("not set — training will log to CSV only")
-                wb_status.style("color:#c62828")
-        _refresh_wb_status()
-
-        def _save_wb() -> None:
-            v = (wb_inp.value or "").strip()
-            if not v:
-                ui.notify("Paste a key first.", type="warning"); return
-            try:
-                cloud_secrets.set_wandb_api_key(v)
-            except Exception as e:
-                ui.notify(f"Keyring save failed: {e}", type="negative"); return
-            wb_inp.value = ""
-            _refresh_wb_status()
-            ui.notify("WandB key saved. It'll be pushed to /workspace/.wandb_key on next code sync.",
-                      type="positive")
-
-        def _forget_wb() -> None:
-            cloud_secrets.delete_wandb_api_key()
-            _refresh_wb_status()
-            ui.notify("WandB key removed from keyring.", type="info")
-
-        ui.button("Save", on_click=_save_wb).props("flat dense color=primary")
-        ui.button("Forget", on_click=_forget_wb).props("flat dense")
-
-    # ── R2 (Cloudflare) credentials ──────────────────────────────────────
-    # Used for two things: (1) per-project archival to r2:herbarium-backup
-    # via the Archive/Restore buttons; (2) the SHARED wheel + HF cache at
-    # r2:herbarium-cache that pod_bootstrap.sh pulls before `uv sync` so
-    # fresh pods don't re-download torch (~2 GB) from PyPI's slow EUR
-    # path. Both buckets must exist in your R2 account before first use.
-    with ui.row().classes("w-full items-start gap-2 mt-1"):
-        with ui.column().classes("flex-1 gap-1"):
-            r2_status = ui.label("").classes("text-caption")
-            r2_acct = (ui.input(label="Account ID",
-                                placeholder="32-char hex from R2 dashboard URL")
-                       .classes("w-full").props("dense outlined"))
-            r2_akid = (ui.input(label="Access Key ID",
-                                placeholder="from R2 → Manage R2 API Tokens")
-                       .classes("w-full").props("dense outlined type=password"))
-            r2_sec  = (ui.input(label="Secret Access Key",
-                                placeholder="shown once at token-creation time")
-                       .classes("w-full").props("dense outlined type=password"))
-            r2_buck = (ui.input(label="Default backup bucket",
-                                value="herbarium-backup")
-                       .classes("w-full").props("dense outlined"))
-
-            def _refresh_r2_status() -> None:
-                creds = cloud_secrets.get_r2_credentials()
-                if creds:
-                    r2_status.set_text(
-                        f"✓ saved (endpoint {creds.endpoint}, bucket {creds.bucket})"
-                    )
-                    r2_status.style("color:#2e7d32")
-                else:
-                    r2_status.set_text(
-                        "not set — Archive/Restore + shared cache will be skipped"
-                    )
-                    r2_status.style("color:#c62828")
-            _refresh_r2_status()
-
-            def _save_r2() -> None:
-                acct = (r2_acct.value or "").strip()
-                ak   = (r2_akid.value or "").strip()
-                sk   = (r2_sec.value  or "").strip()
-                bk   = (r2_buck.value or "").strip() or "herbarium-backup"
-                if not (acct and ak and sk):
-                    ui.notify("Fill Account ID, Access Key, and Secret.", type="warning"); return
-                try:
-                    cloud_secrets.set_r2_credentials(cloud_secrets.R2Credentials(
-                        account_id=acct, access_key_id=ak,
-                        secret_access_key=sk, bucket=bk,
-                    ))
-                except Exception as e:
-                    ui.notify(f"Keyring save failed: {e}", type="negative"); return
-                # Don't leave secrets in the form fields.
-                r2_akid.value = ""
-                r2_sec.value = ""
-                _refresh_r2_status()
-                ui.notify(
-                    "R2 credentials saved. Pushed to /workspace/.config/rclone/rclone.conf "
-                    "on next code sync (i.e. next provision).", type="positive")
-
-            def _forget_r2() -> None:
-                cloud_secrets.delete_r2_credentials()
-                _refresh_r2_status()
-                ui.notify("R2 credentials removed from keyring.", type="info")
-
-            with ui.row().classes("gap-2"):
-                ui.button("Save R2 creds", on_click=_save_r2).props("flat dense color=primary")
-                ui.button("Forget", on_click=_forget_r2).props("flat dense")
-                ui.label(
-                    "Create an R2 API token at Cloudflare dashboard → R2 → Manage R2 API Tokens. "
-                    "Required permission: Object Read & Write on the buckets you'll use."
-                ).classes("text-caption text-grey-7 self-center")
-
-    default_key = str(Path.home() / ".ssh" / "id_ed25519_herbarium")
-    ssh_key_inp = (_path_input("SSH private key:", value=default_key, mode="file",
-                               hint="Passwordless key whose .pub is registered in RunPod → Settings → SSH Keys")
-                   .bind_value(gs, "cloud_ssh_key"))
+    # ── Header + quick-reference order banner ────────────────────────────
+    with ui.row().classes("w-full items-baseline gap-2 mb-1"):
+        ui.icon("cloud").style("color:#00897b;font-size:26px")
+        ui.label("Cloud pod").classes("text-h6").style("color:#00695c")
 
     ui.label(
-        "RunPod auto-injects whatever public keys you've registered into every pod. "
-        "Use a passwordless automation key here so steps don't pause for a passphrase."
-    ).classes("text-caption text-grey-7 ml-40")
+        "Suggested order: Provision → Upload DwC-A → Setup → Download → Prep → "
+        "(re-Provision with purpose=train) → Train → Identify → Download results → Terminate. "
+        "Pod state persists in ~/.herbarium-cloud — closing this app and reopening picks the same pod back up."
+    ).classes("text-body2").style(
+        "background:#f0f7f6;border-left:3px solid #00897b;padding:8px 12px;"
+        "border-radius:0 4px 4px 0;color:#37474f;max-width:1100px;margin-bottom:8px")
 
-    # ── Project & resources ──────────────────────────────────────────────
-    _section("Pod settings")
+    # Setup-not-configured banner. Updates itself via timer because the
+    # Setup tab can save credentials while this tab is mounted.
+    setup_warn = ui.label("").classes("w-full text-body2 mb-1")
+    setup_warn.visible = False
 
-    with ui.row().classes("w-full items-center gap-2"):
-        ui.label("Project name:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
-        proj_lbl = ui.label("").classes("flex-1 font-medium").style("color:#1a237e")
+    def _check_setup() -> None:
+        has_key = bool(cloud_secrets.get_runpod_api_key())
+        ssh_path = (gs.get("cloud_ssh_key") or "").strip()
+        has_ssh = bool(ssh_path) and Path(ssh_path).expanduser().is_file()
+        if has_key and has_ssh:
+            setup_warn.visible = False
+            return
+        missing = []
+        if not has_key: missing.append("RunPod API key")
+        if not has_ssh: missing.append("SSH private key")
+        setup_warn.set_text(
+            f"⚠ Missing: {', '.join(missing)}. Open the ⚙ Setup tab to fix this — "
+            f"every button below will fail until both are configured."
+        )
+        setup_warn.style(
+            "background:#ffebee;border-left:3px solid #c62828;padding:8px 12px;"
+            "border-radius:0 4px 4px 0;color:#c62828;max-width:1100px"
+        )
+        setup_warn.visible = True
+    _check_setup()
 
-        def _refresh_proj() -> None:
-            proj_lbl.set_text(gs.get("main_proj") or "— set Project name at the top of the page —")
-        _refresh_proj()
+    # ── Card: Pod (status + lifecycle) ───────────────────────────────────
+    with ui.card().classes("w-full").style("border-left:3px solid #00897b"):
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.icon("memory").style("color:#00897b;font-size:20px")
+            ui.label("Pod").classes("text-subtitle1 font-bold").style("color:#00695c")
 
-    with ui.row().classes("w-full items-center gap-4 flex-wrap"):
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Purpose:").classes("text-sm")
-            purpose_radio = (ui.radio({"light": "light (L4) — download / prep / identify",
-                                       "train": "train (RTX 4090) — long GPU run"},
-                                      value="light").props("inline dense")
-                             .bind_value(gs, "cloud_purpose"))
+        # Status row — pod info + cost + current step.
+        with ui.row().classes("w-full items-center gap-4 flex-wrap mt-1"):
+            pod_lbl = ui.label("No active pod").style("color:#455a64")
+            cost_lbl = (ui.label("$0.0000").classes("font-mono")
+                        .style("color:#00695c;font-weight:600"))
+            step_lbl = ui.label("").style("color:#455a64")
 
-    with ui.row().classes("w-full items-center gap-4 flex-wrap"):
-        with ui.row().classes("items-center gap-1"):
-            ui.label("GPU type override:").classes("text-sm")
-            gpu_inp = (ui.input(placeholder="(blank = use purpose default)").classes("w-56")
-                       .props("dense outlined")
-                       .bind_value(gs, "cloud_gpu_override"))
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Datacenter:").classes("text-sm")
-            dc_inp = (ui.input(value=DEFAULT_DATACENTER).classes("w-32")
-                      .props("dense outlined")
-                      .bind_value(gs, "cloud_datacenter"))
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Volume size (GB):").classes("text-sm")
-            vol_inp = (ui.input(value=str(DEFAULT_VOLUME_GB)).classes("w-20")
-                       .props("dense outlined")
-                       .bind_value(gs, "cloud_volume_gb"))
-
-    _section("Download caps  (apply only to the Download step)")
-    with ui.row().classes("w-full items-center gap-4 flex-wrap"):
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Max per species:").classes("text-sm")
-            cl_max_per_sp = (ui.input(value="").classes("w-20")
-                             .props("dense outlined placeholder=all")
-                             .bind_value(gs, "cloud_max_per_sp"))
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Total limit:").classes("text-sm")
-            cl_limit = (ui.input(value="").classes("w-20")
-                        .props("dense outlined placeholder=all")
-                        .bind_value(gs, "cloud_limit"))
-        with ui.row().classes("items-center gap-1"):
-            ui.label("IIIF size (px):").classes("text-sm")
-            cl_iiif = (ui.input(value="1200").classes("w-24")
-                       .props("dense outlined")
-                       .bind_value(gs, "cloud_iiif"))
-        with ui.row().classes("items-center gap-1"):
-            ui.label("Resize after download (px):").classes("text-sm")
-            cl_max_size = (ui.input(value="1200").classes("w-24")
-                           .props("dense outlined")
-                           .bind_value(gs, "cloud_max_size"))
-    ui.label(
-        "Tip: many institutions ignore the IIIF size param and serve full scans, "
-        "so set Resize-after-download as well — it shrinks each image with PIL "
-        "right after fetch, regardless of what the server returned."
-    ).classes("text-caption text-grey-7 ml-2")
-    ui.label(
-        "Tip: re-export your DwC-A from GBIF with tighter geographic / dataset "
-        "filters for the cleanest cut. The caps above are a quick second-line defence."
-    ).classes("text-caption text-grey-7 ml-2")
-
-    # ── Live status ──────────────────────────────────────────────────────
-    _section("Status")
-    with ui.row().classes("w-full items-center gap-4 flex-wrap"):
-        pod_lbl = ui.label("No active pod").style("color:#455a64")
-        cost_lbl = ui.label("$0.0000").classes("font-mono").style("color:#00695c; font-weight:600")
-        step_lbl = ui.label("").style("color:#455a64")
-
-    # SFTP transfer progress (shown only while a transfer is in flight).
-    progress_bar = ui.linear_progress(value=0.0, show_value=False).classes("w-full")
-    progress_lbl = ui.label("").classes("text-caption text-grey-7 font-mono")
-    progress_bar.visible = False
-    progress_lbl.visible = False
+        # SFTP transfer progress (shown only while a transfer is in flight).
+        progress_bar = ui.linear_progress(value=0.0, show_value=False).classes("w-full mt-1")
+        progress_lbl = ui.label("").classes("text-caption text-grey-7 font-mono")
+        progress_bar.visible = False
+        progress_lbl.visible = False
 
     def _make_progress_cb(prefix: str):
         """Thread-safe progress callback for paramiko SFTP transfers.
@@ -2914,9 +3040,7 @@ def _build_cloud() -> None:
 
     ui.timer(30.0, _refresh_status)
 
-    # ── Pipeline buttons ─────────────────────────────────────────────────
-    _section("Pipeline")
-
+    # ── Pipeline plumbing — defined before the cards that reference them ──
     def _running() -> bool:
         t = _cloud["task"]
         return t is not None and not t.done()
@@ -2936,11 +3060,14 @@ def _build_cloud() -> None:
             return _cloud["orch"]
         api_key = cloud_secrets.get_runpod_api_key()
         if not api_key:
-            _warn("Save your RunPod API key first."); return None
+            _warn("Open the ⚙ Setup tab and save your RunPod API key first.")
+            return None
         proj = (gs.get("main_proj") or "").strip()
         if not proj:
             _warn("Set the Project name at the top of the page first."); return None
-        ssh_key = (ssh_key_inp.value or "").strip() or None
+        # SSH key path lives in app.storage.general (set by the Setup tab);
+        # read it lazily so the user can change it without restarting.
+        ssh_key = (gs.get("cloud_ssh_key") or "").strip() or None
         _cloud["orch"] = CloudOrchestrator(api_key, proj, key_filename=ssh_key)
         return _cloud["orch"]
 
@@ -3195,21 +3322,6 @@ def _build_cloud() -> None:
             t.cancel()
             ui.notify("Cancellation requested.", type="info")
 
-    # Buttons — laid out by flow stage
-    with ui.row().classes("w-full gap-2 mt-2 flex-wrap"):
-        ui.button("Provision + sync code", icon="cloud_upload",
-                  on_click=lambda: _wrap(_do_provision)
-                  ).props("color=primary unelevated")
-        ui.button("Upload DwC-A", icon="archive",
-                  on_click=lambda: _wrap(_do_upload_dwca)
-                  ).props("flat color=primary")
-
-    with ui.row().classes("w-full gap-2 mt-1 flex-wrap"):
-        for step in ("setup", "download", "prep", "train", "identify"):
-            ui.button(step.capitalize(),
-                      on_click=lambda s=step: _wrap(lambda s=s: _do_step(s))
-                      ).props("flat dense")
-
     def _confirm_restore() -> None:
         with ui.dialog() as dlg, ui.card():
             ui.label("Restore project from R2?").classes("text-h6")
@@ -3225,60 +3337,220 @@ def _build_cloud() -> None:
                 ui.button("Restore", on_click=_ok).props("color=primary unelevated")
         dlg.open()
 
-    # R2 archive — for retiring a project so the network volume can be deleted.
-    with ui.row().classes("w-full gap-2 mt-1 flex-wrap items-center"):
-        ui.label("R2 archive:").classes("text-sm text-grey-7")
-        ui.button("Archive project to R2", icon="cloud_done",
-                  on_click=lambda: _wrap(lambda: _do_step("backup"))
-                  ).props("flat dense color=primary")\
-                  .tooltip("Push ckpt, specsin, DwC-A, predictions, and "
-                           "images_1024.tar to r2:herbarium-backup/<project>/. "
-                           "Safe to delete the network volume after this.")
-        ui.button("Restore project from R2", icon="cloud_download",
-                  on_click=_confirm_restore
-                  ).props("flat dense color=primary")\
-                  .tooltip("Pull a previously archived project back onto a "
-                           "fresh volume — skip download/prep entirely.")
-
-    with ui.row().classes("w-full gap-2 mt-1 flex-wrap items-center"):
-        ui.label("Wipe on pod:").classes("text-sm text-grey-7")
-        ui.button("images_raw",
-                  on_click=lambda: _confirm_wipe("images_raw", "raw downloaded images")
-                  ).props("flat dense color=negative")
-        ui.button("images_filtered",
-                  on_click=lambda: _confirm_wipe("images_filtered", "filter+crop output")
-                  ).props("flat dense color=negative")
-        ui.button("images_1024",
-                  on_click=lambda: _confirm_wipe("images_1024", "resized training images")
-                  ).props("flat dense color=negative")
-        ui.button("predictions",
-                  on_click=lambda: _confirm_wipe("predictions", "identify output")
-                  ).props("flat dense color=negative")
-
-    with ui.row().classes("w-full gap-2 mt-1 flex-wrap"):
-        ui.button("Download results", icon="download",
-                  on_click=lambda: _wrap(_do_download_results)
-                  ).props("flat color=primary")
-        ui.button("Pull images_1024", icon="image",
-                  on_click=lambda: _wrap(_do_download_images)
-                  ).props("flat color=primary")
+    # ── Pod card: lifecycle buttons (status + progress live above) ────────
+    # The status row + progress bar were created earlier (inside the Pod
+    # card opened at the top of this function); now we add the lifecycle
+    # buttons in a fresh row below the card.
+    with ui.row().classes("w-full gap-2 mt-2 flex-wrap"):
+        ui.button("Provision + sync code", icon="cloud_upload",
+                  on_click=lambda: _wrap(_do_provision)
+                  ).props("color=primary unelevated")\
+                  .tooltip("Create a RunPod pod, mount the project volume, push "
+                           "this repo and your wandb / R2 credentials.")
         ui.button("Cancel running step", icon="stop",
                   on_click=_cancel_running).props("flat color=warning")
         ui.button("Terminate (keep volume)", icon="power_settings_new",
                   on_click=lambda: _confirm_terminate(keep_volume=True)
-                  ).props("flat color=negative")
+                  ).props("flat color=negative")\
+                  .tooltip("Stop billing. Network volume + downloaded images "
+                           "stay on RunPod and the next provision can reuse them.")
         ui.button("Terminate + delete volume", icon="delete_forever",
                   on_click=lambda: _confirm_terminate(keep_volume=False)
-                  ).props("flat color=negative")
+                  ).props("flat color=negative")\
+                  .tooltip("Stop billing AND delete the network volume. "
+                           "Use this once you've Archived the project to R2.")
 
-    ui.label(
-        "Suggested order:  Provision → Upload DwC-A → Setup → Download → Prep → "
-        "(re-Provision with purpose=train) → Train → Identify → Download results → Terminate. "
-        "State persists in ~/.herbarium-cloud — closing the desktop app and reopening picks the pod back up."
-    ).classes("text-caption text-grey-7 mt-2")
+    # ── Card B: Configure run ────────────────────────────────────────────
+    with ui.card().classes("w-full mt-2").style("border-left:3px solid #00897b"):
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.icon("tune").style("color:#00897b;font-size:20px")
+            ui.label("Configure run").classes("text-subtitle1 font-bold")\
+                .style("color:#00695c")
 
-    # Surface the project-name change without a full page reload.
+        # Project name — display-only mirror of the top-of-page field.
+        with ui.row().classes("w-full items-center gap-2 mt-1"):
+            ui.label("Project:").classes("text-sm").style("color:#455a64")
+            proj_lbl = (ui.label("").classes("font-medium")
+                        .style("color:#1a237e;font-size:14px"))
+
+            def _refresh_proj() -> None:
+                proj_lbl.set_text(
+                    gs.get("main_proj")
+                    or "— set Project name at the top of the page —"
+                )
+            _refresh_proj()
+
+        # Purpose — primary control, big readable radio.
+        with ui.row().classes("w-full items-center gap-2 mt-2"):
+            ui.label("Purpose:").classes("text-sm").style("color:#455a64")
+            purpose_radio = (ui.radio({
+                    "light": "light (L4) — download / prep / identify",
+                    "train": "train (RTX 4090) — long GPU run",
+                }, value="light").props("inline dense")
+                .bind_value(gs, "cloud_purpose"))
+
+        # Advanced: GPU override + datacenter + volume size.
+        with ui.expansion("Advanced — GPU override / datacenter / volume size"
+                           ).classes("w-full mt-1"):
+            with ui.row().classes("w-full items-center gap-4 flex-wrap pt-1"):
+                with ui.row().classes("items-center gap-1"):
+                    ui.label("GPU type override:").classes("text-sm")
+                    gpu_inp = (ui.input(placeholder="(blank = use purpose default)")
+                               .classes("w-56").props("dense outlined")
+                               .bind_value(gs, "cloud_gpu_override"))
+                with ui.row().classes("items-center gap-1"):
+                    ui.label("Datacenter:").classes("text-sm")
+                    dc_inp = (ui.input(value=DEFAULT_DATACENTER).classes("w-32")
+                              .props("dense outlined")
+                              .bind_value(gs, "cloud_datacenter"))
+                with ui.row().classes("items-center gap-1"):
+                    ui.label("Volume size (GB):").classes("text-sm")
+                    vol_inp = (ui.input(value=str(DEFAULT_VOLUME_GB)).classes("w-20")
+                               .props("dense outlined")
+                               .bind_value(gs, "cloud_volume_gb"))
+
+        # Download caps — only relevant for the Download step. Collapsed by
+        # default since most users never touch them.
+        with ui.expansion("Download caps (Download step only)"
+                           ).classes("w-full"):
+            with ui.row().classes("w-full items-center gap-4 flex-wrap pt-1"):
+                with ui.row().classes("items-center gap-1"):
+                    ui.label("Max per species:").classes("text-sm")
+                    cl_max_per_sp = (ui.input(value="").classes("w-20")
+                                     .props("dense outlined placeholder=all")
+                                     .bind_value(gs, "cloud_max_per_sp"))
+                with ui.row().classes("items-center gap-1"):
+                    ui.label("Total limit:").classes("text-sm")
+                    cl_limit = (ui.input(value="").classes("w-20")
+                                .props("dense outlined placeholder=all")
+                                .bind_value(gs, "cloud_limit"))
+                with ui.row().classes("items-center gap-1"):
+                    ui.label("IIIF size (px):").classes("text-sm")
+                    cl_iiif = (ui.input(value="1200").classes("w-24")
+                               .props("dense outlined")
+                               .bind_value(gs, "cloud_iiif"))
+                with ui.row().classes("items-center gap-1"):
+                    ui.label("Resize after download (px):").classes("text-sm")
+                    cl_max_size = (ui.input(value="1200").classes("w-24")
+                                   .props("dense outlined")
+                                   .bind_value(gs, "cloud_max_size"))
+            ui.label(
+                "Many institutions ignore the IIIF size param and serve full scans, "
+                "so set Resize-after-download as well — it shrinks each image with "
+                "PIL right after fetch, regardless of what the server returned."
+            ).classes("text-body2 mt-1").style("color:#546e7a;max-width:780px")
+            ui.label(
+                "Tip: re-export your DwC-A from GBIF with tighter geographic / "
+                "dataset filters for the cleanest cut. The caps above are a "
+                "second-line defence."
+            ).classes("text-body2").style("color:#546e7a;max-width:780px")
+
+    # ── Card C: Pipeline ─────────────────────────────────────────────────
+    with ui.card().classes("w-full mt-2").style("border-left:3px solid #00897b"):
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.icon("playlist_play").style("color:#00897b;font-size:20px")
+            ui.label("Pipeline").classes("text-subtitle1 font-bold")\
+                .style("color:#00695c")
+
+        ui.label(
+            "1. Upload your local DwC-A to the pod. 2. Run the steps in order "
+            "(Setup is a one-time per-pod env install)."
+        ).classes("text-body2 mt-1").style("color:#455a64")
+
+        with ui.row().classes("w-full gap-2 mt-2 flex-wrap items-center"):
+            ui.button("Upload DwC-A", icon="archive",
+                      on_click=lambda: _wrap(_do_upload_dwca)
+                      ).props("unelevated dense color=primary")\
+                      .tooltip("Push the DwC-A ZIP set on the Download tab "
+                               "to /workspace/data/dwca.zip on the pod.")
+
+        # Step buttons — visual flow with arrows.
+        with ui.row().classes("w-full gap-1 mt-2 flex-wrap items-center"):
+            steps = (
+                ("setup",    "settings",        "Install env (uv sync + DALI)"),
+                ("download", "download",        "Run download_gbif_images.py"),
+                ("prep",     "filter_alt",      "Filter, crop, resize"),
+                ("train",    "model_training",  "Run train_herbarium.py"),
+                ("identify", "manage_search",   "Run identify_herbarium.py"),
+            )
+            for idx, (step, icon, tip) in enumerate(steps):
+                if idx > 0:
+                    ui.icon("chevron_right").style("color:#90a4ae;font-size:20px")
+                ui.button(step.capitalize(), icon=icon,
+                          on_click=lambda s=step: _wrap(lambda s=s: _do_step(s))
+                          ).props("outlined dense color=teal").tooltip(tip)
+
+        # Danger zone — wipe pod-side data. Hidden by default so destructive
+        # actions don't sit next to constructive ones.
+        with ui.expansion("⚠ Danger zone — wipe pod-side data"
+                           ).classes("w-full mt-2").props("dense"):
+            ui.label(
+                "Files deleted here are gone unless you previously downloaded "
+                "or archived them. Useful when re-running a step from scratch."
+            ).classes("text-body2 mt-1").style("color:#c62828;max-width:780px")
+            with ui.row().classes("w-full gap-2 mt-2 flex-wrap"):
+                ui.button("images_raw",
+                          on_click=lambda: _confirm_wipe(
+                              "images_raw", "raw downloaded images")
+                          ).props("flat dense color=negative")
+                ui.button("images_filtered",
+                          on_click=lambda: _confirm_wipe(
+                              "images_filtered", "filter+crop output")
+                          ).props("flat dense color=negative")
+                ui.button("images_1024",
+                          on_click=lambda: _confirm_wipe(
+                              "images_1024", "resized training images")
+                          ).props("flat dense color=negative")
+                ui.button("predictions",
+                          on_click=lambda: _confirm_wipe(
+                              "predictions", "identify output")
+                          ).props("flat dense color=negative")
+
+    # ── Card D: Results & Archive ────────────────────────────────────────
+    with ui.card().classes("w-full mt-2").style("border-left:3px solid #00897b"):
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.icon("download").style("color:#00897b;font-size:20px")
+            ui.label("Results & Archive").classes("text-subtitle1 font-bold")\
+                .style("color:#00695c")
+
+        ui.label(
+            "Pull artefacts back to this machine, or archive the whole project "
+            "to Cloudflare R2 so you can delete the pod's network volume and "
+            "still bring everything back later."
+        ).classes("text-body2 mt-1").style("color:#455a64;max-width:820px")
+
+        with ui.row().classes("w-full gap-2 mt-2 flex-wrap"):
+            ui.button("Download results", icon="cloud_download",
+                      on_click=lambda: _wrap(_do_download_results)
+                      ).props("unelevated dense color=primary")\
+                      .tooltip("Pull last.ckpt, nameslist.json, predictions.csv "
+                               "into the local cloud_results folder.")
+            ui.button("Pull images_1024", icon="image",
+                      on_click=lambda: _wrap(_do_download_images)
+                      ).props("flat dense color=primary")\
+                      .tooltip("Pull the images_1024.tar back so the Review "
+                               "tab can show specimens.")
+
+        ui.separator().classes("my-2")
+        ui.label("Long-term archive (Cloudflare R2)").classes("text-caption")\
+            .style("color:#37474f;font-weight:600;letter-spacing:.4px;text-transform:uppercase")
+
+        with ui.row().classes("w-full gap-2 mt-1 flex-wrap"):
+            ui.button("Archive project to R2", icon="cloud_done",
+                      on_click=lambda: _wrap(lambda: _do_step("backup"))
+                      ).props("outlined dense color=primary")\
+                      .tooltip("Push ckpt, specsin, DwC-A, predictions, and "
+                               "images_1024.tar to r2:<bucket>/<project>/. "
+                               "Safe to delete the network volume after.")
+            ui.button("Restore project from R2", icon="cloud_download",
+                      on_click=_confirm_restore
+                      ).props("outlined dense color=primary")\
+                      .tooltip("Pull a previously archived project back onto "
+                               "a fresh volume — skip download/prep entirely.")
+
+    # Surface the project-name and setup-status changes without a full reload.
     ui.timer(2.0, _refresh_proj)
+    ui.timer(2.0, _check_setup)
 
 
 def _build_run_all(dl_cmd, fc_cmd, rs_cmd, tr_cmd, id_cmd) -> None:
@@ -3640,11 +3912,12 @@ def main_page():
 
                 # Tabs
                 with ui.tabs().classes("w-full") as tabs:
-                    t_dl     = ui.tab("1  Download")
-                    t_fc     = ui.tab("2  Filter & Crop")
-                    t_rs     = ui.tab("3  Resize")
-                    t_tr     = ui.tab("4  Train")
-                    t_id     = ui.tab("5  Identify")
+                    t_setup    = ui.tab("⚙ Setup")
+                    t_dl       = ui.tab("1  Download")
+                    t_fc       = ui.tab("2  Filter & Crop")
+                    t_rs       = ui.tab("3  Resize")
+                    t_tr       = ui.tab("4  Train")
+                    t_id       = ui.tab("5  Identify")
                     t_cloud    = ui.tab("☁ Cloud")
                     t_review   = ui.tab("Review")
                     t_conf     = ui.tab("Analysis")
@@ -3654,6 +3927,9 @@ def main_page():
 
                 with ui.tab_panels(tabs, value=t_dl).classes("w-full rounded").style(
                         "border:1px solid #dde1e4;background:#ffffff;box-shadow:0 1px 3px rgba(0,0,0,.08)"):
+
+                    with ui.tab_panel(t_setup).classes("p-4"):
+                        _build_setup()
 
                     with ui.tab_panel(t_dl).classes("p-4"):
                         dl_cmd, dl_out_dir, dl_specsin = _build_download()
