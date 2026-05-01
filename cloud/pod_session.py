@@ -123,6 +123,19 @@ class PodSession:
             raise RuntimeError("PodSession is not connected; call connect() first")
         return self._client
 
+    def is_alive(self) -> bool:
+        """Cheap liveness check on the underlying transport.
+
+        Returns False if the SSH transport was never opened or is no
+        longer active (e.g. the server-side ssh closed the connection
+        after a long idle period or a network blip). Callers should
+        evict-and-rebuild on False rather than reusing the session.
+        """
+        if self._client is None:
+            return False
+        transport = self._client.get_transport()
+        return transport is not None and transport.is_active()
+
     # ── command execution ─────────────────────────────────────────────────
 
     async def exec_streaming(

@@ -2694,6 +2694,77 @@ def _build_cloud() -> None:
         ui.button("Save", on_click=_save_wb).props("flat dense color=primary")
         ui.button("Forget", on_click=_forget_wb).props("flat dense")
 
+    # ── R2 (Cloudflare) credentials ──────────────────────────────────────
+    # Used for two things: (1) per-project archival to r2:herbarium-backup
+    # via the Archive/Restore buttons; (2) the SHARED wheel + HF cache at
+    # r2:herbarium-cache that pod_bootstrap.sh pulls before `uv sync` so
+    # fresh pods don't re-download torch (~2 GB) from PyPI's slow EUR
+    # path. Both buckets must exist in your R2 account before first use.
+    with ui.row().classes("w-full items-start gap-2 mt-1"):
+        with ui.column().classes("flex-1 gap-1"):
+            r2_status = ui.label("").classes("text-caption")
+            r2_acct = (ui.input(label="Account ID",
+                                placeholder="32-char hex from R2 dashboard URL")
+                       .classes("w-full").props("dense outlined"))
+            r2_akid = (ui.input(label="Access Key ID",
+                                placeholder="from R2 → Manage R2 API Tokens")
+                       .classes("w-full").props("dense outlined type=password"))
+            r2_sec  = (ui.input(label="Secret Access Key",
+                                placeholder="shown once at token-creation time")
+                       .classes("w-full").props("dense outlined type=password"))
+            r2_buck = (ui.input(label="Default backup bucket",
+                                value="herbarium-backup")
+                       .classes("w-full").props("dense outlined"))
+
+            def _refresh_r2_status() -> None:
+                creds = cloud_secrets.get_r2_credentials()
+                if creds:
+                    r2_status.set_text(
+                        f"✓ saved (endpoint {creds.endpoint}, bucket {creds.bucket})"
+                    )
+                    r2_status.style("color:#2e7d32")
+                else:
+                    r2_status.set_text(
+                        "not set — Archive/Restore + shared cache will be skipped"
+                    )
+                    r2_status.style("color:#c62828")
+            _refresh_r2_status()
+
+            def _save_r2() -> None:
+                acct = (r2_acct.value or "").strip()
+                ak   = (r2_akid.value or "").strip()
+                sk   = (r2_sec.value  or "").strip()
+                bk   = (r2_buck.value or "").strip() or "herbarium-backup"
+                if not (acct and ak and sk):
+                    ui.notify("Fill Account ID, Access Key, and Secret.", type="warning"); return
+                try:
+                    cloud_secrets.set_r2_credentials(cloud_secrets.R2Credentials(
+                        account_id=acct, access_key_id=ak,
+                        secret_access_key=sk, bucket=bk,
+                    ))
+                except Exception as e:
+                    ui.notify(f"Keyring save failed: {e}", type="negative"); return
+                # Don't leave secrets in the form fields.
+                r2_akid.value = ""
+                r2_sec.value = ""
+                _refresh_r2_status()
+                ui.notify(
+                    "R2 credentials saved. Pushed to /workspace/.config/rclone/rclone.conf "
+                    "on next code sync (i.e. next provision).", type="positive")
+
+            def _forget_r2() -> None:
+                cloud_secrets.delete_r2_credentials()
+                _refresh_r2_status()
+                ui.notify("R2 credentials removed from keyring.", type="info")
+
+            with ui.row().classes("gap-2"):
+                ui.button("Save R2 creds", on_click=_save_r2).props("flat dense color=primary")
+                ui.button("Forget", on_click=_forget_r2).props("flat dense")
+                ui.label(
+                    "Create an R2 API token at Cloudflare dashboard → R2 → Manage R2 API Tokens. "
+                    "Required permission: Object Read & Write on the buckets you'll use."
+                ).classes("text-caption text-grey-7 self-center")
+
     default_key = str(Path.home() / ".ssh" / "id_ed25519_herbarium")
     ssh_key_inp = (_path_input("SSH private key:", value=default_key, mode="file",
                                hint="Passwordless key whose .pub is registered in RunPod → Settings → SSH Keys")
@@ -2967,6 +3038,14 @@ def _build_cloud() -> None:
             if gs.get("tr_reset_optimizer"): env["RESET_OPTIMIZER"] = "1"
             # Show the user what's about to ship
             _cloud_log("Train env: " + " ".join(f"{k}={v}" for k, v in env.items()))
+        elif step in ("backup", "restore"):
+            # Backup/restore namespace by project so multiple projects can
+            # share one R2 bucket without overwriting each other.
+            proj = (gs.get("main_proj") or "").strip()
+            if not proj:
+                _warn("Set the Project name at the top of the page first."); return
+            env["PROJECT"] = proj
+            _cloud_log(f"{step.capitalize()} project: {proj}")
         rc = await orch.run_step(pod, step, env=env, on_log=_cloud_log)
         if rc != 0:
             _err(f"Step {step} exited {rc}")
@@ -3011,28 +3090,25 @@ def _build_cloud() -> None:
         gs["review_imgs"] = str(out)
         _info(f"Pulled images → {out}")
 
-    async def _do_terminate(*, keep_volume: bool) -> None:
+    async def _do_terminate(
+        *, keep_volume: bool, status_label, close_btn,
+    ) -> None:
+        """Run the actual terminate call. UI elements (status_label,
+        close_btn) are created in the foreground click handler and
+        passed in here — we only mutate them, never create new widgets,
+        because background tasks have no NiceGUI slot context.
+        """
         orch = _cloud["orch"]; pod = _cloud["pod"]
         if not (orch and pod):
-            _info("No active pod."); return
-        # Non-dismissible modal so the user can't close the window mid-call
-        # and leave the pod running. We control its lifecycle by hand —
-        # only close it ourselves after the API call returns.
-        with ui.dialog().props("persistent no-esc-dismiss no-backdrop-dismiss") as dlg, ui.card():
-            ui.label("Terminating pod…").classes("text-h6")
-            ui.label("DO NOT close this window until termination is confirmed.")\
-                .classes("text-caption text-red-9")
-            ui.spinner(size="lg").classes("self-center my-2")
-            status = ui.label("Calling RunPod API…").classes("text-caption")
-            close_btn = ui.button("Close", on_click=dlg.close).props("flat")
-            close_btn.disable()
-        dlg.open()
+            status_label.text = "No active pod."
+            close_btn.enable()
+            return
         try:
             await orch.terminate(pod, keep_volume=keep_volume, on_log=_cloud_log)
             _cloud["pod"] = None
-            status.text = "✓ Pod terminated. Safe to close."
+            status_label.text = "✓ Pod terminated. Safe to close."
         except Exception as e:
-            status.text = f"✗ Terminate failed: {e!r}  — check RunPod console."
+            status_label.text = f"✗ Terminate failed: {e!r}  — check RunPod console."
             _err(f"Terminate failed: {e!r}")
         finally:
             close_btn.enable()
@@ -3050,7 +3126,25 @@ def _build_cloud() -> None:
                 ui.button("Cancel", on_click=dlg.close).props("flat")
                 def _ok() -> None:
                     dlg.close()
-                    _wrap(lambda: _do_terminate(keep_volume=keep_volume))
+                    # Create the progress dialog HERE in the foreground
+                    # click handler — it has a valid slot context.
+                    # Only the API call itself runs in the background.
+                    with ui.dialog().props(
+                        "persistent no-esc-dismiss no-backdrop-dismiss"
+                    ) as prog_dlg, ui.card():
+                        ui.label("Terminating pod…").classes("text-h6")
+                        ui.label("DO NOT close this window until termination is confirmed.")\
+                            .classes("text-caption text-red-9")
+                        ui.spinner(size="lg").classes("self-center my-2")
+                        status = ui.label("Calling RunPod API…").classes("text-caption")
+                        close_btn = ui.button("Close", on_click=prog_dlg.close).props("flat")
+                        close_btn.disable()
+                    prog_dlg.open()
+                    _wrap(lambda: _do_terminate(
+                        keep_volume=keep_volume,
+                        status_label=status,
+                        close_btn=close_btn,
+                    ))
                 ui.button("Terminate", on_click=_ok).props("color=negative unelevated")
         dlg.open()
 
@@ -3115,6 +3209,36 @@ def _build_cloud() -> None:
             ui.button(step.capitalize(),
                       on_click=lambda s=step: _wrap(lambda s=s: _do_step(s))
                       ).props("flat dense")
+
+    def _confirm_restore() -> None:
+        with ui.dialog() as dlg, ui.card():
+            ui.label("Restore project from R2?").classes("text-h6")
+            ui.label("This pulls checkpoints, specsin, predictions, and the "
+                     "tarred image set back onto the volume. Existing files "
+                     "with the same names will be overwritten.")\
+                .classes("text-caption")
+            with ui.row().classes("w-full justify-end gap-2 mt-2"):
+                ui.button("Cancel", on_click=dlg.close).props("flat")
+                def _ok() -> None:
+                    dlg.close()
+                    _wrap(lambda: _do_step("restore"))
+                ui.button("Restore", on_click=_ok).props("color=primary unelevated")
+        dlg.open()
+
+    # R2 archive — for retiring a project so the network volume can be deleted.
+    with ui.row().classes("w-full gap-2 mt-1 flex-wrap items-center"):
+        ui.label("R2 archive:").classes("text-sm text-grey-7")
+        ui.button("Archive project to R2", icon="cloud_done",
+                  on_click=lambda: _wrap(lambda: _do_step("backup"))
+                  ).props("flat dense color=primary")\
+                  .tooltip("Push ckpt, specsin, DwC-A, predictions, and "
+                           "images_1024.tar to r2:herbarium-backup/<project>/. "
+                           "Safe to delete the network volume after this.")
+        ui.button("Restore project from R2", icon="cloud_download",
+                  on_click=_confirm_restore
+                  ).props("flat dense color=primary")\
+                  .tooltip("Pull a previously archived project back onto a "
+                           "fresh volume — skip download/prep entirely.")
 
     with ui.row().classes("w-full gap-2 mt-1 flex-wrap items-center"):
         ui.label("Wipe on pod:").classes("text-sm text-grey-7")

@@ -11,6 +11,8 @@ This pipeline lets you build an AI model that can identify plant species from he
 - An internet connection for the download step
 - Disk space: plan for roughly 1–2 GB per 1,000 images at default GBIF thumbnail size; 5–15 GB per 1,000 if downloading at IIIF size 2048; much more for `max` resolution
 
+**No GPU on your computer?** You can run training in the cloud instead. See **[cloud_setup.md](cloud_setup.md)** for a step-by-step guide to setting up RunPod (rented GPU), WandB (live training graphs), and Cloudflare R2 (project archives + shared cache). Then everything described below runs from the **Cloud** tab.
+
 ---
 
 ## Starting the application

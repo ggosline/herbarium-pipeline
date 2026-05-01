@@ -56,7 +56,36 @@ include = [
 ]
 
 [tool.uv]
-# Allow uv to resolve PyTorch from the default PyPI index. On Linux this
-# pulls the CUDA-enabled wheels; on macOS it pulls MPS. If you later want
-# to pin a specific CUDA build, add a [tool.uv.sources] entry for torch
-# pointing at https://download.pytorch.org/whl/cu121 (or similar).
+# Consider every configured index when resolving each package, instead of
+# stopping at the first index that has *any* version of that package.
+# Without this, uv finds e.g. torchmetrics 1.0.3 on pytorch.org/whl/cu128
+# and refuses to look at PyPI for the newer 1.x we actually need.
+# The "unsafe" name guards against dependency-confusion attacks where a
+# malicious internal index publishes a fake "django" wheel — irrelevant
+# here because pytorch.org is the trusted upstream for those wheels.
+index-strategy = "unsafe-best-match"
+
+# PyTorch's own CDN (CloudFront) reliably serves at 50–100 MB/s into
+# RunPod, while PyPI/Fastly has been observed at <3 Mbps from EUR-IS-1,
+# turning a 90-second torch install into a 90-minute one. Pin Linux
+# torch + torchvision to the cu128 index; macOS keeps the PyPI wheels
+# (MPS / CPU). Other platforms fall back to PyPI as well.
+#
+# cu128 was chosen so the locked torch version matches what the project
+# was already tested against (2.11.x). cu121 / cu124 cap at older
+# versions. Bump to cu130 (or whatever's current) when you upgrade
+# torch in the future.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+# explicit=true (its previous value) limits the index to packages that
+# are explicitly source-mapped to it. With only torch + torchvision
+# mapped, uv resolved torch's transitive deps (nvidia-cublas-cu12,
+# nvidia-cudnn-cu12, etc., ~3 GB total) from PyPI/Fastly — which is the
+# slow path we're trying to avoid. Leaving explicit unset (the default)
+# lets uv prefer this index for any package it carries, so the whole
+# CUDA stack comes through pytorch.org's CDN.
+
+[tool.uv.sources]
+torch       = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]

@@ -38,13 +38,78 @@ mkdir -p "$WS"
 touch "$ACTIVITY_FILE"
 trap 'touch "$ACTIVITY_FILE" 2>/dev/null || true' EXIT
 
-# ─── keep cache + venv on ephemeral container disk, NOT the volume ────────
-# Container disk is fast local NVMe, free, and wiped on pod stop — perfect
-# for caches. The network volume is paid storage + slower I/O.
-export UV_CACHE_DIR=/root/.cache/uv
+# ─── caches: split between volume (persistent) and container disk (fast) ──
+# Wheels (UV_CACHE_DIR) and HF model weights (HF_HOME) live on the volume
+# so every fresh pod reuses them. EUR-IS-1's egress to PyPI has been
+# observed at <3 Mbps — cold uv sync took ~1.5 hr. Volume I/O beats that
+# by ~50×.
+#
+# UV_PROJECT_ENVIRONMENT (the resolved venv) stays on the container disk:
+# it's read on every Python invocation, so we want fast local NVMe. The
+# venv is cheap to recreate from a populated cache (~1 min vs ~1 hr).
+export UV_CACHE_DIR=/workspace/.cache/uv
 export UV_PROJECT_ENVIRONMENT=/root/venv
+export HF_HOME=/workspace/.cache/huggingface
+mkdir -p "$UV_CACHE_DIR" "$HF_HOME"
+
+# Shared R2 cache — one bucket serves every project, every user. R2 has
+# no egress fees and pulls into RunPod fast (~50–100 Mbps typical), so
+# wheels + HF weights round-trip in seconds instead of being re-fetched
+# from PyPI/HF over the slow EUR-IS-1 path. Override via env if you keep
+# multiple cache buckets, e.g. for different python versions.
+CACHE_REMOTE="${CACHE_REMOTE:-r2:herbarium-cache}"
 
 mkdir -p "$IMG_RAW" "$IMG_FILT" "$IMG_1024" "$CKPT"
+
+# ─── shared cache push/pull (R2) ──────────────────────────────────────────
+# Both functions are best-effort: if rclone isn't installed yet, the R2
+# remote isn't configured, or the bucket is empty/unreachable, they log
+# and continue rather than failing the surrounding step. The whole point
+# is to *speed up* setup — never to block it.
+# Shared rclone flags for cache transfers:
+#   --copy-links     : follow symlinks (HF dedups via blobs/ + snapshots/
+#                      symlinks; uv build envs use python symlinks). Without
+#                      this rclone skips them with a NOTICE and the cache
+#                      structure is incomplete on restore.
+#   --exclude builds-v*/** : uv's transient build environments. Per-resolution,
+#                      no value cross-pod, often contain absolute symlinks
+#                      that wouldn't resolve elsewhere anyway.
+RCLONE_CACHE_FLAGS=(
+  --transfers 16 --checkers 16 --fast-list --stats=10s
+  --copy-links
+  --exclude 'builds-v*/**'
+)
+
+cache_pull() {
+  if ! command -v rclone >/dev/null; then
+    echo "rclone not installed yet — skipping cache pull"; return 0
+  fi
+  if ! rclone lsd "$CACHE_REMOTE" >/dev/null 2>&1; then
+    echo "Cache remote $CACHE_REMOTE not accessible — skipping pull"; return 0
+  fi
+  echo "→ Pulling shared cache from $CACHE_REMOTE..."
+  rclone copy "$CACHE_REMOTE/uv/"          "$UV_CACHE_DIR/" \
+    "${RCLONE_CACHE_FLAGS[@]}" 2>&1 | tail -3 || true
+  rclone copy "$CACHE_REMOTE/huggingface/" "$HF_HOME/" \
+    "${RCLONE_CACHE_FLAGS[@]}" 2>&1 | tail -3 || true
+  echo "✓ Cache pull done ($(du -sh "$UV_CACHE_DIR" "$HF_HOME" 2>/dev/null | tr '\n' ' '))"
+}
+
+cache_push() {
+  if ! command -v rclone >/dev/null; then
+    echo "rclone not installed — skipping cache push"; return 0
+  fi
+  if ! rclone lsd "$CACHE_REMOTE" >/dev/null 2>&1 \
+       && ! rclone mkdir "$CACHE_REMOTE" 2>/dev/null; then
+    echo "Cache remote $CACHE_REMOTE not writable — skipping push"; return 0
+  fi
+  echo "→ Pushing shared cache to $CACHE_REMOTE (diff only)..."
+  rclone copy "$UV_CACHE_DIR/" "$CACHE_REMOTE/uv/" \
+    "${RCLONE_CACHE_FLAGS[@]}" 2>&1 | tail -3 || true
+  rclone copy "$HF_HOME/"      "$CACHE_REMOTE/huggingface/" \
+    "${RCLONE_CACHE_FLAGS[@]}" 2>&1 | tail -3 || true
+  echo "✓ Cache push done"
+}
 
 # ─── one-time per pod: env setup ──────────────────────────────────────────
 setup() {
@@ -58,18 +123,37 @@ setup() {
     git clone "$REPO_URL" "$REPO"
   fi
 
-  # 2. Install uv if missing
+  # 2. System packages we need before anything else can run. Idempotent —
+  #    apt is a no-op when these are present (e.g. on the bigger runpod
+  #    pytorch image they're prebaked).
+  if ! command -v curl >/dev/null || ! command -v git >/dev/null; then
+    apt-get update -qq
+    apt-get install -y --no-install-recommends curl ca-certificates git
+  fi
+
+  # 3. rclone — installed BEFORE uv sync so cache_pull can populate
+  #    UV_CACHE_DIR from R2. Otherwise we'd download every wheel from
+  #    PyPI on first use even though it's sitting in R2.
+  if ! command -v rclone >/dev/null; then
+    curl -fsSL https://rclone.org/install.sh | bash
+  fi
+
+  # 4. Pull shared wheel + HF caches from R2. Best-effort: never fails.
+  cache_pull
+
+  # 5. uv itself.
   if ! command -v uv >/dev/null; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
     export PATH="$HOME/.local/bin:$PATH"
   fi
 
-  # 3. Create venv + install locked deps. uv.lock is committed so this is
-  #    deterministic across pods. --frozen refuses to update the lock.
+  # 6. Create venv + install locked deps. With a populated UV_CACHE_DIR
+  #    this is link-only (no downloads) and finishes in ~1 min. Cold cache
+  #    can take an hour on a slow PyPI path.
   cd "$REPO"
   uv sync --frozen
 
-  # 4. DALI — installed outside the lock because the wheel name depends on
+  # 7. DALI — installed outside the lock because the wheel name depends on
   #    the pod's CUDA version. Detect via nvidia-smi (always in PATH on a GPU
   #    pod) rather than nvcc — nvcc reports the container toolkit, nvidia-smi
   #    reports what the host driver supports, which is what DALI needs to match.
@@ -92,14 +176,35 @@ setup() {
     echo "No GPU detected — skipping DALI (CPU pod). Training will not work here."
   fi
 
-  # 5. wandb login
+  # 8. wandb login
   if [ -f "$WS/.wandb_key" ]; then
     uv run wandb login "$(cat "$WS/.wandb_key")"
   fi
 
-  # 6. rclone for R2 backup
-  if ! command -v rclone >/dev/null; then
-    curl -fsSL https://rclone.org/install.sh | bash
+  # 9. Drop wheels that no resolution still needs (e.g. wheels left over
+  #    from a previous lock revision). Keeps the volume + R2 cache lean.
+  #    --ci is non-interactive and only removes truly unused entries.
+  uv cache prune --ci || true
+
+  # 10. Push any new wheels (DALI, anything PyPI just fetched) back to R2
+  #     so the next pod for any project benefits.
+  cache_push
+
+  # 11. Make the cache + venv env vars sticky for interactive SSH sessions,
+  #     so manually running `uv sync` / `uv pip install` from a shell
+  #     hits the volume cache (15 GB) instead of the empty default at
+  #     ~/.cache/uv. Idempotent — the marker prevents duplicate appends.
+  if ! grep -q "# herbarium-pipeline env" /root/.bashrc 2>/dev/null; then
+    cat >> /root/.bashrc <<'BASHRC'
+
+# herbarium-pipeline env — written by pod_bootstrap.sh setup
+export UV_CACHE_DIR=/workspace/.cache/uv
+export UV_PROJECT_ENVIRONMENT=/root/venv
+export HF_HOME=/workspace/.cache/huggingface
+export RCLONE_CONFIG=/workspace/.config/rclone/rclone.conf
+export PATH="$HOME/.local/bin:$PATH"
+BASHRC
+    echo "Added herbarium env exports to /root/.bashrc"
   fi
 
   start_watchdog
@@ -209,6 +314,10 @@ prep() {
   python -u "$REPO/verify_specsin.py" \
     --specsin "$SPECSIN" \
     --image-dir "$IMG_1024"
+
+  # Push the CLIP weights (~600 MB) that filter_and_crop just cached to
+  # HF_HOME, so other projects skip the download on their first prep.
+  cache_push
 }
 
 # ─── step 3: train (needs GPU pod, DALI installed) ────────────────────────
@@ -267,6 +376,10 @@ train() {
     --wandb-project "$WANDB_PROJECT" \
     --wandb-run-name "$WANDB_RUN_NAME" \
     "${EXTRA[@]}"
+
+  # Push the timm/DINOv3 backbone weights (~1.2 GB) downloaded on first
+  # train, so other projects skip the download on their first train.
+  cache_push
 }
 
 # ─── step 4: identify ─────────────────────────────────────────────────────
@@ -281,37 +394,93 @@ identify() {
     --batch-size 32
 }
 
-# ─── backup: push checkpoints + predictions to R2 ─────────────────────────
+# ─── backup: full project archive to R2 ───────────────────────────────────
+# Pushes everything needed to delete the network volume and rebuild later
+# without re-downloading from GBIF: latest ckpt, nameslist, specsin, the
+# DwC-A snapshot, predictions/, and the resized image set tarred for fast
+# transfer. Requires PROJECT env var so multiple projects can coexist
+# under the same R2 bucket (e.g. r2:herbarium-backup/menispermaceae/).
 backup() {
+  : "${PROJECT:?PROJECT env var required (e.g. PROJECT=menispermaceae)}"
+  REMOTE="$R2_REMOTE/$PROJECT"
+  echo "→ Archiving project '$PROJECT' to $REMOTE"
+
+  # 1. Latest checkpoint (irreplaceable)
   CKPT_FILE=$(ls -t "$CKPT"/*.ckpt 2>/dev/null | head -1)
   if [ -n "$CKPT_FILE" ]; then
-    echo "Uploading $(basename "$CKPT_FILE") to R2..."
-    rclone copy "$CKPT_FILE" "$R2_REMOTE/checkpoints/" \
+    echo "  ckpt: $(basename "$CKPT_FILE")"
+    rclone copy "$CKPT_FILE" "$REMOTE/checkpoints/" \
       --progress --transfers 4 --s3-chunk-size 64M
   fi
-  # Class-names JSON next to ckpt — tiny, critical
-  rclone copy "$CKPT/" "$R2_REMOTE/checkpoints/" \
-    --include "*.json" --progress
+  # nameslist.json + any other small ckpt-side metadata
+  rclone copy "$CKPT/" "$REMOTE/checkpoints/" --include "*.json" --progress
+
+  # 2. Per-project state
+  [ -f "$SPECSIN" ] && rclone copy "$SPECSIN" "$REMOTE/" --progress
+  [ -f "$DWCA" ]    && rclone copy "$DWCA"    "$REMOTE/" --progress
+
+  # 3. Predictions output (small)
   if [ -d "$DATA/predictions" ]; then
-    rclone copy "$DATA/predictions" "$R2_REMOTE/predictions/" --progress
+    rclone copy "$DATA/predictions" "$REMOTE/predictions/" --progress
   fi
-  echo "Backup done: $R2_REMOTE"
+
+  # 4. Resized images — tar first so it's one large sequential upload
+  #    instead of N small PUTs (faster + cheaper at R2's per-op pricing).
+  if [ -d "$IMG_1024" ]; then
+    IMG_TAR="$DATA/images_1024.tar"
+    echo "  bundling $IMG_1024 → $(basename "$IMG_TAR")"
+    tar cf "$IMG_TAR" -C "$DATA" images_1024
+    echo "  uploading $(du -h "$IMG_TAR" | cut -f1)"
+    rclone copy "$IMG_TAR" "$REMOTE/" \
+      --progress --transfers 4 --s3-chunk-size 64M
+    rm -f "$IMG_TAR"
+  fi
+
+  echo "✓ Backup complete: $REMOTE"
+  echo "  Safe to delete the network volume — restore with PROJECT=$PROJECT bash $0 restore"
 }
 
-# ─── restore: pull checkpoints back (fresh volume recovery) ───────────────
+# ─── restore: pull a project archive back onto a fresh volume ─────────────
 restore() {
-  mkdir -p "$CKPT"
-  rclone copy "$R2_REMOTE/checkpoints/" "$CKPT/" --progress
-  echo "Restored checkpoints to $CKPT"
+  : "${PROJECT:?PROJECT env var required (e.g. PROJECT=menispermaceae)}"
+  REMOTE="$R2_REMOTE/$PROJECT"
+  echo "→ Restoring project '$PROJECT' from $REMOTE"
+
+  mkdir -p "$CKPT" "$DATA/predictions"
+
+  # Checkpoints + metadata
+  rclone copy "$REMOTE/checkpoints/" "$CKPT/" --progress
+
+  # Per-project state files (specsin + DwC-A) land directly in $DATA
+  rclone copy "$REMOTE/" "$DATA/" --include "specsin.csv" --include "gbif.zip" --progress
+
+  # Predictions
+  rclone copy "$REMOTE/predictions/" "$DATA/predictions/" --progress 2>/dev/null || true
+
+  # Images tarball — pull then unpack on-pod (tar lives only briefly)
+  if rclone lsf "$REMOTE/images_1024.tar" >/dev/null 2>&1; then
+    IMG_TAR="$DATA/images_1024.tar"
+    echo "  pulling images tar..."
+    rclone copy "$REMOTE/images_1024.tar" "$DATA/" --progress \
+      --transfers 4 --s3-chunk-size 64M
+    echo "  extracting..."
+    rm -rf "$IMG_1024"
+    tar xf "$IMG_TAR" -C "$DATA"
+    rm -f "$IMG_TAR"
+  fi
+
+  echo "✓ Restore complete. Skip download/prep — go straight to identify or further training."
 }
 
-case "${1:?usage: $0 [setup|download|prep|train|identify|backup|restore]}" in
-  setup)    setup ;;
-  download) download ;;
-  prep)     prep ;;
-  train)    train ;;
-  identify) identify ;;
-  backup)   backup ;;
-  restore)  restore ;;
-  *)        echo "unknown step: $1"; exit 1 ;;
+case "${1:?usage: $0 [setup|download|prep|train|identify|backup|restore|cache_pull|cache_push]}" in
+  setup)      setup ;;
+  download)   download ;;
+  prep)       prep ;;
+  train)      train ;;
+  identify)   identify ;;
+  backup)     backup ;;
+  restore)    restore ;;
+  cache_pull) cache_pull ;;
+  cache_push) cache_push ;;
+  *)          echo "unknown step: $1"; exit 1 ;;
 esac

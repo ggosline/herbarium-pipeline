@@ -43,6 +43,16 @@ ProgressFn = Callable[[int, int], None]
 
 # ── defaults ─────────────────────────────────────────────────────────────
 
+# RunPod's own pytorch image on Docker Hub. Pulls are fast (RunPod hosts
+# cache it aggressively — it's their most popular base) and crucially it
+# ships sshd preconfigured for RunPod's SSH-over-public-IP flow.
+#
+# Trade-off: Docker Hub anonymous pulls are rate-limited (~100 / 6h per
+# host IP). When RunPod's host IP gets unlucky you can hit
+# "toomanyrequests" at create_pod time. If that becomes chronic, the
+# durable fix is wiring containerRegistryAuthId through create_pod —
+# but that adds a third credential for naive users so we accept the
+# rare failure for now.
 DEFAULT_IMAGE = "runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04"
 DEFAULT_DATACENTER = "EUR-IS-1"
 DEFAULT_VOLUME_GB = 80
@@ -188,10 +198,22 @@ class CloudOrchestrator:
     ) -> PodSession:
         """Return a connected SSH session for the pod, creating + caching one
         on first call. Retries through the brief gap between RunPod
-        publishing the SSH port and sshd accepting connections."""
+        publishing the SSH port and sshd accepting connections.
+
+        EOFError is caught alongside paramiko.SSHException / OSError because
+        paramiko raises bare EOFError when the server closes the TCP
+        connection during the SSH banner exchange — common while sshd is
+        still starting up, or when the pod was reaped between provision
+        and connect (in which case all retries will fail and the final
+        error message points at the real problem).
+        """
         cached = self._sessions.get(handle.pod_id)
         if cached is not None:
-            return cached
+            if cached.is_alive():
+                return cached
+            on_log("Cached SSH session is dead — rebuilding")
+            await cached.aclose()
+            self._sessions.pop(handle.pod_id, None)
         last_err: Exception | None = None
         for i in range(attempts):
             session = PodSession(
@@ -201,12 +223,23 @@ class CloudOrchestrator:
                 await session.connect()
                 self._sessions[handle.pod_id] = session
                 return session
-            except (paramiko.SSHException, OSError) as e:
+            except (paramiko.SSHException, OSError, EOFError) as e:
                 last_err = e
                 await session.aclose()
                 on_log(f"SSH attempt {i + 1}/{attempts}: {type(e).__name__}: {e}")
                 await asyncio.sleep(delay)
-        raise RuntimeError(f"SSH never came up: {last_err!r}")
+        # All retries failed — re-check pod status so the error message
+        # tells the user whether the pod is actually still alive or got
+        # reaped behind RunPod's status endpoint.
+        try:
+            current = await self._rp().get_pod(handle.pod_id)
+            status_hint = (f" pod status now: {current.desired_status}, "
+                           f"ssh_endpoint={current.ssh_endpoint}")
+        except Exception:
+            status_hint = " (couldn't re-query pod status)"
+        raise RuntimeError(
+            f"SSH never came up after {attempts} attempts: {last_err!r}.{status_hint}"
+        )
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -267,17 +300,23 @@ class CloudOrchestrator:
             ports=("22/tcp",),
         )
         on_log(f"  pod {pod.id} created (${pod.cost_per_hr}/hr), waiting for SSH...")
-        ready = await self._rp().wait_until_ready(pod.id, timeout=300)
+        # Persist the pod_id NOW, before any wait that might fail. If
+        # wait_until_ready times out we still know which pod is paid-for so
+        # the next provision call can reuse / clean it up instead of
+        # silently spawning a second pod.
+        self._state.pod_id = pod.id
+        self._state.pod_started_at = time.time()
+        self._state.pod_hourly_rate = pod.cost_per_hr
+        self._save_state()
+
+        # NGC's pytorch image (~10 GB) + cold-host scheduling can push first-
+        # boot past the old 300s budget. 900s covers the worst case we've seen.
+        ready = await self._rp().wait_until_ready(pod.id, timeout=900)
         host, port = ready.ssh_endpoint  # type: ignore[misc]
         on_log(f"  pod ready @ {host}:{port}")
 
-        # Persist before we attempt SSH — a connect failure shouldn't lose
-        # the pod_id (we'd leak a paid pod the user can't easily find).
-        self._state.pod_id = pod.id
         self._state.ssh_host = host
         self._state.ssh_port = port
-        self._state.pod_started_at = time.time()
-        self._state.pod_hourly_rate = pod.cost_per_hr
         self._save_state()
 
         handle = self._handle_from_pod(ready)
@@ -304,6 +343,7 @@ class CloudOrchestrator:
             await session.sftp_put(f, f"{REMOTE_REPO}/{f.name}")
         await session.exec_capture(f"chmod +x {REMOTE_REPO}/pod_bootstrap.sh")
         await self.push_wandb_key(handle, on_log=on_log)
+        await self.push_r2_config(handle, on_log=on_log)
 
     async def push_wandb_key(
         self, handle: PodHandle, *, on_log: LogFn = print,
@@ -321,6 +361,53 @@ class CloudOrchestrator:
         session = await self._ensure_session(handle, on_log=on_log)
         await session.sftp_put_bytes(key.encode("utf-8"), "/workspace/.wandb_key")
         on_log("Pushed wandb key → /workspace/.wandb_key (chmod 600)")
+        return True
+
+    async def push_r2_config(
+        self, handle: PodHandle, *, on_log: LogFn = print,
+    ) -> bool:
+        """Write an rclone config for Cloudflare R2 to the pod.
+
+        Reads R2 credentials from the OS keyring and renders an
+        ``rclone.conf`` at ``/workspace/.config/rclone/rclone.conf`` (the
+        path bootstrap exports as ``RCLONE_CONFIG``). The remote is named
+        ``r2`` — the same name the bootstrap's ``CACHE_REMOTE`` and
+        backup paths assume.
+
+        Returns True if pushed, False if no creds are configured (cache
+        push/pull and backup/restore will then no-op gracefully).
+        """
+        creds = secrets.get_r2_credentials()
+        if not creds:
+            on_log("No R2 credentials in keyring — skipping rclone config push "
+                   "(set them in the Cloud tab to enable shared cache + R2 backup).")
+            return False
+        # provider=Other rather than provider=Cloudflare — the latter is a
+        # newer rclone alias that some pre-v1.62 builds don't recognize
+        # (NOTICE "s3 provider 'Cloudflare' not known"). "Other" is the
+        # generic S3-compatible provider; behaves the same for R2.
+        # no_check_bucket avoids an extra HEAD per upload — R2 returns 200
+        # on bucket existence checks slowly enough that batch uploads
+        # noticeably slow without it.
+        conf = (
+            "[r2]\n"
+            "type = s3\n"
+            "provider = Other\n"
+            f"access_key_id = {creds.access_key_id}\n"
+            f"secret_access_key = {creds.secret_access_key}\n"
+            f"endpoint = {creds.endpoint}\n"
+            "acl = private\n"
+            "no_check_bucket = true\n"
+        )
+        session = await self._ensure_session(handle, on_log=on_log)
+        await session.exec_capture("mkdir -p /workspace/.config/rclone")
+        await session.sftp_put_bytes(
+            conf.encode("utf-8"),
+            "/workspace/.config/rclone/rclone.conf",
+        )
+        await session.exec_capture("chmod 600 /workspace/.config/rclone/rclone.conf")
+        on_log(f"Pushed rclone.conf → /workspace/.config/rclone/ "
+               f"(R2 endpoint {creds.endpoint})")
         return True
 
     async def upload_dwca(
