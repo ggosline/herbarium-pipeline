@@ -184,7 +184,34 @@ class RunPodClient:
         if compute_type == "GPU":
             body["gpuCount"] = gpu_count
             if gpu_type_ids:
-                body["gpuTypeIds"] = list(gpu_type_ids)
+                ids = [s.strip().strip("'\"") for s in gpu_type_ids]
+                # Pre-validate against the published enum so the user gets
+                # a clear suggestion instead of a 500-char truncated 400.
+                # Best-effort: if the spec fetch fails (offline, etc.),
+                # let the API return whatever it returns.
+                try:
+                    valid = set(await self.list_gpu_types())
+                except Exception:
+                    valid = set()
+                if valid:
+                    bad = [g for g in ids if g not in valid]
+                    if bad:
+                        import difflib
+                        hints = []
+                        for g in bad:
+                            close = difflib.get_close_matches(g, valid, n=3, cutoff=0.4)
+                            hints.append(
+                                f"  {g!r} → did you mean: "
+                                f"{', '.join(repr(c) for c in close) or '(no close match)'}"
+                            )
+                        raise ValueError(
+                            "Unknown RunPod GPU type id(s). RunPod's web "
+                            "console shows marketing names; the API only "
+                            "accepts model numbers from its OpenAPI enum. "
+                            "Run `python tools/list_runpod_gpus.py` for the "
+                            "full list. Suggestions:\n" + "\n".join(hints)
+                        )
+                body["gpuTypeIds"] = ids
         if volume_gb is not None:
             body["volumeInGb"] = volume_gb
         if network_volume_id:
