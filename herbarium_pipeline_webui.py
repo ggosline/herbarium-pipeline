@@ -854,67 +854,6 @@ def _build_train() -> tuple:
                      "with a clean optimizer at the LR you specify above. "
                      "Leave unticked to continue an interrupted stage-2 run."))
 
-    # ── Remote training (optional) ────────────────────────────────────────────
-    ui.separator().classes("my-3")
-    with ui.expansion("Remote training  (optional)").classes("w-full"):
-        with ui.column().classes("w-full gap-2 pt-2"):
-
-            with ui.row().classes("w-full items-center gap-2"):
-                ui.label("SSH host:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
-                ssh_host = (ui.input(placeholder="user@hostname")
-                            .classes("flex-1").props("dense outlined")
-                            .bind_value(gs, "tr_ssh_host"))
-            with ui.row().classes("w-full items-center gap-2"):
-                ui.label("Local project root:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
-                ssh_lroot = (ui.input(placeholder="/mnt/e/MyProject")
-                             .classes("flex-1").props("dense outlined")
-                             .bind_value(gs, "tr_ssh_lroot"))
-            with ui.row().classes("w-full items-center gap-2"):
-                ui.label("Remote project root:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
-                ssh_rroot = (ui.input(placeholder="/home/user/MyProject")
-                             .classes("flex-1").props("dense outlined")
-                             .bind_value(gs, "tr_ssh_rroot"))
-            with ui.row().classes("w-full items-center gap-2"):
-                ui.label("Activation command:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
-                ssh_activate = (ui.input(value="conda activate p12")
-                                .classes("flex-1").props("dense outlined")
-                                .bind_value(gs, "tr_ssh_activate"))
-
-            ui.separator().classes("my-1")
-
-            # Transfer method
-            with ui.row().classes("w-full items-center gap-2"):
-                ui.label("Transfer via:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
-                xfer_mode = (ui.radio(
-                    {"rsync": "rsync (direct SSH)", "rclone": "rclone (cloud bucket)"},
-                    value="rsync").props("inline dense")
-                    .bind_value(gs, "tr_xfer_mode"))
-
-            # rclone-specific fields — shown only when rclone is selected
-            with ui.row().classes("w-full items-center gap-2") as rclone_row:
-                ui.label("rclone remote:bucket:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
-                rclone_remote = (ui.input(placeholder="r2:mybucket  or  s3:mybucket")
-                                 .classes("flex-1").props("dense outlined")
-                                 .bind_value(gs, "tr_rclone_remote"))
-
-            # Toggle visibility
-            xfer_mode.bind_value_to(rclone_row, "visible",
-                                    forward=lambda v: v == "rclone")
-            rclone_row.visible = False
-
-            with ui.row().classes("gap-2 mt-1 ml-48"):
-                ui.button("Sync data →", icon="upload",
-                          on_click=lambda: _sync_to()
-                          ).props("outlined color=teal dense")
-                ui.button("← Sync checkpoint", icon="download",
-                          on_click=lambda: _sync_from()
-                          ).props("outlined color=teal dense")
-            ui.label(
-                "rsync: copies directly over SSH using --partial so interrupted transfers resume. "
-                "rclone: uploads to a cloud bucket then the remote downloads from it — "
-                "faster for large datasets on slow uplinks. Leave SSH host blank to run locally."
-            ).classes("text-caption text-grey-6 mt-1")
-
     def _tr_env() -> dict:
         env = {}
         if nccl_p2p_disable.value:
@@ -932,26 +871,15 @@ def _build_train() -> tuple:
         if not out: raise ValueError("Enter an output directory.")
         n_gpus = int(_v(tr_gpus) or "1")
 
-        host   = _v(ssh_host)
-        lroot  = _v(ssh_lroot).rstrip("/")
-        rroot  = _v(ssh_rroot).rstrip("/")
-
-        def _repath(p: str) -> str:
-            """Swap local root for remote root in a path string."""
-            return p.replace(lroot, rroot) if (host and lroot and rroot) else p
-
-        if host:
-            # Remote: single-GPU python call (torchrun works too but needs nproc agreed)
-            cmd = ["python", "-u", _repath(str(SCRIPTS["train"]))]
-        elif n_gpus > 1:
+        if n_gpus > 1:
             cmd = [sys.executable, "-u", "-m", "torch.distributed.run",
                    "--standalone", f"--nproc_per_node={n_gpus}",
                    str(SCRIPTS["train"])]
         else:
             cmd = [sys.executable, "-u", str(SCRIPTS["train"])]
 
-        cmd += ["--sources"] + [_repath(s) for s in srcs] + [
-               "--output-dir",    _repath(out),
+        cmd += ["--sources"] + srcs + [
+               "--output-dir",    out,
                "--model",         tr_model.value,
                "--image-sz",      tr_imgsz.value,
                "--batch-size",       tr_batch.value,
@@ -981,7 +909,7 @@ def _build_train() -> tuple:
             cmd += ["--no-wandb"]
         ck = _v(resume)
         if ck:
-            cmd += ["--resume", _repath(ck)]
+            cmd += ["--resume", ck]
             if reset_opt.value:
                 cmd += ["--reset-optimizer"]
         if use_location.value:
@@ -989,59 +917,7 @@ def _build_train() -> tuple:
         mps = _v(tr_max_per_sp)
         if mps and mps != "0": cmd += ["--max-per-species", mps]
 
-        if host:
-            activate = _v(ssh_activate)
-            remote_str = " ".join(shlex.quote(a) for a in cmd)
-            if activate:
-                remote_str = f"{activate} && {remote_str}"
-            return ["ssh", "-T", host, remote_str]
-
         return cmd
-
-    async def _sync_to():
-        lroot  = _v(ssh_lroot).rstrip("/")
-        rroot  = _v(ssh_rroot).rstrip("/")
-        if not lroot or not rroot:
-            ui.notify("Set local and remote project roots first.", type="warning")
-            return
-        if xfer_mode.value == "rclone":
-            bucket = _v(rclone_remote).rstrip("/")
-            if not bucket:
-                ui.notify("Enter a rclone remote:bucket.", type="warning")
-                return
-            await _launch(["rclone", "copy", "--progress",
-                           f"{lroot}/", f"{bucket}/"])
-        else:
-            host = _v(ssh_host)
-            if not host:
-                ui.notify("Set SSH host first.", type="warning")
-                return
-            await _launch(["rsync", "-avz", "--partial", "--info=progress2",
-                           f"{lroot}/", f"{host}:{rroot}/"])
-
-    async def _sync_from():
-        lroot = _v(ssh_lroot).rstrip("/")
-        rroot = _v(ssh_rroot).rstrip("/")
-        out   = _v(tr_out)
-        if not lroot or not rroot or not out:
-            ui.notify("Set local root, remote root and output dir first.", type="warning")
-            return
-        rel        = out[len(lroot):].lstrip("/") if out.startswith(lroot) else Path(out).name
-        remote_out = f"{rroot}/{rel}"
-        if xfer_mode.value == "rclone":
-            bucket = _v(rclone_remote).rstrip("/")
-            if not bucket:
-                ui.notify("Enter a rclone remote:bucket.", type="warning")
-                return
-            await _launch(["rclone", "copy", "--progress",
-                           f"{bucket}/{rel}/", f"{out}/"])
-        else:
-            host = _v(ssh_host)
-            if not host:
-                ui.notify("Set SSH host first.", type="warning")
-                return
-            await _launch(["rsync", "-avz", "--partial",
-                           f"{host}:{remote_out}/", f"{out}/"])
 
     return _tr_cmd, tr_out, wandb_name, tr_sources, tr_model
 
