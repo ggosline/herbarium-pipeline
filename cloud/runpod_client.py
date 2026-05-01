@@ -257,6 +257,40 @@ class RunPodClient:
                 )
             await asyncio.sleep(poll_interval)
 
+    # ── GPU types ─────────────────────────────────────────────────────────
+
+    async def list_gpu_types(self) -> list[str]:
+        """Return the list of GPU type IDs RunPod will accept.
+
+        The REST v1 API has no ``/gputypes`` endpoint, but the valid
+        identifiers are baked into the published OpenAPI schema as the
+        enum on ``PodCreateInput.gpuTypeIds.items``. We fetch the spec
+        and pull that list — the same source the API server validates
+        against, so the result is authoritative.
+
+        Pass any string from this list as ``gpu_type_ids`` to
+        :meth:`create_pod`. ``GPU_BY_PURPOSE`` in ``orchestrator.py``
+        should always be a subset of these.
+        """
+        # Spec endpoint is unauthenticated; uses the same base_url + httpx
+        # client the rest of the methods do.
+        resp = await self._client.get("/openapi.json")
+        if resp.status_code >= 400:
+            raise RunPodAPIError(
+                resp.status_code, resp.text,
+                method="GET", url=str(resp.request.url),
+            )
+        spec = resp.json()
+        try:
+            enum = (spec["components"]["schemas"]["PodCreateInput"]
+                        ["properties"]["gpuTypeIds"]["items"]["enum"])
+        except (KeyError, TypeError) as e:
+            raise RunPodAPIError(
+                0, f"unexpected OpenAPI shape: {e!r}",
+                method="GET", url="/openapi.json",
+            )
+        return list(enum)
+
     # ── Network volumes ───────────────────────────────────────────────────
 
     async def create_volume(
