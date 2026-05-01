@@ -3037,10 +3037,46 @@ def _build_cloud() -> None:
                            ).classes("w-full mt-1"):
             with ui.row().classes("w-full items-center gap-4 flex-wrap pt-1"):
                 with ui.row().classes("items-center gap-1"):
-                    ui.label("GPU type override:").classes("text-sm")
-                    gpu_inp = (ui.input(placeholder="(blank = use purpose default)")
-                               .classes("w-56").props("dense outlined")
-                               .bind_value(gs, "cloud_gpu_override"))
+                    ui.label("GPU type:").classes("text-sm")
+                    # Searchable picker populated from RunPod's OpenAPI
+                    # schema (the same source the API server validates
+                    # against) the first time it's opened. Restricting to
+                    # this list avoids the opaque "value must be one of …"
+                    # 400 you get when the marketing name (e.g. "A100 SXM
+                    # 80GB" from the RunPod console) doesn't match the
+                    # API id ("NVIDIA A100-SXM4-80GB"). "" = use the
+                    # purpose default in GPU_BY_PURPOSE.
+                    # Strip any stray whitespace / quotes left over from
+                    # earlier free-text entries so the saved value loads
+                    # cleanly into the select.
+                    _saved_gpu = (gs.get("cloud_gpu_override") or "").strip().strip("'\"")
+                    gs["cloud_gpu_override"] = _saved_gpu
+                    gpu_inp = (ui.select(options=[""] + ([_saved_gpu] if _saved_gpu else []),
+                                          value=_saved_gpu, label="(blank = purpose default)",
+                                          with_input=True, clearable=True)
+                                .classes("w-72").props("dense outlined")
+                                .bind_value(gs, "cloud_gpu_override"))
+
+                    async def _refresh_gpu_list() -> None:
+                        # Lazy import to keep tab-render cheap if the user
+                        # never opens this expander.
+                        from cloud.runpod_client import RunPodClient
+                        api_key = (cloud_secrets.get_runpod_api_key()
+                                   or "openapi-spec-is-public")
+                        try:
+                            async with RunPodClient(api_key) as rp:
+                                ids = sorted(await rp.list_gpu_types())
+                        except Exception as e:
+                            ui.notify(f"Couldn't fetch GPU list: {e}",
+                                      type="negative"); return
+                        gpu_inp.set_options([""] + ids,
+                                            value=gpu_inp.value or "")
+                        ui.notify(f"Loaded {len(ids)} GPU types.",
+                                  type="positive")
+
+                    ui.button(icon="refresh", on_click=_refresh_gpu_list
+                              ).props("flat dense round")\
+                              .tooltip("Reload list from RunPod's OpenAPI schema.")
                 with ui.row().classes("items-center gap-1"):
                     ui.label("Datacenter:").classes("text-sm")
                     dc_inp = (ui.input(value=DEFAULT_DATACENTER).classes("w-32")
@@ -3051,6 +3087,12 @@ def _build_cloud() -> None:
                     vol_inp = (ui.input(value=str(DEFAULT_VOLUME_GB)).classes("w-20")
                                .props("dense outlined")
                                .bind_value(gs, "cloud_volume_gb"))
+            ui.label(
+                "RunPod's web console shows marketing names "
+                "('A100 SXM 80GB'); the API only accepts model numbers "
+                "('NVIDIA A100-SXM4-80GB'). Use the ↻ button to load the "
+                "current list, or run `python tools/list_runpod_gpus.py`."
+            ).classes("text-caption mt-1").style("color:#546e7a;max-width:780px")
 
         # Download caps — only relevant for the Download step. Collapsed by
         # default since most users never touch them.
