@@ -26,6 +26,12 @@ python /path/to/Pipeline/herbarium_pipeline_webui.py
 
 Your browser will open automatically at `http://localhost:8765`. All settings are **saved automatically** as you type — if you close and reopen the application, every field is restored exactly where you left off.
 
+The window has 12 tabs split into three groups:
+
+- **⚙ Setup** — one-time configuration: cloud credentials (RunPod / WandB / R2), SSH key, local environment check. Once everything is green here you should not need to come back. Skip this tab entirely if you only run training locally.
+- **1 Download → 5 Identify** — the five-step pipeline.
+- **☁ Cloud, Review, Analysis, Quick ID, Distribution, Run All** — operations across the produced data and the optional cloud-pod runner.
+
 ---
 
 ## Projects root and Project name
@@ -112,28 +118,29 @@ Click **Run Resize**.
 
 ## Tab 4 — Train
 
-Trains the AI model. Expect hours depending on the number of images and GPU speed.
+Trains the AI model. Expect hours depending on the number of images and GPU speed. Settings are organised into accordion sections — **Model & batch size** and **Schedule (epochs, learning rates, cool-down)** are open by default; the rest (Loss & hierarchy, Geo features, Logging & resume) are collapsed because their defaults work for most runs.
 
-**Data sources**
+**Data sources** *(always visible)*
 
 Click **Add Source…** and select the specsin CSV and images folder for your project. You can add multiple sources (e.g. images from different institutions or a second family) — they are combined automatically.
 
 **Output / run dir** — where training results, checkpoints, and the species list are saved.
 
-**Model** — the neural network architecture. `vit_large_patch16_dinov3.lvd1689m` is the most accurate option. Use a smaller model like `efficientnet_b4` if you have limited GPU memory.
+**Model & batch size** *(accordion, open by default)*
 
-**Key settings**
+`vit_large_patch16_dinov3.lvd1689m` is the most accurate model. Use a smaller model like `efficientnet_b4` if you have limited GPU memory.
 
 | Setting | Meaning |
 |---|---|
 | Image size (px) | Resolution images are fed to the model (640 is a good balance) |
 | Batch size | Images processed at once — reduce if you run out of GPU memory |
+| Stage 2 batch | Override batch size for stage 2 (full fine-tune); 0 = same as stage 1 |
 | Grad accum | Effectively multiplies the batch size without using more memory |
 | GPUs | Number of GPUs to use |
 | NCCL_P2P_DISABLE | Tick only for multi-GPU setups **without** NVLink (e.g. two cards in separate PCIe slots). Do not tick if NVLink is present. |
 | Max per species | Cap training images per species (0 = no cap) |
 
-**Training stages**
+**Schedule (epochs, learning rates, cool-down)** *(accordion, open by default)*
 
 Training is divided into up to three stages:
 
@@ -143,33 +150,24 @@ Training is divided into up to three stages:
 | Stage 2 (fine-tune) | All layers unlock and train together. The main training phase — 15–50 epochs depending on dataset size, LR ~0.0001. |
 | Cool-down | Optional final phase at **reduced batch size and LR**, run immediately after Stage 2. Best results have been achieved with batch 5, accum 2, LR 0.0001 for a few extra epochs. Set epochs to 0 to skip. |
 
-**Classification target**
+**Loss & hierarchy** *(accordion, collapsed)*
 
-- *Species* — the model learns to distinguish individual species (default)
-- *Genus* — the model learns genera only (useful if species labels are unreliable)
-- *Family* — the model learns families only
-- *Hierarchical multi-head* — the model learns all levels simultaneously using a combined loss. This often improves species-level accuracy. Set loss weights (e.g. Species 1.0, Genus 0.5, Family 0.0) to control each level's contribution.
+- *Species / Genus / Family* — which rank the model is trained to distinguish (default: species)
+- *Hierarchical multi-head* — the model learns all three ranks simultaneously using a combined loss. Often improves species-level accuracy. Set loss weights (e.g. Species 1.0, Genus 0.5, Family 0.0) to control each rank's contribution.
 
-**Location features**
+**Geo features** *(accordion, collapsed)*
 
-Tick **Use lat/lon during training** to fuse geographic coordinates with image features. When enabled, the model learns that a species from West Africa looks slightly different from the same species scanned in Europe, and can use collection locality to disambiguate similar-looking taxa. The *Geo MLP dim* controls the size of the geographic feature branch (64 is a good default).
+Tick **Use lat/lon during training** to fuse geographic coordinates with image features. When enabled, the model learns that a species from West Africa looks slightly different from the same species scanned in Europe, and can use collection locality to disambiguate similar-looking taxa. *Geo MLP dim* controls the size of the geographic feature branch (64 is a good default).
 
-**WandB logging**
+**Logging & resume** *(accordion, collapsed)*
 
-Enter a Weights & Biases project name to get live training charts. When a run is started fresh, per-species/genus/family image counts are uploaded as tables so you can review dataset composition in the WandB UI. If training is **resumed from a checkpoint**, the run automatically continues logging to the same WandB run rather than creating a new one. Leave the project field blank to use a local CSV log instead.
+- *WandB project* — enter a Weights & Biases project name to get live training charts. Leave blank for local CSV logs only. When training is **resumed from a checkpoint**, the run continues logging to the same WandB run rather than creating a new one.
+- *Resume checkpoint* — to continue an interrupted training run, select `<project>/runs/checkpoints/last.ckpt`. Stage 1 is skipped automatically on resume.
+- *Reset optimizer* — load weights only. Tick when starting a fresh stage 2 from a stage-1 checkpoint with a different LR.
 
-**Resume checkpoint**
+**WandB run name** *(always visible — just above the Run Training button)*
 
-To continue an interrupted training run, select `<project>/runs/checkpoints/last.ckpt` and click Run Training. Stage 1 is skipped automatically on resume.
-
-**Remote training**
-
-Expand the *Remote training* section to run training on a remote GPU server:
-
-- Enter the **SSH host** (`user@hostname`), **local project root**, and **remote project root**
-- Click **Sync data →** to copy your dataset to the remote machine (via rsync or rclone to a cloud bucket)
-- Click **Run Training** — the command runs on the remote machine over SSH
-- Click **← Sync checkpoint** to retrieve the finished checkpoint
+The one logging field worth changing per experiment. Use descriptive names like `stage2_lr1e-4_geo` so the WandB sidebar stays scannable when you have a dozen runs in one project. The Apply paths button at the top of the page resets it to the project name, so set it after Apply.
 
 Click **Run Training**.
 
@@ -191,12 +189,18 @@ Runs the trained model over your images to sort unidentified specimens and flag 
 
 **Output / Review dir** — results are written here.
 
-**Thresholds**
+**Advanced — thresholds, image size, geo re-rank** *(expander, collapsed)*
+
+Defaults work for most runs. Open this section to adjust:
 
 | Setting | Meaning |
 |---|---|
 | Mismatch threshold | Confidence level above which a disagreement between the model and the recorded label is flagged (0.7 = 70%) |
 | Low-conf flag | Images where the top prediction confidence is below this value are also set aside (0 = off) |
+| Image size (px) | Inference resolution; should match training (640 by default) |
+| Batch size | Reduce for VRAM-constrained inference |
+| Geo rerank weight | Blend model probability with geographic range from training occurrences. 0 = off, 0.3 is a good starting point. Only applied when lat/lon is present. |
+| Geo sigma (km) | Bandwidth for geographic scoring. 500 km suits most plant families; use 200–300 for highly localised taxa. |
 
 A `predictions.csv` file is written to the output directory with the full top-5 results for every image.
 
@@ -291,7 +295,7 @@ Reduce **Batch size** (try 2 or 1), increase **Grad accum** by the same factor t
 This is handled automatically — the DDP strategy sets `find_unused_parameters=True` whenever hierarchical mode is enabled.
 
 **My settings are gone after restarting the app.**
-Settings are persisted to `~/.nicegui/storage-general.json`. If this file is missing or corrupted, fields will revert to defaults. Use **Apply paths** to quickly restore all project paths from the Projects root and Project name fields.
+Settings are persisted to `<Pipeline repo>/.nicegui/storage-general.json` (relative to where you launched the script). If this file is missing or corrupted, fields will revert to defaults. Use **Apply paths** to quickly restore all project paths from the Projects root and Project name fields. Cloud credentials live in the OS keyring (not this JSON), so they survive even if the storage file is wiped.
 
 ---
 

@@ -104,28 +104,39 @@ You should now have **four strings** noted down:
 ## 4. Enter all credentials into the WebUI
 
 1. Launch the WebUI (`python /path/to/Pipeline/herbarium_pipeline_webui.py`).
-2. Open the **Cloud** tab.
-3. Fill in and **Save** each section:
+2. Open the **⚙ Setup** tab (the first one).
+3. Each section has a status pill (✓ ready / not set) and its own *Save* button:
 
-| Section | What to paste |
+| Card | What to paste |
 |---|---|
-| **API key** (RunPod) | The `rpa_…` string from step 1d |
-| **WandB key** | The key from step 2 (or leave blank to skip wandb) |
-| **R2 credentials** | Account ID, Access Key, Secret, default bucket = `herbarium-backup` |
-| **SSH private key** | Path to `~/.ssh/id_ed25519_herbarium` (the file *without* `.pub`) |
+| **Local environment** | Nothing — just confirms your Python / NiceGUI / GPU / disk are usable. Click *Re-check* if the readout looks stale. |
+| **RunPod** | The `rpa_…` API key from step 1d, plus the path to your **SSH private key** (`~/.ssh/id_ed25519_herbarium` — the file *without* `.pub`). |
+| **WandB** | Key from step 2 (or leave blank to skip wandb). |
+| **Cloudflare R2** | Account ID, Access Key, Secret, default bucket = `herbarium-backup`. |
 
-Each *Save* button stores its secret in your **OS keyring** (Windows Credential Manager / macOS Keychain / Linux Secret Service). Nothing is written to plain files.
+Each *Save* button stores its secret in your **OS keyring** (Windows Credential Manager / macOS Keychain / Linux Secret Service). Nothing is written to plain files. When all four cards show ✓, you can switch to the ☁ Cloud tab and forget Setup exists.
 
 ---
 
 ## 5. First project — provision and run
 
-1. Top of the page: set a **Project name** (e.g. `MyFirstProject`) and **Apply paths**.
-2. Cloud tab → set:
-   - **Purpose**: `light` for download/prep, `train` for training.
-   - **Datacenter**: pick one that's geographically near you. *Once chosen, it's locked* — your network volume can only live in that DC.
-   - **Volume size**: 80 GB is fine for ≤10k images.
-3. Click **Provision**. You'll see logs in the panel:
+1. **Top of the page** (above the tabs): set a **Project name** (e.g. `MyFirstProject`) and click **Apply paths**.
+2. Open the **☁ Cloud** tab. It's organised as four cards:
+
+| Card | What it does |
+|---|---|
+| **Pod** | Status row (pod id / cost / current step) + lifecycle buttons: *Provision + sync code*, *Cancel running step*, *Terminate (keep volume)*, *Terminate + delete volume*. Banner at the top warns if Setup credentials are missing. |
+| **Configure run** | *Project* (mirrors the top-of-page field) and *Purpose*. The **Advanced** expander has GPU type override (a searchable dropdown — click ↻ to load the live list from RunPod), datacenter, volume size. **Download caps** is a separate expander. |
+| **Pipeline** | The Upload-DwC-A button + the five step buttons in flow order: Setup → Download → Prep → Train → Identify. A yellow note above them explains that each step pulls its parameters from the matching stage tab (hover any step button — its tooltip names the exact source tab and fields). The **Repair R2 wheel cache** button and **⚠ Danger zone** (wipe pod-side data) live here too. |
+| **Results & Archive** | *Download results*, *Pull images_1024*, *Archive project to R2*, *Restore project from R2*. |
+
+3. In **Configure run**, set:
+   - **Purpose**: `light` (NVIDIA L4 — cheap, for download / prep / identify) or `train` (RTX 4090 — long GPU run).
+   - **Advanced → Datacenter**: pick one that's geographically near you. *Once chosen, it's locked* — your network volume can only live in that DC.
+   - **Advanced → Volume size**: 80 GB is fine for ≤10k images.
+   - **Advanced → GPU type** (optional override): leave blank to use the purpose default. If you want a specific GPU, click the **↻** button to load RunPod's current list, then pick from the dropdown — RunPod's web console shows marketing names ("A100 SXM 80GB") that are *not* what the API accepts ("NVIDIA A100-SXM4-80GB"). For a CLI version of the same list run `python tools/list_runpod_gpus.py`.
+
+4. **Pod card → Provision + sync code**. Logs appear in the right-hand panel:
 
    ```
    Creating network volume (80 GB, EUR-IS-1)...
@@ -138,11 +149,11 @@ Each *Save* button stores its secret in your **OS keyring** (Windows Credential 
    Pushed rclone.conf → /workspace/.config/rclone/
    ```
 
-4. Click **Setup**. **First time:** this takes ~10 min on a fresh project (downloads torch, DALI, etc., then pushes them to the R2 cache). **Every subsequent setup** on any project: ~1 min (pulls from R2 cache).
+5. **Pipeline card → Setup**. **First time:** ~5–10 min (downloads torch + nvidia-* + DALI etc., then pushes them to the R2 cache). **Every subsequent setup** on any project: ~1 min (pulls from R2 cache).
 
-5. Click **Download** → **Prep** → **Train** in order, configuring fields on the Download/Train tabs.
+6. **Pipeline card → Download → Prep → Train → Identify** in order. Configure each step's parameters on its own stage tab first — Train in particular pulls every knob (model, batch size, epochs, LRs, geo, hierarchy, WandB run name) from the **4 Train** tab.
 
-6. When done: **Archive project to R2** to back up checkpoints + images, then terminate the pod from the RunPod console (or let the idle watchdog do it after 1 hr of inactivity).
+7. When done: **Results & Archive → Archive project to R2** to back up checkpoints + images, then **Pod → Terminate** (or let the idle watchdog do it after 1 hr of inactivity).
 
 ---
 
@@ -181,6 +192,25 @@ The previous step crashed but the task tracker didn't clear. Click **Cancel runn
 
 ### Pod was created but provision crashed before SSH came up
 The orchestrator now persists `pod_id` immediately, so the next **Provision** click will reuse the orphaned pod (or report it). If reuse fails, terminate the orphan in the RunPod console first.
+
+### `400 Bad Request — value must be one of 'NVIDIA GeForce RTX 4090', …` on Provision
+The GPU id you typed into the **GPU type** override doesn't match RunPod's API enum. Their web console shows marketing names ("A100 SXM 80GB"); the API only accepts model numbers ("NVIDIA A100-SXM4-80GB"). Two fixes:
+
+1. Open Configure run → Advanced → click the **↻** next to the GPU dropdown and pick from the list, or
+2. Clear the override entirely so the purpose default kicks in.
+
+For a quick CLI listing of every accepted id:
+```bash
+python tools/list_runpod_gpus.py            # all 49
+python tools/list_runpod_gpus.py --grep H100  # filter
+```
+
+The orchestrator also pre-validates whatever you submit and suggests the three closest matches if it doesn't recognise the id, so a typo gets a useful error rather than the truncated 400.
+
+### Setup pushes wheels to R2 but the next pod still re-downloads everything
+Symptom: in `r2:herbarium-cache/uv/` you only see a small `simple-v21/pypi/` tree (~25 entries) and no `wheels-v6/` or `archive-v0/` directory. This was a real bug in versions of `pod_bootstrap.sh` before commit `af57303`: `uv cache prune --ci` ran *before* `cache_push` and stripped the wheel binaries from the local cache, so only the index metadata reached R2. The fix removed the prune step.
+
+To repair an existing pod whose R2 cache was emptied this way, click the **Repair R2 wheel cache** button (Pipeline card on the Cloud tab) — it forces `uv sync --frozen --reinstall` to re-download every wheel into the volume cache, then pushes them to R2. One painful PyPI fetch (~5–30 min depending on datacenter) buys back warm-cache pods for every future provision.
 
 ---
 
