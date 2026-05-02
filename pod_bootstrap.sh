@@ -103,12 +103,24 @@ cache_push() {
        && ! rclone mkdir "$CACHE_REMOTE" 2>/dev/null; then
     echo "Cache remote $CACHE_REMOTE not writable — skipping push"; return 0
   fi
+  # Show local sizes BEFORE push so a wheel-stripped cache (e.g. after
+  # `uv cache prune --ci`) is obvious in the log instead of silently
+  # uploading a tiny metadata-only tree to R2.
   echo "→ Pushing shared cache to $CACHE_REMOTE (diff only)..."
+  echo "  local sizes:"
+  du -sh "$UV_CACHE_DIR" "$HF_HOME" 2>/dev/null | sed 's/^/    /'
+
+  local rc_uv=0 rc_hf=0
   rclone copy "$UV_CACHE_DIR/" "$CACHE_REMOTE/uv/" \
-    "${RCLONE_CACHE_FLAGS[@]}" 2>&1 | tail -3 || true
+    "${RCLONE_CACHE_FLAGS[@]}" --stats-one-line 2>&1 | tail -3 || rc_uv=$?
   rclone copy "$HF_HOME/"      "$CACHE_REMOTE/huggingface/" \
-    "${RCLONE_CACHE_FLAGS[@]}" 2>&1 | tail -3 || true
-  echo "✓ Cache push done"
+    "${RCLONE_CACHE_FLAGS[@]}" --stats-one-line 2>&1 | tail -3 || rc_hf=$?
+
+  if [ "$rc_uv" -ne 0 ] || [ "$rc_hf" -ne 0 ]; then
+    echo "⚠ Cache push had errors (uv rc=$rc_uv, hf rc=$rc_hf)" >&2
+  else
+    echo "✓ Cache push done"
+  fi
 }
 
 # ─── one-time per pod: env setup ──────────────────────────────────────────
@@ -181,13 +193,18 @@ setup() {
     uv run wandb login "$(cat "$WS/.wandb_key")"
   fi
 
-  # 9. Drop wheels that no resolution still needs (e.g. wheels left over
-  #    from a previous lock revision). Keeps the volume + R2 cache lean.
-  #    --ci is non-interactive and only removes truly unused entries.
-  uv cache prune --ci || true
-
-  # 10. Push any new wheels (DALI, anything PyPI just fetched) back to R2
-  #     so the next pod for any project benefits.
+  # 9. Push the wheels we just downloaded back to R2 so the next pod (any
+  #    project) starts from a warm cache.
+  #
+  #    NOTE: do NOT run `uv cache prune --ci` here. Its purpose is the
+  #    opposite of ours — it strips out the pre-built wheel binaries
+  #    ("reduces cache size by ~90%") on the assumption that re-downloading
+  #    from a fast PyPI is cheaper than persisting them. For our
+  #    EUR-IS-1 → PyPI path that assumption inverts: re-downloading
+  #    8 GB of wheels from PyPI takes ~1 hr, but pulling them from R2
+  #    takes ~1 min. Pruning here would leave R2 with only the index
+  #    metadata (the small ~25-entry simple-v21/pypi/ tree) and force
+  #    every future pod to re-fetch wheels from PyPI.
   cache_push
 
   # 11. Make the cache + venv env vars sticky for interactive SSH sessions,
