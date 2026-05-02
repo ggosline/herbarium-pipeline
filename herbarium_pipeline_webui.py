@@ -844,8 +844,8 @@ def _build_train() -> tuple:
         with ui.row().classes("w-full items-center gap-2"):
             ui.label("WandB project:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
             wandb_proj = ui.input(value="").classes("w-48").props("dense outlined").bind_value(gs, "tr_wandb_proj")
-            ui.label("Run name:").classes("text-sm ml-4")
-            wandb_name = ui.input(value="herbarium_run").classes("w-48").props("dense outlined").bind_value(gs, "tr_wandb_name")
+            ui.label("(rarely changes — set once per project; experiments distinguished by Run name below)"
+                     ).classes("text-caption text-grey-7")
         resume = _path_input("Resume checkpoint:", mode="file").bind_value(gs, "tr_resume")
         reset_opt = (ui.checkbox(
             "Reset optimizer  (load weights only — use when starting a fresh stage 2 from a stage-1 checkpoint)",
@@ -859,6 +859,19 @@ def _build_train() -> tuple:
         if nccl_p2p_disable.value:
             env["NCCL_P2P_DISABLE"] = "1"
         return env
+
+    # Run name lives outside the accordion because it's the one logging
+    # field that should change per experiment. Placed just above Run
+    # Training so the user sees / edits it on every launch.
+    with ui.row().classes("w-full items-center gap-2 mt-3"):
+        ui.label("WandB run name:").classes("w-36 text-right shrink-0 font-medium")\
+            .style("color:#455a64")
+        wandb_name = (ui.input(value="herbarium_run",
+                               placeholder="e.g. stage2_lr1e-4_geo")
+                      .classes("flex-1").props("dense outlined")
+                      .bind_value(gs, "tr_wandb_name"))
+        ui.label("descriptive names make the WandB sidebar much easier to scan")\
+            .classes("text-caption text-grey-7")
 
     ui.button("Run Training", icon="model_training",
               on_click=lambda: _launch(_tr_cmd(), extra_env=_tr_env())
