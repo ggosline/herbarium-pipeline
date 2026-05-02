@@ -875,6 +875,9 @@ def train(config: dict):
     # have requires_grad=True at initialisation; unfreezing mid-run means the
     # backbone gradients are never all-reduced across GPUs and training goes flat.
     checkpoint_cb = None
+    # Track whichever trainer ran last so the final summary can pull the
+    # last-epoch metrics from its callback_metrics dict.
+    last_trainer = None
     if do_stage1:
         if hasattr(model_module, "freeze_backbone"):
             model_module.freeze_backbone()
@@ -892,6 +895,7 @@ def train(config: dict):
                                     EarlyStopping(monitor="valid_loss", patience=5, mode="min")],
                                    stage1_epochs, num_gpus)
         s1_trainer.fit(lit)
+        last_trainer = s1_trainer
         if use_wandb:
             _step_offset[0] += s1_trainer.global_step
             wandb_offset_file.write_text(str(_step_offset[0]))
@@ -940,6 +944,7 @@ def train(config: dict):
                                     EarlyStopping(monitor="valid_loss", patience=5, mode="min")],
                                    stage2_epochs, num_gpus)
         s2_trainer.fit(lit, ckpt_path=fit_ckpt)
+        last_trainer = s2_trainer
         if use_wandb:
             _step_offset[0] += s2_trainer.global_step
             wandb_offset_file.write_text(str(_step_offset[0]))
@@ -979,20 +984,61 @@ def train(config: dict):
             cooldown_epochs, num_gpus,
         )
         cooldown_trainer.fit(lit)
+        last_trainer = cooldown_trainer
         if use_wandb:
             _step_offset[0] += cooldown_trainer.global_step
             wandb_offset_file.write_text(str(_step_offset[0]))
         checkpoint_cb = cooldown_ckpt_cb
 
-    best_ckpt = checkpoint_cb.best_model_path if checkpoint_cb else str(output_dir / "checkpoints" / "last.ckpt")
-    print(f"\n{'='*50}\nTRAINING COMPLETE")
-    print(f"Best checkpoint : {best_ckpt}")
-    print(f"Nameslist       : {nameslist_path}")
-    print(f"{'='*50}")
-
+    # wandb.finish() prints its own (long) Run summary table, which can be
+    # truncated by output viewers (NiceGUI's log panel collapses long
+    # contiguous bursts into "... + N lines"). Run it FIRST so our compact
+    # summary below is the very last thing on stdout — guaranteed visible
+    # even if wandb's table got folded.
     if use_wandb:
         import wandb
         wandb.finish()
+
+    best_ckpt = (checkpoint_cb.best_model_path if checkpoint_cb
+                 else str(output_dir / "checkpoints" / "last.ckpt"))
+
+    # Pull the last-epoch metrics off the trainer that actually ran most
+    # recently. callback_metrics is populated as logs flow through the
+    # Lightning logger, so it has whatever the last validation epoch saw.
+    final_metrics: dict = (last_trainer.callback_metrics
+                           if last_trainer is not None else {})
+
+    def _fmt(name: str, fmt: str = ".4f") -> str:
+        v = final_metrics.get(name)
+        if v is None:
+            return "n/a"
+        try:
+            return f"{float(v):{fmt}}"
+        except (TypeError, ValueError):
+            return str(v)
+
+    # Best valid_loss across the whole run: the active checkpoint callback
+    # tracks `monitor='valid_loss', mode='min'`, so its best_model_score is
+    # exactly that. (For hierarchical models we still monitor valid_loss,
+    # so this stays meaningful.)
+    best_val_loss_str = "n/a"
+    if checkpoint_cb is not None and checkpoint_cb.best_model_score is not None:
+        best_val_loss_str = f"{float(checkpoint_cb.best_model_score):.4f}"
+
+    print(f"\n{'='*50}\nTRAINING COMPLETE")
+    print(f"  Final val_Accuracy : {_fmt('val_Accuracy', '.4f')}")
+    print(f"  Final valid_loss   : {_fmt('valid_loss', '.4f')}")
+    print(f"  Best valid_loss    : {best_val_loss_str}")
+    # Hierarchical heads, when enabled, also report their own per-rank
+    # accuracies. Print them only when present so single-head runs stay
+    # uncluttered.
+    if "val_genus_Accuracy" in final_metrics:
+        print(f"  Final val_genus_Accuracy  : {_fmt('val_genus_Accuracy', '.4f')}")
+    if "val_family_Accuracy" in final_metrics:
+        print(f"  Final val_family_Accuracy : {_fmt('val_family_Accuracy', '.4f')}")
+    print(f"  Best checkpoint    : {best_ckpt}")
+    print(f"  Nameslist          : {nameslist_path}")
+    print(f"{'='*50}")
 
 
 # ---------------------------------------------------------------------------
