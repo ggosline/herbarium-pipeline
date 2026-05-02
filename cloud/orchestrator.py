@@ -497,21 +497,46 @@ class CloudOrchestrator:
         on_log: LogFn = print,
         on_progress: ProgressFn | None = None,
     ) -> list[Path]:
-        """Pull checkpoint, names list, and predictions back to ``local_dir``.
+        """Pull every checkpoint, the names list, predictions, and specsin
+        back to ``local_dir``.
 
         Quietly skips files that don't exist on the pod (e.g. ``predictions.csv``
         before the identify step has run). Returns the list of files written.
+
+        Checkpoints are pulled by globbing ``checkpoints/*.ckpt`` rather than
+        a hardcoded list because Lightning emits one ``last.ckpt`` plus per-
+        stage best-of-run files like ``epoch=17-valid_loss=0.40.ckpt`` and
+        ``cd-epoch=03-valid_loss=0.39.ckpt``, and the user usually wants the
+        best one (lowest valid_loss) as well as last.
         """
         local_dir = Path(local_dir)
         local_dir.mkdir(parents=True, exist_ok=True)
         session = await self._ensure_session(handle, on_log=on_log)
 
-        wishlist = [
-            (f"{REMOTE_DATA}/checkpoints/last.ckpt", local_dir / "last.ckpt"),
-            (f"{REMOTE_DATA}/checkpoints/nameslist.json", local_dir / "nameslist.json"),
+        # Fixed-path artefacts.
+        # nameslist.json lives at /workspace/data/nameslist.json (Lightning
+        # writes it next to output_dir, not under checkpoints/) — easy bug
+        # to introduce because the README's project layout puts it under
+        # runs/ when training locally.
+        wishlist: list[tuple[str, Path]] = [
+            (f"{REMOTE_DATA}/nameslist.json",            local_dir / "nameslist.json"),
             (f"{REMOTE_DATA}/predictions/predictions.csv", local_dir / "predictions.csv"),
-            (f"{REMOTE_DATA}/specsin.csv", local_dir / "specsin.csv"),
+            (f"{REMOTE_DATA}/specsin.csv",               local_dir / "specsin.csv"),
         ]
+
+        # Discover every checkpoint file rather than hardcoding names.
+        # Run as a single shell command so we don't pay per-file SFTP listing.
+        rc, ls_out = await session.exec_capture(
+            f"ls -1 {REMOTE_DATA}/checkpoints/*.ckpt 2>/dev/null"
+        )
+        if rc == 0 and ls_out.strip():
+            for line in ls_out.strip().splitlines():
+                remote = line.strip()
+                if remote:
+                    wishlist.append((remote, local_dir / Path(remote).name))
+        else:
+            on_log(f"  no checkpoints under {REMOTE_DATA}/checkpoints/")
+
         written: list[Path] = []
         for remote, local in wishlist:
             stat = await session.remote_stat(remote)
@@ -521,12 +546,19 @@ class CloudOrchestrator:
             r_size, r_mtime = stat
             if local.exists():
                 l = local.stat()
-                # Skip when local matches remote in both size and freshness.
-                # Local mtime ≥ remote means we already have at least this version.
+                # Skip only when local size matches AND local was modified
+                # at or after remote. paramiko's sftp_get does NOT preserve
+                # remote mtime, so local mtime is the wall-clock time of
+                # the previous download — which is reliably ≥ the remote
+                # mtime that existed at that time, but < any newer remote
+                # mtime produced by a re-train.
                 if l.st_size == r_size and l.st_mtime >= r_mtime - 1:
                     on_log(f"  up-to-date {local.name} ({r_size:,} bytes)")
                     written.append(local)
                     continue
+                on_log(f"  stale {local.name} (local {l.st_size:,}b @"
+                       f" {int(l.st_mtime)}, remote {r_size:,}b @"
+                       f" {int(r_mtime)}) — re-downloading")
             on_log(f"  download {remote} → {local} ({r_size:,} bytes)")
             await session.sftp_get(remote, local, on_progress=on_progress)
             written.append(local)
