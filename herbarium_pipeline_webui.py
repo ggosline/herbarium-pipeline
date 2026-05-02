@@ -2855,7 +2855,34 @@ def _build_cloud() -> None:
         # Auto-populate Identify + Review tab fields with the freshly-pulled paths
         # so the user can move on without re-typing them.
         names = {p.name: str(p) for p in written}
-        if "last.ckpt" in names:        gs["id_ckpt"]    = names["last.ckpt"]
+
+        # Prefer the lowest-valid_loss checkpoint over last.ckpt for inference.
+        # Lightning's filename templates put the loss as the last "-N.NNNN"
+        # segment before .ckpt:
+        #   stage 1:  s1-04-0.4123.ckpt
+        #   stage 2:  17-0.3984.ckpt
+        #   cooldown: cd-03-0.3987.ckpt
+        # last.ckpt has no parsable loss; fall back to it only if no
+        # numbered checkpoint matched.
+        import re
+        loss_re = re.compile(r"-(\d+\.\d+)\.ckpt$")
+        scored: list[tuple[float, str]] = []
+        for name, path in names.items():
+            m = loss_re.search(name)
+            if m:
+                try:
+                    scored.append((float(m.group(1)), path))
+                except ValueError:
+                    pass
+        if scored:
+            scored.sort(key=lambda x: x[0])
+            best_loss, best_path = scored[0]
+            gs["id_ckpt"] = best_path
+            _info(f"Identify ckpt → {Path(best_path).name} (best valid_loss={best_loss:.4f})")
+        elif "last.ckpt" in names:
+            gs["id_ckpt"] = names["last.ckpt"]
+            _info("Identify ckpt → last.ckpt (no per-stage best files were pulled)")
+
         if "nameslist.json" in names:   gs["id_nl"]      = names["nameslist.json"]
         if "predictions.csv" in names:
             gs["review_csv"] = names["predictions.csv"]
