@@ -3155,21 +3155,52 @@ def _build_cloud() -> None:
             "(Setup is a one-time per-pod env install)."
         ).classes("text-body2 mt-1").style("color:#455a64")
 
+        # Cross-tab data flow note. The cloud step buttons don't have
+        # their own parameter forms — they read the same gs[...] keys
+        # that the local stage tabs bind to, so configuring a stage
+        # locally and running it on the cloud uses identical settings.
+        ui.label(
+            "Each step pulls its parameters from the matching stage tab — "
+            "configure the run there, click here to execute it on the pod. "
+            "Hover a button to see exactly which fields it uses."
+        ).classes("text-body2 mt-1").style(
+            "color:#37474f;background:#fffde7;border-left:3px solid #fbc02d;"
+            "padding:6px 12px;border-radius:0 4px 4px 0;max-width:1000px"
+        )
+
         with ui.row().classes("w-full gap-2 mt-2 flex-wrap items-center"):
             ui.button("Upload DwC-A", icon="archive",
                       on_click=lambda: _wrap(_do_upload_dwca)
                       ).props("unelevated dense color=primary")\
-                      .tooltip("Push the DwC-A ZIP set on the Download tab "
-                               "to /workspace/data/dwca.zip on the pod.")
+                      .tooltip("Pushes the DwC-A ZIP from the 1 Download tab "
+                               "(dl_dwca field) to /workspace/data/dwca.zip "
+                               "on the pod. Required before the Download step.")
 
-        # Step buttons — visual flow with arrows.
+        # Step buttons — visual flow with arrows. Each tooltip names the
+        # source tab/fields so the user knows where to change a parameter.
         with ui.row().classes("w-full gap-1 mt-2 flex-wrap items-center"):
             steps = (
-                ("setup",    "settings",        "Install env (uv sync + DALI)"),
-                ("download", "download",        "Run download_gbif_images.py"),
-                ("prep",     "filter_alt",      "Filter, crop, resize"),
-                ("train",    "model_training",  "Run train_herbarium.py"),
-                ("identify", "manage_search",   "Run identify_herbarium.py"),
+                ("setup",    "settings",
+                 "One-time env install (uv sync + DALI). No user params."),
+                ("download", "download",
+                 "Runs download_gbif_images.py on the pod. "
+                 "Uses the DwC-A you uploaded above + the Download caps "
+                 "expander on this tab (max-per-species, total limit, "
+                 "IIIF size, post-download resize)."),
+                ("prep",     "filter_alt",
+                 "Runs filter+crop+resize on the pod with hardcoded defaults "
+                 "(CLIP filter, crop white borders, resize to 1024px). "
+                 "The 2 Filter & Crop / 3 Resize tabs only affect local runs."),
+                ("train",    "model_training",
+                 "Runs train_herbarium.py on the pod, pulling EVERY knob "
+                 "from the 4 Train tab: model, image size, batch sizes, "
+                 "grad accum, GPUs, all stage epochs/LRs, cooldown, label "
+                 "level, hierarchical weights, geo features, max-per-species, "
+                 "and WandB run name. Set those in the 4 Train tab first."),
+                ("identify", "manage_search",
+                 "Runs identify_herbarium.py on the pod with hardcoded "
+                 "defaults. Pulls neither thresholds nor batch size from "
+                 "the 5 Identify tab — those only affect local runs."),
             )
             for idx, (step, icon, tip) in enumerate(steps):
                 if idx > 0:
