@@ -3165,6 +3165,21 @@ def _build_cloud() -> None:
                           on_click=lambda s=step: _wrap(lambda s=s: _do_step(s))
                           ).props("outlined dense color=teal").tooltip(tip)
 
+        # One-off maintenance — repair the R2 wheel cache after a bootstrap
+        # that left it metadata-only (the historical `uv cache prune --ci`
+        # bug). Forces a re-download of every wheel and pushes them to R2.
+        with ui.row().classes("w-full gap-2 mt-2 flex-wrap items-center"):
+            ui.label("Maintenance:").classes("text-sm").style("color:#546e7a")
+            ui.button("Repair R2 wheel cache", icon="build",
+                      on_click=lambda: _wrap(
+                          lambda: _do_step("repair_cache"))
+                      ).props("flat dense color=teal")\
+                      .tooltip("Force re-download of every wheel into the "
+                               "pod's UV cache, then push to R2. Use once if "
+                               "an earlier setup pruned the wheels before "
+                               "pushing — leaves R2 with the full ~8 GB so "
+                               "future pods skip the slow PyPI fetch.")
+
         # Danger zone — wipe pod-side data. Hidden by default so destructive
         # actions don't sit next to constructive ones.
         with ui.expansion("⚠ Danger zone — wipe pod-side data"

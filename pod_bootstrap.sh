@@ -489,15 +489,37 @@ restore() {
   echo "✓ Restore complete. Skip download/prep — go straight to identify or further training."
 }
 
-case "${1:?usage: $0 [setup|download|prep|train|identify|backup|restore|cache_pull|cache_push]}" in
-  setup)      setup ;;
-  download)   download ;;
-  prep)       prep ;;
-  train)      train ;;
-  identify)   identify ;;
-  backup)     backup ;;
-  restore)    restore ;;
-  cache_pull) cache_pull ;;
-  cache_push) cache_push ;;
-  *)          echo "unknown step: $1"; exit 1 ;;
+# ─── one-shot: rebuild the wheel cache from PyPI/CDN, push to R2 ──────────
+# Used after a pod survived an earlier bootstrap that prune'd the wheel
+# binaries (the historical `uv cache prune --ci` bug). Forces uv to
+# re-download every wheel into UV_CACHE_DIR, then ships them to R2 so
+# every future pod skips the slow PyPI fetch.
+repair_cache() {
+  if [ ! -d "$REPO" ]; then
+    echo "Repo missing at $REPO — run setup first."; exit 1
+  fi
+  cd "$REPO"
+  echo "→ Forcing re-download of all wheels into $UV_CACHE_DIR..."
+  echo "  (uv sync --frozen --reinstall — this is the slow PyPI step we"
+  echo "   want to do exactly once, then never again on any future pod.)"
+  uv sync --frozen --reinstall
+  echo
+  echo "→ Wheel cache size after redownload:"
+  du -sh "$UV_CACHE_DIR" 2>/dev/null
+  echo
+  cache_push
+}
+
+case "${1:?usage: $0 [setup|download|prep|train|identify|backup|restore|cache_pull|cache_push|repair_cache]}" in
+  setup)        setup ;;
+  download)     download ;;
+  prep)         prep ;;
+  train)        train ;;
+  identify)     identify ;;
+  backup)       backup ;;
+  restore)      restore ;;
+  cache_pull)   cache_pull ;;
+  cache_push)   cache_push ;;
+  repair_cache) repair_cache ;;
+  *)            echo "unknown step: $1"; exit 1 ;;
 esac
