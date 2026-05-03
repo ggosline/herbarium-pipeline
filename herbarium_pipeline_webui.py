@@ -2653,22 +2653,18 @@ _cloud_widgets: dict = {
 
 
 def _is_cloud_mode() -> bool:
-    """Cloud is the default; users without a GPU live here."""
     return app.storage.general.get("main_mode", "cloud") == "cloud"
 
 
-def _local_only(elem):
-    """Hide a widget when the user is in Cloud mode."""
+def _mode_only(elem, mode: str):
+    """Show ``elem`` only when ``app.storage.general["main_mode"] == mode``."""
     elem.bind_visibility_from(app.storage.general, "main_mode",
-                              lambda v: (v or "cloud") == "local")
+                              lambda v: (v or "cloud") == mode)
     return elem
 
 
-def _cloud_only(elem):
-    """Hide a widget when the user is in Local mode."""
-    elem.bind_visibility_from(app.storage.general, "main_mode",
-                              lambda v: (v or "cloud") == "cloud")
-    return elem
+def _local_only(elem): return _mode_only(elem, "local")
+def _cloud_only(elem): return _mode_only(elem, "cloud")
 
 
 def _cloud_log(line: str) -> None:
@@ -2714,24 +2710,50 @@ def _ensure_orch() -> Optional[CloudOrchestrator]:
     return _cloud["orch"]
 
 
+def _clear_active_pod() -> None:
+    """Reset the per-pod state after a terminate. Called from manual
+    Terminate, the auto light→train upgrade, and the Run All sequencer's
+    pre-train upgrade — keeping all three in sync."""
+    _cloud["pod"] = None
+    _cloud["purpose"] = None
+    _cloud["setup_done_for_pod"] = None
+
+
+def _cloud_results_dir(orch: CloudOrchestrator) -> Path:
+    """Local destination for downloaded cloud artefacts."""
+    gs = app.storage.general
+    base = gs.get("main_base_dir") or str(Path.home())
+    proj = gs.get("main_proj") or orch.project
+    return Path(base) / proj / "cloud_results"
+
+
+def _set_text_if_changed(widget, value: str) -> None:
+    """Skip the set_text (and the websocket frame it generates) when the
+    label already shows ``value``. The status timer fires every 30 s; a
+    long-idle pod would otherwise emit three pointless updates per tick."""
+    if widget is not None and getattr(widget, "text", None) != value:
+        widget.set_text(value)
+
+
 def _refresh_cloud_status() -> None:
     pod_lbl = _cloud_widgets["pod_lbl"]
-    cost_lbl = _cloud_widgets["cost_lbl"]
-    step_lbl = _cloud_widgets["step_lbl"]
     if pod_lbl is None:
         return  # header not built yet
+    cost_lbl = _cloud_widgets["cost_lbl"]
+    step_lbl = _cloud_widgets["step_lbl"]
     orch: CloudOrchestrator | None = _cloud["orch"]
     pod: PodHandle | None = _cloud["pod"]
     if pod and orch:
         purpose = _cloud.get("purpose") or "?"
-        pod_lbl.set_text(f"pod {pod.pod_id} [{purpose}] {pod.ssh_host}:{pod.ssh_port}  "
-                         f"${pod.cost_per_hr:.2f}/hr")
-        cost_lbl.set_text(f"${orch.current_cost_usd():.4f}")
-        step_lbl.set_text(f"step: {orch.state.current_step or '(idle)'}")
+        _set_text_if_changed(pod_lbl,
+            f"pod {pod.pod_id} [{purpose}] {pod.ssh_host}:{pod.ssh_port}  "
+            f"${pod.cost_per_hr:.2f}/hr")
+        _set_text_if_changed(cost_lbl, f"${orch.current_cost_usd():.4f}")
+        _set_text_if_changed(step_lbl, f"step: {orch.state.current_step or '(idle)'}")
     else:
-        pod_lbl.set_text("No active pod")
-        cost_lbl.set_text("$0.0000")
-        step_lbl.set_text("")
+        _set_text_if_changed(pod_lbl,  "No active pod")
+        _set_text_if_changed(cost_lbl, "$0.0000")
+        _set_text_if_changed(step_lbl, "")
 
 
 def _show_progress() -> None:
@@ -2818,88 +2840,98 @@ def _cancel_cloud() -> None:
 
 # ── per-step env builders (read from gs[...] — same keys the local tabs bind) ──
 
-def _cloud_env_download() -> dict[str, str]:
+# Sentinel for "blank value" that covers None, "", whitespace, "0", "0.0".
+# A few hyperparams (e.g. STAGE1_EPOCHS) might legitimately be "0" to mean
+# "skip stage 1" — those are passed through; the bash side defaults are
+# only triggered by genuinely-absent values.
+_ZERO_LIKE = {"", "0", "0.0"}
+
+
+def _env_from_gs(mapping: dict[str, object], *, drop_zero: bool = True) -> dict[str, str]:
+    """Build a string-env dict from gs-backed values, dropping blanks.
+
+    ``mapping`` keys are the env var names; values are either a single
+    gs key (str), a tuple of fallback gs keys, or a literal string. With
+    ``drop_zero=True`` "0"/"0.0" also count as blank — appropriate for
+    fields like geo_weight where 0 means "off". With ``drop_zero=False``
+    "0" is preserved (e.g. STAGE1_EPOCHS=0 means "skip stage 1").
+    """
     gs = app.storage.general
-    env: dict[str, str] = {}
-    # Cloud download caps live under cloud_* keys (set in Cloud Tools tab).
-    # Fall back to the local Download tab's caps if the cloud-specific
-    # values are blank, so a user who configured local download caps
-    # gets the same cap when running on the pod.
-    def _pick(*keys: str) -> str:
-        for k in keys:
-            v = (gs.get(k) or "")
-            v = v.strip() if isinstance(v, str) else str(v)
-            if v and v != "0":
-                return v
-        return ""
-    mps = _pick("cloud_max_per_sp", "dl_max_per_sp")
-    lim = _pick("cloud_limit", "dl_limit")
-    iiif = _pick("cloud_iiif", "dl_iiif")
-    mxs = _pick("cloud_max_size", "dl_max_size")
-    if mps:  env["MAX_PER_SP"] = mps
-    if lim:  env["LIMIT"] = lim
-    if iiif: env["IIIF"] = iiif
-    if mxs:  env["MAX_SIZE"] = mxs
-    return env
+    blanks = _ZERO_LIKE if drop_zero else {""}
+
+    def _resolve(v: object) -> str:
+        if isinstance(v, tuple):
+            for key in v:
+                got = gs.get(key)
+                s = str(got).strip() if got is not None else ""
+                if s and s not in blanks:
+                    return s
+            return ""
+        if isinstance(v, str) and v.startswith("@"):  # literal escape: "@foo" → "foo"
+            return v[1:]
+        # bare gs key
+        got = gs.get(v) if isinstance(v, str) else v
+        return str(got).strip() if got is not None else ""
+
+    out: dict[str, str] = {}
+    for env_key, src in mapping.items():
+        s = _resolve(src)
+        if s and s not in blanks:
+            out[env_key] = s
+    return out
+
+
+def _cloud_env_download() -> dict[str, str]:
+    return _env_from_gs({
+        "MAX_PER_SP": ("cloud_max_per_sp", "dl_max_per_sp"),
+        "LIMIT":      ("cloud_limit",       "dl_limit"),
+        "IIIF":       ("cloud_iiif",        "dl_iiif"),
+        "MAX_SIZE":   ("cloud_max_size",    "dl_max_size"),
+    })
 
 
 def _cloud_env_train() -> dict[str, str]:
+    # drop_zero=False so STAGE1_EPOCHS=0 (skip stage 1) etc. survive.
+    env = _env_from_gs({
+        "MODEL":               "tr_model",
+        "IMAGE_SZ":             "tr_imgsz",
+        "BATCH_SIZE":           "tr_batch",
+        "ACCUM":                "tr_accum",
+        "STAGE2_BATCH_SIZE":    "tr_s2_batch",
+        "STAGE1_EPOCHS":        "tr_s1ep",
+        "STAGE1_LR":            "tr_s1lr",
+        "STAGE2_EPOCHS":        "tr_s2ep",
+        "STAGE2_LR":            "tr_s2lr",
+        "COOLDOWN_EPOCHS":      "tr_cd_ep",
+        "COOLDOWN_LR":          "tr_cd_lr",
+        "COOLDOWN_BATCH_SIZE":  "tr_cd_batch",
+        "COOLDOWN_ACCUM":       "tr_cd_accum",
+        "NUM_GPUS":             "tr_gpus",
+        "MAX_PER_SP":           "tr_max_per_sp",
+        "LABEL_LEVEL":          "tr_label_level",
+        "GEO_DIM":              "tr_geo_dim",
+        "SPECIES_WEIGHT":       "tr_w_sp",
+        "GENUS_WEIGHT":         "tr_w_ge",
+        "FAMILY_WEIGHT":        "tr_w_fa",
+        "WANDB_RUN_NAME":       "tr_wandb_name",
+    }, drop_zero=False)
     gs = app.storage.general
-    mapping = {
-        "MODEL":               gs.get("tr_model"),
-        "IMAGE_SZ":            gs.get("tr_imgsz"),
-        "BATCH_SIZE":          gs.get("tr_batch"),
-        "ACCUM":               gs.get("tr_accum"),
-        "STAGE2_BATCH_SIZE":   gs.get("tr_s2_batch"),
-        "STAGE1_EPOCHS":       gs.get("tr_s1ep"),
-        "STAGE1_LR":           gs.get("tr_s1lr"),
-        "STAGE2_EPOCHS":       gs.get("tr_s2ep"),
-        "STAGE2_LR":           gs.get("tr_s2lr"),
-        "COOLDOWN_EPOCHS":     gs.get("tr_cd_ep"),
-        "COOLDOWN_LR":         gs.get("tr_cd_lr"),
-        "COOLDOWN_BATCH_SIZE": gs.get("tr_cd_batch"),
-        "COOLDOWN_ACCUM":      gs.get("tr_cd_accum"),
-        "NUM_GPUS":            gs.get("tr_gpus"),
-        "MAX_PER_SP":          gs.get("tr_max_per_sp"),
-        "LABEL_LEVEL":         gs.get("tr_label_level"),
-        "GEO_DIM":             gs.get("tr_geo_dim"),
-        "SPECIES_WEIGHT":      gs.get("tr_w_sp"),
-        "GENUS_WEIGHT":        gs.get("tr_w_ge"),
-        "FAMILY_WEIGHT":       gs.get("tr_w_fa"),
-        "WANDB_RUN_NAME":      gs.get("tr_wandb_name"),
-    }
-    env: dict[str, str] = {}
-    for k, v in mapping.items():
-        s = (str(v).strip() if v is not None else "")
-        if s:
-            env[k] = s
-    if gs.get("tr_hier"):           env["HIERARCHICAL"]    = "1"
-    if gs.get("tr_use_location"):   env["USE_LOCATION"]    = "1"
+    if gs.get("tr_hier"):            env["HIERARCHICAL"]    = "1"
+    if gs.get("tr_use_location"):    env["USE_LOCATION"]    = "1"
     if gs.get("tr_reset_optimizer"): env["RESET_OPTIMIZER"] = "1"
     return env
 
 
 def _cloud_env_identify() -> dict[str, str]:
-    """Env vars for the pod's `identify` step. Pulls from the Identify-tab
-    fields (id_*) with id_model falling back to tr_model so the Identify
-    tab inherits the architecture chosen for training when not overridden.
-    """
-    gs = app.storage.general
-    mapping = {
-        "MODEL":              (gs.get("id_model") or gs.get("tr_model") or ""),
-        "IMAGE_SZ":            gs.get("id_imgsz"),
-        "BATCH_SIZE":          gs.get("id_batch"),
-        "THRESHOLD":           gs.get("id_thresh"),
-        "LOW_CONF_THRESHOLD":  gs.get("id_lowconf"),
-        "GEO_WEIGHT":          gs.get("id_geo_weight"),
-        "GEO_SIGMA":           gs.get("id_geo_sigma"),
-    }
-    env: dict[str, str] = {}
-    for k, v in mapping.items():
-        s = (str(v).strip() if v is not None else "")
-        if s and s != "0" and s != "0.0":
-            env[k] = s
-    return env
+    return _env_from_gs({
+        "MODEL":              ("id_model", "tr_model"),
+        "IMAGE_SZ":            "id_imgsz",
+        "BATCH_SIZE":          "id_batch",
+        "THRESHOLD":           "id_thresh",
+        "LOW_CONF_THRESHOLD":  "id_lowconf",
+        "GEO_WEIGHT":          "id_geo_weight",
+        "GEO_SIGMA":           "id_geo_sigma",
+    })
 
 
 # ── orchestrator action wrappers ──
@@ -2974,9 +3006,7 @@ async def _do_download_results() -> None:
         _cloud_warn("Provision a pod first.")
         return
     gs = app.storage.general
-    base = gs.get("main_base_dir") or str(Path.home())
-    proj = gs.get("main_proj") or orch.project
-    local_dir = Path(base) / proj / "cloud_results"
+    local_dir = _cloud_results_dir(orch)
     cb = _make_progress_cb("download")
     written = await orch.download_results(pod, local_dir, on_log=_cloud_log, on_progress=cb)
     names = {p.name: str(p) for p in written}
@@ -3015,9 +3045,7 @@ async def _do_download_images() -> None:
         _cloud_warn("Provision a pod first.")
         return
     gs = app.storage.general
-    base = gs.get("main_base_dir") or str(Path.home())
-    proj = gs.get("main_proj") or orch.project
-    local_dir = Path(base) / proj / "cloud_results"
+    local_dir = _cloud_results_dir(orch)
     cb = _make_progress_cb("images_1024.tar")
     out = await orch.download_images(pod, local_dir, on_log=_cloud_log, on_progress=cb)
     gs["review_imgs"] = str(out)
@@ -3032,9 +3060,7 @@ async def _do_terminate(*, keep_volume: bool, status_label, close_btn) -> None:
         return
     try:
         await orch.terminate(pod, keep_volume=keep_volume, on_log=_cloud_log)
-        _cloud["pod"] = None
-        _cloud["purpose"] = None
-        _cloud["setup_done_for_pod"] = None
+        _clear_active_pod()
         status_label.text = "✓ Pod terminated. Safe to close."
     except Exception as e:
         status_label.text = f"✗ Terminate failed: {e!r}  — check RunPod console."
@@ -3150,14 +3176,11 @@ async def _do_upgrade_to_train_and_run() -> None:
         except Exception as e:
             _cloud_err(f"Terminate-before-upgrade failed: {e!r}")
             return
-        _cloud["pod"] = None
-        _cloud["purpose"] = None
-        _cloud["setup_done_for_pod"] = None
+        _clear_active_pod()
         _refresh_cloud_status()
     if _cloud["pod"] is None:
         await _do_provision(purpose="train")
-    rc = await _do_step("train", env=_cloud_env_train())
-    return  # noqa: PLR1711  -- explicit "no value"; keeps the function signature tidy
+    await _do_step("train", env=_cloud_env_train())
 
 
 def _confirm_train_upgrade(then_run: callable) -> None:
@@ -3340,7 +3363,11 @@ def _build_pod_strip() -> None:
         setup_warn.visible = True
 
     _check_setup()
-    ui.timer(2.0, _check_setup)
+    # 30s rather than 2s: setup state only changes when the user explicitly
+    # saves creds in the Setup tab. The 2s poll was hitting the OS keyring
+    # (libsecret/D-Bus on Linux, blocking the asyncio loop ~1–10 ms each)
+    # forever per browser session for a value that rarely changes.
+    ui.timer(30.0, _check_setup)
     ui.timer(30.0, _refresh_cloud_status)
 
 

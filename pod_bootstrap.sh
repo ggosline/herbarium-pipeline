@@ -161,6 +161,14 @@ venv_cache_key() {
   # We deliberately do NOT stamp `python3 --version` because uv may install
   # its own python (when system python is too old) which differs from
   # /usr/bin/python3 and was producing misleading keys.
+  #
+  # Memoised via VENV_CACHE_KEY env var: setup() exports it once, the
+  # backgrounded venv_push subcommand inherits it, and venv_pull/venv_push
+  # within the same run skip the double sha256.
+  if [ -n "${VENV_CACHE_KEY:-}" ]; then
+    echo "$VENV_CACHE_KEY"
+    return
+  fi
   local cuda_major="${CUDA_MAJOR:-}"
   if [ -z "$cuda_major" ]; then
     if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
@@ -175,7 +183,9 @@ venv_cache_key() {
   else
     lock_hash="nolock"
   fi
-  echo "venv-cuda${cuda_major}-${lock_hash}"
+  VENV_CACHE_KEY="venv-cuda${cuda_major}-${lock_hash}"
+  export VENV_CACHE_KEY
+  echo "$VENV_CACHE_KEY"
 }
 
 venv_pull() {
@@ -302,29 +312,33 @@ venv_push() {
 # stale function/variable state and survives ssh-session teardown via
 # setsid (new session) + < /dev/null (closed stdin). Output goes to a
 # log file the user can `tail -f` from another session.
+_run_bg() {
+  # Re-invoke this script in a detached session: setsid for a new process
+  # group (immune to ctrl-C and parent exit), < /dev/null so it doesn't
+  # share our stdin, log to /workspace/.last_<subcmd>.log so the user can
+  # `tail -f` from another ssh.
+  local subcmd=$1
+  local log=/workspace/.last_${subcmd}.log
+  : > "$log"
+  setsid bash "$REPO/pod_bootstrap.sh" "$subcmd" >> "$log" 2>&1 < /dev/null &
+  disown 2>/dev/null || true
+}
+
 venv_push_bg() {
   if [ ! -d /workspace/venv ]; then
     echo "No /workspace/venv to push — skipping background push"
     return 0
   fi
-  local log=/workspace/.last_venv_push.log
   local size
   size=$(du -sh /workspace/venv 2>/dev/null | cut -f1)
-  echo "→ Backgrounding venv push ($size) — tail $log to follow."
-  : > "$log"
-  setsid bash "$REPO/pod_bootstrap.sh" venv_push >> "$log" 2>&1 < /dev/null &
-  disown 2>/dev/null || true
+  echo "→ Backgrounding venv push ($size) — tail /workspace/.last_venv_push.log to follow."
+  _run_bg venv_push
 }
 
 cache_push_bg() {
-  if ! command -v rclone >/dev/null; then
-    return 0
-  fi
-  local log=/workspace/.last_cache_push.log
-  echo "→ Backgrounding wheel + HF cache push — tail $log to follow."
-  : > "$log"
-  setsid bash "$REPO/pod_bootstrap.sh" cache_push >> "$log" 2>&1 < /dev/null &
-  disown 2>/dev/null || true
+  command -v rclone >/dev/null || return 0
+  echo "→ Backgrounding wheel + HF cache push — tail /workspace/.last_cache_push.log to follow."
+  _run_bg cache_push
 }
 
 # ─── one-time per pod: env setup ──────────────────────────────────────────
