@@ -2,16 +2,27 @@
 
 This pipeline lets you build an AI model that can identify plant species from herbarium sheet photographs. You download images from the global GBIF database, clean them, train a model, and then use that model to check or sort new images — all through a browser-based interface.
 
+The application has **two modes**, switchable from the toggle in the top-right of the window:
+
+- **☁ Cloud** *(default)* — orchestrates a rented GPU pod on RunPod from this UI. Recommended for everyone: training is faster on a 4090 than most local GPUs, costs a few US dollars per run, and needs no local GPU at all. Setup is one-time (see [cloud_setup.md](cloud_setup.md)).
+- **💻 Local** — runs the scripts on this machine. Requires an NVIDIA GPU with ≥20 GB VRAM for training the recommended ViT-Large model.
+
+This guide covers both modes. The five processing tabs (Download / Filter & Crop / Resize / Train / Identify) work the same way in either; what differs is *where* the work runs and which fields apply.
+
 ---
 
 ## What you will need
 
-- A Windows or Linux PC with an NVIDIA GPU (required for training; the more VRAM the better)
-- The conda environment `p12` already set up on this machine
-- An internet connection for the download step
-- Disk space: plan for roughly 1–2 GB per 1,000 images at default GBIF thumbnail size; 5–15 GB per 1,000 if downloading at IIIF size 2048; much more for `max` resolution
+**For Cloud mode (default, recommended):**
+- A RunPod account with billing set up, plus an SSH keypair — see [cloud_setup.md](cloud_setup.md). Optional: WandB for live training graphs, Cloudflare R2 for project archives and a shared wheel cache.
+- An internet connection.
+- Local disk space only for downloaded results (checkpoints, predictions, optionally the resized image set for the Review tab).
 
-**No GPU on your computer?** You can run training in the cloud instead. See **[cloud_setup.md](cloud_setup.md)** for a step-by-step guide to setting up RunPod (rented GPU), WandB (live training graphs), and Cloudflare R2 (project archives + shared cache). Then everything described below runs from the **Cloud** tab.
+**For Local mode:**
+- A Windows or Linux PC with an NVIDIA GPU (required for training; ~20 GB VRAM minimum for the default ViT-Large recipe).
+- The conda environment `p12` already set up on this machine.
+- An internet connection for the download step.
+- Disk space: plan for roughly 1–2 GB per 1,000 images at default GBIF thumbnail size; 5–15 GB per 1,000 at IIIF size 2048.
 
 ---
 
@@ -24,13 +35,22 @@ conda activate p12
 python /path/to/Pipeline/herbarium_pipeline_webui.py
 ```
 
-Your browser will open automatically at `http://localhost:8765`. All settings are **saved automatically** as you type — if you close and reopen the application, every field is restored exactly where you left off.
+Your browser will open automatically at `http://localhost:8765`. All settings — including the Local/Cloud toggle — are **saved automatically** as you type. If you close and reopen the application, every field is restored exactly where you left off.
 
-The window has 12 tabs split into three groups:
+### Header at a glance
 
-- **⚙ Setup** — one-time configuration: cloud credentials (RunPod / WandB / R2), SSH key, local environment check. Once everything is green here you should not need to come back. Skip this tab entirely if you only run training locally.
+- **Top-right toggle** — switches Local ↔ Cloud. Sticky across restarts; defaults to Cloud on first launch.
+- **Cloud pod strip** *(visible in Cloud mode)* — pod ID, hourly rate, running cost, current step. Buttons: Provision, Upload DwC-A, Download results, Cancel step, Terminate. The Purpose dropdown (`light` / `train`) decides which GPU type a fresh Provision asks for; the next section explains why.
+
+### Tabs
+
+The same five processing tabs appear in either mode (1 Download → 5 Identify). In Cloud mode the Run button on each tab dispatches the work to the pod; in Local mode it runs the script as a subprocess on this machine. Path / output fields that don't apply are hidden depending on the mode you're in.
+
+- **⚙ Setup** — one-time configuration: cloud credentials (RunPod / WandB / R2), SSH key, local environment check. Once everything is green here you should not need to come back.
 - **1 Download → 5 Identify** — the five-step pipeline.
-- **☁ Cloud, Review, Analysis, Quick ID, Distribution, Run All** — operations across the produced data and the optional cloud-pod runner.
+- **Run All** — sequences the five steps end-to-end. In Cloud mode this also handles provisioning and the auto-upgrade from a light pod to a train pod (see "Train tab" below).
+- **Review, Analysis, Quick ID, Distribution** — work with results once produced.
+- **☁ Cloud Tools** *(Cloud mode only, last tab)* — advanced and rare actions: GPU/datacenter overrides, download caps, R2 archive/restore, pull tarred image set, wipe pod-side directories.
 
 ---
 
@@ -235,10 +255,24 @@ Shows the image count per species as a bar chart. Enter a specsin CSV and images
 
 Chains all five pipeline steps together automatically. Tick only the steps you want to run, then click **Run Full Pipeline**. Each step uses the settings entered in its own tab, so configure those first.
 
+In **Cloud mode** Run All also handles pod lifecycle: it provisions a light pod, uploads the DwC-A, runs Setup → Download → Prep, then auto-terminates the light pod (volume preserved), provisions a train pod, and runs Train → Identify → Download results. The pod stays alive after — terminate from the header strip when finished. If a step fails the sequencer stops and leaves the current pod running so you can investigate.
+
+In **Local mode** the steps run as subprocesses on this machine in the order shown.
+
 Typical use:
 - First time: tick all five steps
 - Re-training after adding more images: tick Download, Filter & Crop, and Train only
 - Re-running identification after improving the model: tick Identify only
+
+## Train tab — auto upgrade from light to train pod (Cloud mode)
+
+Cloud mode uses two GPU sizes:
+- **light** — cheap L4 — fine for Download, Prep, Identify
+- **train** — RTX 4090 — needed for the actual training run
+
+When you click **Run Training** in Cloud mode while the active pod is `light`, you get a one-time confirmation: *"Switch to a train pod?"*. Confirming terminates the light pod (the network volume + downloaded images are preserved), provisions a train pod attached to the same volume, syncs your code, and runs train. Tick *"Don't ask again"* in that dialog to make this automatic for all future trainings. Identify can run on either pod size, so the train pod is reused; downsize manually from Cloud Tools if you want to save a few cents.
+
+The `Purpose` dropdown in the header pod strip controls what a manual *Provision* call asks for — it doesn't trigger an upgrade by itself.
 
 ---
 

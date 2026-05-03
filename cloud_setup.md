@@ -114,29 +114,17 @@ You should now have **four strings** noted down:
 | **WandB** | Key from step 2 (or leave blank to skip wandb). |
 | **Cloudflare R2** | Account ID, Access Key, Secret, default bucket = `herbarium-backup`. |
 
-Each *Save* button stores its secret in your **OS keyring** (Windows Credential Manager / macOS Keychain / Linux Secret Service). Nothing is written to plain files. When all four cards show ✓, you can switch to the ☁ Cloud tab and forget Setup exists.
+Each *Save* button stores its secret in your **OS keyring** (Windows Credential Manager / macOS Keychain / Linux Secret Service). Nothing is written to plain files.
 
 ---
 
 ## 5. First project — provision and run
 
-1. **Top of the page** (above the tabs): set a **Project name** (e.g. `MyFirstProject`) and click **Apply paths**.
-2. Open the **☁ Cloud** tab. It's organised as four cards:
+The UI runs in **Cloud mode** by default. The header carries a Local/Cloud toggle (top-right) and, in Cloud mode, a pod-status strip with the day-to-day controls: *Provision*, *Upload DwC-A*, *Download results*, *Cancel step*, *Terminate*, plus the *Purpose* dropdown.
 
-| Card | What it does |
-|---|---|
-| **Pod** | Status row (pod id / cost / current step) + lifecycle buttons: *Provision + sync code*, *Cancel running step*, *Terminate (keep volume)*, *Terminate + delete volume*. Banner at the top warns if Setup credentials are missing. |
-| **Configure run** | *Project* (mirrors the top-of-page field) and *Purpose*. The **Advanced** expander has GPU type override (a searchable dropdown — click ↻ to load the live list from RunPod), datacenter, volume size. **Download caps** is a separate expander. |
-| **Pipeline** | The Upload-DwC-A button + the five step buttons in flow order: Setup → Download → Prep → Train → Identify. A yellow note above them explains that each step pulls its parameters from the matching stage tab (hover any step button — its tooltip names the exact source tab and fields). The **Repair R2 wheel cache** button and **⚠ Danger zone** (wipe pod-side data) live here too. |
-| **Results & Archive** | *Download results*, *Pull images_1024*, *Archive project to R2*, *Restore project from R2*. |
+1. **Top of the page**: set a **Project name** (e.g. `MyFirstProject`) and click **Apply paths**. (The Projects-root path is just where downloaded results land locally; in Cloud mode that's only used by *Download results*.)
 
-3. In **Configure run**, set:
-   - **Purpose**: `light` (NVIDIA L4 — cheap, for download / prep / identify) or `train` (RTX 4090 — long GPU run).
-   - **Advanced → Datacenter**: pick one that's geographically near you. *Once chosen, it's locked* — your network volume can only live in that DC.
-   - **Advanced → Volume size**: 80 GB is fine for ≤10k images.
-   - **Advanced → GPU type** (optional override): leave blank to use the purpose default. If you want a specific GPU, click the **↻** button to load RunPod's current list, then pick from the dropdown — RunPod's web console shows marketing names ("A100 SXM 80GB") that are *not* what the API accepts ("NVIDIA A100-SXM4-80GB"). For a CLI version of the same list run `python tools/list_runpod_gpus.py`.
-
-4. **Pod card → Provision + sync code**. Logs appear in the right-hand panel:
+2. **Header pod strip → Purpose: light** for the first run. Click **Provision**. Logs appear in the right-hand panel:
 
    ```
    Creating network volume (80 GB, EUR-IS-1)...
@@ -149,11 +137,36 @@ Each *Save* button stores its secret in your **OS keyring** (Windows Credential 
    Pushed rclone.conf → /workspace/.config/rclone/
    ```
 
-5. **Pipeline card → Setup**. **First time:** ~5–10 min (downloads torch + nvidia-* + DALI etc., then pushes them to the R2 cache). **Every subsequent setup** on any project: ~1 min (pulls from R2 cache).
+3. **Tab 1 Download → Local DwC-A ZIP**: select your downloaded GBIF DwC-A ZIP file. (The Output paths below are hidden in Cloud mode — the pod uses fixed paths under `/workspace/data/`.) Then in the header, click **Upload DwC-A**.
 
-6. **Pipeline card → Download → Prep → Train → Identify** in order. Configure each step's parameters on its own stage tab first — Train in particular pulls every knob (model, batch size, epochs, LRs, geo, hierarchy, WandB run name) from the **4 Train** tab.
+4. **Tab 1 Download → Run Download** (this dispatches the bootstrap `download` step on the pod). Each fresh pod auto-runs `setup` first. Three speed regimes:
+   - **Cold R2** (very first time anyone in your R2 bucket has run setup): ~5–10 min — pulls all wheels from PyPI, builds the venv, then pushes both the wheel cache and the assembled venv tarball to R2.
+   - **Warm R2 venv cache** (most cases — same lockfile + same Python + same CUDA major as a previous run): ~30–60 s — pulls the assembled venv tarball directly from R2 and skips `uv sync` entirely.
+   - **Same-volume re-provision** (you terminated and re-provisioned a pod attached to the same network volume): near-instant — `/workspace/venv/.cache_key` matches and setup short-circuits.
 
-7. When done: **Results & Archive → Archive project to R2** to back up checkpoints + images, then **Pod → Terminate** (or let the idle watchdog do it after 1 hr of inactivity).
+   Update `pyproject.toml` or `uv.lock` and the cache key changes, so the next pod takes the cold-R2 path again — but only that once, then everyone else gets the new warm cache. To re-run setup manually (e.g. after `rm -rf /workspace/venv`), use **☁ Cloud Tools → Maintenance → Run Setup step**.
+
+5. **Tab 2 Filter & Crop → Run** (or Tab 3 Resize → Run — both map to the same `prep` step on the pod, which does filter + crop + resize together with hardcoded defaults).
+
+6. **Tab 4 Train → Run Training**. You'll see a one-time confirm: *"Switch to a train pod?"* — this terminates the light pod (volume kept) and provisions an RTX 4090 attached to the same volume. Tick *"Don't ask again"* to make this automatic for future trainings. Configure model / batch size / epochs / LRs / geo / hierarchy / WandB run name on this tab — every knob is shipped to the pod via env vars.
+
+7. **Tab 5 Identify → Run Identify**. Runs on the train pod with bootstrap defaults, auto-picking the most recent .ckpt under `/workspace/data/checkpoints/`.
+
+8. **Header → Download results** to pull checkpoints, predictions, and the species list back locally. The Identify-checkpoint and Review-CSV fields auto-populate with the pulled paths.
+
+9. When done: open **☁ Cloud Tools → Archive project to R2** to back up checkpoints + tarred images, then **Header → Terminate** (the network volume is preserved by default; deleting it is a separate explicit choice in the dialog).
+
+**One-shot alternative — Run All:** with credentials configured and the DwC-A path set on Tab 1, you can click **Run All → Run Full Pipeline** in Cloud mode and let the sequencer do steps 2–7 above on its own (it provisions, uploads, sets up, downloads, preps, auto-upgrades to a train pod, trains, identifies, downloads results). The pod is left running so you can investigate any failure; remember to terminate when finished.
+
+### Advanced overrides
+
+The **☁ Cloud Tools** tab (last tab, only visible in Cloud mode) holds:
+
+- **Pod overrides** — GPU type (use the **↻** to load RunPod's current list — the web console's marketing names like "A100 SXM 80GB" are *not* what the API accepts, you need "NVIDIA A100-SXM4-80GB"; alternatively run `python tools/list_runpod_gpus.py`), Datacenter (locked once chosen — your volume can only live in the DC where it was created), Volume size (80 GB is fine for ≤10k images).
+- **Download caps** — Max-per-species, total limit, IIIF size, post-download resize. Used by the cloud `download` step. Local downloads use the equivalent fields on Tab 1.
+- **Results & Archive** — Pull images_1024 (tarred) for local Review, R2 archive/restore.
+- **Maintenance** — Repair R2 wheel cache, re-run Setup.
+- **Danger zone** — wipe `images_raw` / `images_filtered` / `images_1024` / `predictions` directories on the pod.
 
 ---
 
@@ -167,7 +180,7 @@ Each *Save* button stores its secret in your **OS keyring** (Windows Credential 
 | `r2:herbarium-backup/<project>/` (per-project) | Latest checkpoint + tarred images for restore | a few cents/GB/month |
 | RunPod pod itself | Nothing persistent — wiped on terminate | $0 when terminated |
 
-The whole point of R2 is so you can **terminate volumes between projects** without losing work. Restore a project later with **Restore project from R2** on the Cloud tab.
+The whole point of R2 is so you can **terminate volumes between projects** without losing work. Restore a project later with **Restore project from R2** on the ☁ Cloud Tools tab.
 
 ---
 

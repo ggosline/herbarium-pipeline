@@ -44,13 +44,24 @@ trap 'touch "$ACTIVITY_FILE" 2>/dev/null || true' EXIT
 # observed at <3 Mbps — cold uv sync took ~1.5 hr. Volume I/O beats that
 # by ~50×.
 #
-# UV_PROJECT_ENVIRONMENT (the resolved venv) stays on the container disk:
-# it's read on every Python invocation, so we want fast local NVMe. The
-# venv is cheap to recreate from a populated cache (~1 min vs ~1 hr).
+# UV_PROJECT_ENVIRONMENT (the resolved venv) lives on the Network Volume so
+# a fresh pod attached to the same volume reuses it across terminate/
+# provision cycles — `uv sync --frozen` becomes a no-op on a warm volume,
+# saving the ~1 min link step that would otherwise run every time.
+# Trade-off: the venv is read on every Python invocation, and RunPod's
+# network volume is slower than container-disk NVMe. In practice the
+# import-time penalty is sub-second per process, far less than the
+# cold-cache `uv sync` cost it replaces.
 export UV_CACHE_DIR=/workspace/.cache/uv
-export UV_PROJECT_ENVIRONMENT=/root/venv
+export UV_PROJECT_ENVIRONMENT=/workspace/venv
 export HF_HOME=/workspace/.cache/huggingface
-mkdir -p "$UV_CACHE_DIR" "$HF_HOME"
+# uv installs its own Python interpreter when the project's requires-python
+# doesn't match what's on the image. Keep that interpreter on the volume so
+# the venv's bin/python symlink stays valid across terminate / re-provision.
+# Without this, uv defaults to /root/.local/share/uv/python — container disk,
+# wiped on terminate, leaves every cached venv with a dangling python link.
+export UV_PYTHON_INSTALL_DIR=/workspace/.uv-python
+mkdir -p "$UV_CACHE_DIR" "$HF_HOME" "$UV_PYTHON_INSTALL_DIR"
 
 # Shared R2 cache — one bucket serves every project, every user. R2 has
 # no egress fees and pulls into RunPod fast (~50–100 Mbps typical), so
@@ -123,6 +134,199 @@ cache_push() {
   fi
 }
 
+# ─── full-venv cache (R2) ─────────────────────────────────────────────────
+# The assembled venv is project-independent: same lockfile + same Python +
+# same CUDA major → identical bits. We tar it once and pull it directly on
+# fresh pods so `uv sync --frozen` doesn't have to re-link wheels into a
+# venv (~1 min per pod) and DALI doesn't have to be re-installed (~30 s).
+#
+# Cache key components (any change → different key, fresh build, fresh push):
+#   - Python major.minor (from $UV_PROJECT_ENVIRONMENT/bin/python or system)
+#   - CUDA major (so a cuda12 venv isn't pulled onto a cuda13 pod)
+#   - sha256 of pyproject.toml + uv.lock
+#
+# Stored at $CACHE_REMOTE/venvs/<key>.tar (uncompressed — wheels are already
+# binary, gzip would burn CPU for ~5% saving). Stream with rclone cat / rcat
+# so we don't double-up I/O on the network volume with a staging tarball.
+
+venv_cache_key() {
+  # Cache key components:
+  #   - cuda_major: DALI is installed outside the lock (wheel name varies
+  #     per CUDA major). A cuda12 venv has cuda12 DALI bytes; a cuda13 pod
+  #     can't use them.
+  #   - lock_hash: hashes pyproject.toml + uv.lock. requires-python is in
+  #     pyproject.toml, so the python version dimension is implicitly
+  #     covered — change requires-python and the key changes.
+  #
+  # We deliberately do NOT stamp `python3 --version` because uv may install
+  # its own python (when system python is too old) which differs from
+  # /usr/bin/python3 and was producing misleading keys.
+  local cuda_major="${CUDA_MAJOR:-}"
+  if [ -z "$cuda_major" ]; then
+    if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
+      cuda_major=$(nvidia-smi | grep -oP 'CUDA Version:\s*\K[0-9]+' | head -1)
+    fi
+    : "${cuda_major:=cpu}"
+  fi
+  local lock_hash
+  if [ -f "$REPO/uv.lock" ] && [ -f "$REPO/pyproject.toml" ]; then
+    lock_hash=$(sha256sum "$REPO/pyproject.toml" "$REPO/uv.lock" \
+                  | sha256sum | cut -c1-12)
+  else
+    lock_hash="nolock"
+  fi
+  echo "venv-cuda${cuda_major}-${lock_hash}"
+}
+
+venv_pull() {
+  # 0. Local short-circuit: same volume already has a matching venv.
+  local key
+  key=$(venv_cache_key)
+  if [ -f /workspace/venv/.cache_key ] \
+     && [ "$(cat /workspace/venv/.cache_key 2>/dev/null)" = "$key" ]; then
+    echo "✓ /workspace/venv already matches $key — skipping pull"
+    return 0
+  fi
+  if ! command -v rclone >/dev/null; then
+    echo "rclone not installed yet — skipping venv pull"
+    return 1
+  fi
+  if ! rclone lsd "$CACHE_REMOTE" >/dev/null 2>&1; then
+    echo "Cache remote $CACHE_REMOTE not accessible — skipping venv pull"
+    return 1
+  fi
+  # New format: zstd-compressed tarball at venvs/<key>.tar.zst.
+  # Older pods may have pushed plain .tar files — try both, prefer .zst.
+  local remote_zst="$CACHE_REMOTE/venvs/${key}.tar.zst"
+  local remote_tar="$CACHE_REMOTE/venvs/${key}.tar"
+  local remote="" decompress=""
+  if rclone lsf "$remote_zst" >/dev/null 2>&1; then
+    remote="$remote_zst"
+    decompress="zstd -d -T0"
+  elif rclone lsf "$remote_tar" >/dev/null 2>&1; then
+    remote="$remote_tar"
+    decompress="cat"
+  else
+    echo "Venv cache miss for $key (will build + push)"
+    return 1
+  fi
+  echo "→ Pulling cached venv $key from $remote..."
+  rm -rf /workspace/venv.new
+  mkdir -p /workspace/venv.new
+  # Stream R2 → (optional zstd -d) → tar -x. Single network pass.
+  if ! rclone cat "$remote" | $decompress | tar -xf - -C /workspace/venv.new; then
+    echo "⚠ Venv pull/extract failed — falling through to slow path"
+    rm -rf /workspace/venv.new
+    return 1
+  fi
+  # Atomic swap. If a previous venv exists, replace it.
+  rm -rf /workspace/venv.old
+  if [ -d /workspace/venv ]; then
+    mv /workspace/venv /workspace/venv.old
+  fi
+  mv /workspace/venv.new /workspace/venv
+  rm -rf /workspace/venv.old
+  echo "$key" > /workspace/venv/.cache_key
+  echo "✓ Venv ready ($(du -sh /workspace/venv 2>/dev/null | cut -f1))"
+  return 0
+}
+
+# Multipart upload tuning for the large (5–10 GB) venv tarball.
+#   --s3-chunk-size 64M       — default 5MiB → 2000 parts for a 10GB blob;
+#                               64MiB → ~160 parts. Fewer round-trips, better
+#                               throughput on R2's per-part overhead.
+#   --s3-upload-concurrency 8 — default 4. Most RunPod NICs comfortably push
+#                               8 parallel chunks. The bottleneck is bandwidth
+#                               not CPU.
+#   --no-traverse             — skip rclone's plan-the-upload listing pass;
+#                               we know the destination is a single object.
+RCLONE_VENV_FLAGS=(
+  --s3-chunk-size 64M
+  --s3-upload-concurrency 8
+  --no-traverse
+  --stats=15s
+)
+
+venv_push() {
+  # Synchronous push — blocks until R2 acks. Used by the explicit
+  # `bash pod_bootstrap.sh venv_push` subcommand. setup() invokes
+  # venv_push_bg instead to avoid blocking the user on a 5–15 min upload.
+  if [ ! -d /workspace/venv ]; then
+    echo "No /workspace/venv to push — skipping"
+    return 0
+  fi
+  if ! command -v rclone >/dev/null; then
+    echo "rclone not installed — skipping venv push"
+    return 0
+  fi
+  if ! rclone lsd "$CACHE_REMOTE" >/dev/null 2>&1 \
+       && ! rclone mkdir "$CACHE_REMOTE" 2>/dev/null; then
+    echo "Cache remote $CACHE_REMOTE not writable — skipping venv push"
+    return 0
+  fi
+  local key
+  key=$(venv_cache_key)
+  echo "$key" > /workspace/venv/.cache_key
+  # Compressed tarball. zstd -1 -T0 streams at ~500 MB/s (CPU-bound) with
+  # 30–50% size reduction on the binary content (libtorch, nvidia-cudnn,
+  # DALI .so files). Wheels themselves are zip-compressed and won't shrink
+  # further but they're a small fraction of the venv.
+  local compressor="cat" suffix="tar"
+  if command -v zstd >/dev/null; then
+    compressor="zstd -1 -T0 --long=27"
+    suffix="tar.zst"
+  fi
+  local remote="$CACHE_REMOTE/venvs/${key}.${suffix}"
+  local size
+  size=$(du -sh /workspace/venv 2>/dev/null | cut -f1)
+  echo "→ Pushing /workspace/venv ($size on disk, $compressor compression) → $remote..."
+  # Stream tar → zstd → R2. rclone rcat reads stdin; multipart-tuned for throughput.
+  if tar -cf - -C /workspace venv | $compressor | rclone rcat "$remote" \
+       "${RCLONE_VENV_FLAGS[@]}" 2>&1 | tail -5; then
+    echo "✓ Venv push done"
+  else
+    echo "⚠ Venv push had errors — non-fatal" >&2
+  fi
+}
+
+# Backgrounded variants. setup() invokes these so the user isn't blocked
+# on a 5–15 min upload of a 5–10 GB venv — they can move on to download
+# / prep / etc. while the tarball uploads. The watchdog's idle clock is
+# reset by the next bootstrap step the user runs, so the pod won't be
+# reaped under an in-flight upload as long as the user is interacting
+# with it. Worst case: pod terminated mid-push → next setup hits the
+# slow path again and retries.
+#
+# The upload runs in a fresh `bash pod_bootstrap.sh <subcommand>` invocation
+# rather than a subshell of the current process — that avoids capturing
+# stale function/variable state and survives ssh-session teardown via
+# setsid (new session) + < /dev/null (closed stdin). Output goes to a
+# log file the user can `tail -f` from another session.
+venv_push_bg() {
+  if [ ! -d /workspace/venv ]; then
+    echo "No /workspace/venv to push — skipping background push"
+    return 0
+  fi
+  local log=/workspace/.last_venv_push.log
+  local size
+  size=$(du -sh /workspace/venv 2>/dev/null | cut -f1)
+  echo "→ Backgrounding venv push ($size) — tail $log to follow."
+  : > "$log"
+  setsid bash "$REPO/pod_bootstrap.sh" venv_push >> "$log" 2>&1 < /dev/null &
+  disown 2>/dev/null || true
+}
+
+cache_push_bg() {
+  if ! command -v rclone >/dev/null; then
+    return 0
+  fi
+  local log=/workspace/.last_cache_push.log
+  echo "→ Backgrounding wheel + HF cache push — tail $log to follow."
+  : > "$log"
+  setsid bash "$REPO/pod_bootstrap.sh" cache_push >> "$log" 2>&1 < /dev/null &
+  disown 2>/dev/null || true
+}
+
 # ─── one-time per pod: env setup ──────────────────────────────────────────
 setup() {
   # 1. Clone / update code on the volume.
@@ -138,76 +342,104 @@ setup() {
   # 2. System packages we need before anything else can run. Idempotent —
   #    apt is a no-op when these are present (e.g. on the bigger runpod
   #    pytorch image they're prebaked).
-  if ! command -v curl >/dev/null || ! command -v git >/dev/null; then
+  if ! command -v curl >/dev/null || ! command -v git >/dev/null \
+       || ! command -v zstd >/dev/null; then
     apt-get update -qq
-    apt-get install -y --no-install-recommends curl ca-certificates git
+    apt-get install -y --no-install-recommends curl ca-certificates git zstd
   fi
 
-  # 3. rclone — installed BEFORE uv sync so cache_pull can populate
-  #    UV_CACHE_DIR from R2. Otherwise we'd download every wheel from
-  #    PyPI on first use even though it's sitting in R2.
+  # 3. rclone — installed BEFORE the venv pull so we can stream the tarball
+  #    from R2. Without it venv_pull short-circuits and we fall through to
+  #    the slow path.
   if ! command -v rclone >/dev/null; then
     curl -fsSL https://rclone.org/install.sh | bash
   fi
 
-  # 4. Pull shared wheel + HF caches from R2. Best-effort: never fails.
-  cache_pull
-
-  # 5. uv itself.
+  # 4. uv — needed in both fast and slow paths. Tiny, fast install.
   if ! command -v uv >/dev/null; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
     export PATH="$HOME/.local/bin:$PATH"
   fi
 
-  # 6. Create venv + install locked deps. With a populated UV_CACHE_DIR
-  #    this is link-only (no downloads) and finishes in ~1 min. Cold cache
-  #    can take an hour on a slow PyPI path.
-  cd "$REPO"
-  uv sync --frozen
-
-  # 7. DALI — installed outside the lock because the wheel name depends on
-  #    the pod's CUDA version. Detect via nvidia-smi (always in PATH on a GPU
-  #    pod) rather than nvcc — nvcc reports the container toolkit, nvidia-smi
-  #    reports what the host driver supports, which is what DALI needs to match.
+  # 5. CUDA major detection. Needed for the venv cache key (so a cuda12 tar
+  #    isn't pulled onto a cuda13 pod) AND for the DALI install in the slow
+  #    path. nvidia-smi reports what the host driver supports — what DALI
+  #    needs to match — whereas nvcc would report the container toolkit.
   if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
-    # CUDA Version appears in the plain `nvidia-smi` header (e.g. "CUDA Version: 13.0").
-    # It is NOT exposed via --query-gpu on most driver versions, so parse the header.
     CUDA_VER=$(nvidia-smi | grep -oP 'CUDA Version:\s*\K[0-9]+\.[0-9]+' | head -1)
     CUDA_MAJOR=${CUDA_VER%%.*}
     : "${CUDA_MAJOR:=12}"   # fallback if header format ever changes
-    echo "Detected CUDA $CUDA_VER (driver-supported) — installing nvidia-dali-cuda${CUDA_MAJOR}0"
-    # DALI wheels for newer CUDA/Python combos live on NVIDIA's index, not PyPI.
-    # --only-binary refuses source builds (we don't have cmake/CUDA toolkit).
-    DALI_ARGS=(--python "$UV_PROJECT_ENVIRONMENT/bin/python" \
-               --extra-index-url https://developer.download.nvidia.com/compute/redist \
-               --only-binary=:all:)
-    uv pip install "${DALI_ARGS[@]}" "nvidia-dali-cuda${CUDA_MAJOR}0" \
-      || { echo "DALI cuda${CUDA_MAJOR}0 wheel unavailable; falling back to cuda120"; \
-           uv pip install "${DALI_ARGS[@]}" nvidia-dali-cuda120; }
+    echo "Detected CUDA $CUDA_VER (driver-supported)"
   else
-    echo "No GPU detected — skipping DALI (CPU pod). Training will not work here."
+    CUDA_MAJOR="cpu"
+    echo "No GPU detected — using CPU venv key. Training will not work here."
+  fi
+  export CUDA_MAJOR
+
+  cd "$REPO"
+
+  # 6. Try the venv R2 fast path. On a hit we skip cache_pull / uv sync /
+  #    DALI install entirely — the assembled venv is what we want.
+  if venv_pull; then
+    echo "Setup fast path complete — venv pulled from R2."
+  else
+    # ── Slow path: build the venv from wheels. ──
+    # 6a. Pull shared wheel + HF caches from R2. Best-effort: never fails.
+    cache_pull
+
+    # 6b. Create venv + install locked deps. With a populated UV_CACHE_DIR
+    #     this is link-only (no downloads) and finishes in ~1 min. Cold
+    #     cache can take an hour on a slow PyPI path.
+    uv sync --frozen
+
+    # 6c. DALI — installed outside the lock because the wheel name depends
+    #     on the pod's CUDA version.
+    if [ "$CUDA_MAJOR" != "cpu" ]; then
+      echo "Installing nvidia-dali-cuda${CUDA_MAJOR}0..."
+      DALI_ARGS=(--python "$UV_PROJECT_ENVIRONMENT/bin/python" \
+                 --extra-index-url https://developer.download.nvidia.com/compute/redist \
+                 --only-binary=:all:)
+      uv pip install "${DALI_ARGS[@]}" "nvidia-dali-cuda${CUDA_MAJOR}0" \
+        || { echo "DALI cuda${CUDA_MAJOR}0 wheel unavailable; falling back to cuda120"; \
+             uv pip install "${DALI_ARGS[@]}" nvidia-dali-cuda120; }
+    else
+      echo "Skipping DALI install on CPU pod."
+    fi
+
+    # 6d. Push the wheels + HF cache and then the assembled venv back to R2
+    #     so the next pod (any project) gets the fast path.
+    #
+    #     NOTE: do NOT run `uv cache prune --ci` here. Its purpose is the
+    #     opposite of ours — it strips out the pre-built wheel binaries
+    #     ("reduces cache size by ~90%") on the assumption that
+    #     re-downloading from a fast PyPI is cheaper than persisting them.
+    #     For our EUR-IS-1 → PyPI path that assumption inverts:
+    #     re-downloading 8 GB of wheels takes ~1 hr, pulling from R2
+    #     takes ~1 min. Pruning leaves R2 with metadata-only and forces
+    #     every future pod to re-fetch.
+    # Background the venv push so setup() returns in seconds. The user can
+    # move on to download/prep while the venv tarball uploads to R2.
+    #
+    # We deliberately do NOT push the wheel cache (UV_CACHE_DIR) or HF
+    # cache to R2. Reasoning: with the venv tarball on R2, the fast path
+    # (every subsequent pod) doesn't need wheels — the venv is complete.
+    # Wheels are only useful for the slow-path rebuild that happens when
+    # the lockfile changes, which is rare. Pushing 14 GB of wheels +
+    # 5 GB of HF models on every setup was costing more time than the
+    # actual training. Manual `bash pod_bootstrap.sh cache_push` still
+    # works if you want to seed the wheel cache after a lockfile bump.
+    venv_push_bg
+    echo "Venv push is running in the background; subsequent pods (and"
+    echo "re-provisions) will hit the fast path once it finishes."
   fi
 
-  # 8. wandb login
+  # 7. wandb login. Independent of which path built the venv — the binary
+  #    lives at $UV_PROJECT_ENVIRONMENT/bin/wandb either way.
   if [ -f "$WS/.wandb_key" ]; then
-    uv run wandb login "$(cat "$WS/.wandb_key")"
+    "$UV_PROJECT_ENVIRONMENT/bin/wandb" login "$(cat "$WS/.wandb_key")"
   fi
 
-  # 9. Push the wheels we just downloaded back to R2 so the next pod (any
-  #    project) starts from a warm cache.
-  #
-  #    NOTE: do NOT run `uv cache prune --ci` here. Its purpose is the
-  #    opposite of ours — it strips out the pre-built wheel binaries
-  #    ("reduces cache size by ~90%") on the assumption that re-downloading
-  #    from a fast PyPI is cheaper than persisting them. For our
-  #    EUR-IS-1 → PyPI path that assumption inverts: re-downloading
-  #    8 GB of wheels from PyPI takes ~1 hr, but pulling them from R2
-  #    takes ~1 min. Pruning here would leave R2 with only the index
-  #    metadata (the small ~25-entry simple-v21/pypi/ tree) and force
-  #    every future pod to re-fetch wheels from PyPI.
-  cache_push
-
-  # 11. Make the cache + venv env vars sticky for interactive SSH sessions,
+  # 8. Make the cache + venv env vars sticky for interactive SSH sessions,
   #     so manually running `uv sync` / `uv pip install` from a shell
   #     hits the volume cache (15 GB) instead of the empty default at
   #     ~/.cache/uv. Idempotent — the marker prevents duplicate appends.
@@ -216,7 +448,8 @@ setup() {
 
 # herbarium-pipeline env — written by pod_bootstrap.sh setup
 export UV_CACHE_DIR=/workspace/.cache/uv
-export UV_PROJECT_ENVIRONMENT=/root/venv
+export UV_PROJECT_ENVIRONMENT=/workspace/venv
+export UV_PYTHON_INSTALL_DIR=/workspace/.uv-python
 export HF_HOME=/workspace/.cache/huggingface
 export RCLONE_CONFIG=/workspace/.config/rclone/rclone.conf
 export PATH="$HOME/.local/bin:$PATH"
@@ -226,7 +459,7 @@ BASHRC
 
   start_watchdog
 
-  echo "Setup complete. Activate with: source /root/venv/bin/activate"
+  echo "Setup complete. Activate with: source /workspace/venv/bin/activate"
 }
 
 # Background watchdog that polls $ACTIVITY_FILE and self-terminates the pod
@@ -271,7 +504,7 @@ EOF
   echo "Watchdog started (idle limit ${IDLE_LIMIT_SECONDS}s, log $WS/watchdog.log)"
 }
 
-activate() { source /root/venv/bin/activate; }
+activate() { source /workspace/venv/bin/activate; }
 
 # ─── step 1: download (runs fine on a CPU pod) ────────────────────────────
 download() {
@@ -402,13 +635,31 @@ train() {
 # ─── step 4: identify ─────────────────────────────────────────────────────
 identify() {
   activate
-  CKPT_FILE=$(ls -t "$CKPT"/*.ckpt | head -1)
-  python -u "$REPO/identify_herbarium.py" \
-    --checkpoint "$CKPT_FILE" \
-    --model vit_large_patch16_dinov3.lvd1689m \
-    --sources "$SPECSIN:$IMG_1024" \
-    --output-dir "$DATA/predictions" \
-    --batch-size 32
+  # Pick the most recent .ckpt unless caller passed CKPT_FILE explicitly.
+  : "${CKPT_FILE:=$(ls -t "$CKPT"/*.ckpt | head -1)}"
+  # Tunables — override via env (the webui's Identify-tab Run button ships
+  # these from the matching gs[...] keys).
+  : "${MODEL:=vit_large_patch16_dinov3.lvd1689m}"
+  : "${IMAGE_SZ:=640}"
+  : "${BATCH_SIZE:=32}"
+  : "${THRESHOLD:=}"
+  : "${LOW_CONF_THRESHOLD:=}"
+  : "${GEO_WEIGHT:=}"
+  : "${GEO_SIGMA:=}"
+
+  args=(--checkpoint "$CKPT_FILE"
+        --model      "$MODEL"
+        --sources    "$SPECSIN:$IMG_1024"
+        --output-dir "$DATA/predictions"
+        --image-sz   "$IMAGE_SZ"
+        --batch-size "$BATCH_SIZE")
+  [ -n "$THRESHOLD" ]          && args+=(--threshold          "$THRESHOLD")
+  [ -n "$LOW_CONF_THRESHOLD" ] && args+=(--low-conf-threshold "$LOW_CONF_THRESHOLD")
+  [ -n "$GEO_WEIGHT" ]         && args+=(--geo-weight         "$GEO_WEIGHT")
+  [ -n "$GEO_SIGMA" ]          && args+=(--geo-sigma          "$GEO_SIGMA")
+
+  echo "Identify: model=$MODEL image_sz=$IMAGE_SZ batch=$BATCH_SIZE ckpt=$CKPT_FILE"
+  python -u "$REPO/identify_herbarium.py" "${args[@]}"
 }
 
 # ─── backup: full project archive to R2 ───────────────────────────────────
@@ -510,16 +761,20 @@ repair_cache() {
   cache_push
 }
 
-case "${1:?usage: $0 [setup|download|prep|train|identify|backup|restore|cache_pull|cache_push|repair_cache]}" in
-  setup)        setup ;;
-  download)     download ;;
-  prep)         prep ;;
-  train)        train ;;
-  identify)     identify ;;
-  backup)       backup ;;
-  restore)      restore ;;
-  cache_pull)   cache_pull ;;
-  cache_push)   cache_push ;;
-  repair_cache) repair_cache ;;
+case "${1:?usage: $0 [setup|download|prep|train|identify|backup|restore|cache_pull|cache_push|cache_push_bg|venv_pull|venv_push|venv_push_bg|repair_cache]}" in
+  setup)         setup ;;
+  download)      download ;;
+  prep)          prep ;;
+  train)         train ;;
+  identify)      identify ;;
+  backup)        backup ;;
+  restore)       restore ;;
+  cache_pull)    cache_pull ;;
+  cache_push)    cache_push ;;
+  cache_push_bg) cache_push_bg ;;
+  venv_pull)     venv_pull ;;
+  venv_push)     venv_push ;;
+  venv_push_bg)  venv_push_bg ;;
+  repair_cache)  repair_cache ;;
   *)            echo "unknown step: $1"; exit 1 ;;
 esac
