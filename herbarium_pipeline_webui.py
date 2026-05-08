@@ -646,8 +646,9 @@ def _build_filter_crop() -> callable:
     with _cloud_only(ui.column().classes("w-full")):
         ui.label(
             "Cloud mode: this tab's Run button executes the bootstrap 'prep' "
-            "step on the pod (filter + crop + resize 1024 px, CLIP filter). "
-            "The fields below configure local runs only."
+            "step on the pod (filter + crop + resize 1024 px). "
+            "The Method dropdown affects the cloud run; path / numeric fields "
+            "below configure local runs only."
         ).classes("text-body2").style(
             "background:#f0f7f6;border-left:3px solid #00897b;padding:8px 12px;"
             "border-radius:0 4px 4px 0;color:#37474f;max-width:1000px;margin-bottom:6px")
@@ -1634,6 +1635,27 @@ def _build_review() -> tuple:
                            "Genus", italic=True)
 
         if level == "family":
+            # Family-level CSV: top{k}_name already holds family names.
+            # Species/genus-level CSV: aggregate top-5 by mapping each
+            # top{k}_name → its family (preferring the per-row top{k}_family
+            # column written by identify, falling back to a heuristic).
+            agg: dict[str, float] = {}
+            for k in range(1, 6):
+                name = str(row.get(f"top{k}_name", "") or "")
+                if not name or name == "nan":
+                    break
+                prob = float(row.get(f"top{k}_prob", 0) or 0)
+                fam = str(row.get(f"top{k}_family", "") or "")
+                if not fam or fam == "nan":
+                    # No mapping → assume top{k}_name is itself the family
+                    # (i.e. a family-level model whose identify run predates
+                    # the top{k}_family column being written).
+                    fam = name
+                agg[fam] = agg.get(fam, 0) + prob
+            if agg:
+                items = sorted(agg.items(), key=lambda x: x[1], reverse=True)
+                return _render(items, "Family", italic=False)
+            # Last-resort fallback for very old CSVs.
             if "pred_family" in row.index and str(row.get("pred_family", "nan")) not in ("", "nan"):
                 prob = float(row.get("confidence", row.get("top1_prob", 0)) or 0)
                 return _render([(str(row["pred_family"]), prob)], "Family", italic=False)
@@ -3072,8 +3094,12 @@ def _cloud_env_download() -> dict[str, str]:
 
 
 def _cloud_env_prep() -> dict[str, str]:
+    # FILTER_METHOD reads from fc_method — the same key the Filter & Crop
+    # tab's Method dropdown binds to, so changing it there now actually
+    # affects the cloud prep run. cloud_filter_method is kept for any old
+    # state files that already have it set (fallback only).
     return _env_from_gs({
-        "FILTER_METHOD": "cloud_filter_method",
+        "FILTER_METHOD": ("fc_method", "cloud_filter_method"),
         "NO_FILTER":     "cloud_no_filter",
         "NO_CROP":       "cloud_no_crop",
     })
@@ -3816,7 +3842,7 @@ def _build_cloud_tools() -> None:
                 ui.label("Filter method:").classes("text-sm")
                 ui.select(["clip", "hsv"], value="clip")\
                   .props("dense outlined").classes("w-24")\
-                  .bind_value(gs, "cloud_filter_method")
+                  .bind_value(gs, "fc_method")
             with ui.row().classes("items-center gap-1"):
                 ui.label("No filter:").classes("text-sm")
                 ui.select(["", "1"], value="")\
