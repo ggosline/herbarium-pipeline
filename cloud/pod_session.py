@@ -102,6 +102,13 @@ class PodSession:
             banner_timeout=self.connect_timeout,
             auth_timeout=self.connect_timeout,
         )
+        # Send a keepalive every 30s so RunPod's NAT / idle timers don't
+        # silently drop long-running channels (training, large rsync,
+        # tarball pulls). Without this the webui log goes quiet with no
+        # error and there's no way to tell what's running.
+        transport = client.get_transport()
+        if transport is not None:
+            transport.set_keepalive(30)
         self._client = client
 
     async def aclose(self) -> None:
@@ -205,11 +212,23 @@ class PodSession:
             target=reader, name=f"pod-exec-{self.host}", daemon=True
         )
         thread.start()
+        # Heartbeat: if no output arrives for HEARTBEAT_S seconds, emit a
+        # synthetic line so the user can tell the channel is alive vs hung.
+        # Cold imports, DALI compile, and big rsync runs can all go silent
+        # for a minute or more.
+        HEARTBEAT_S = 60.0
+        silent_since = 0.0
         try:
             while True:
-                line = await queue.get()
+                try:
+                    line = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_S)
+                except asyncio.TimeoutError:
+                    silent_since += HEARTBEAT_S
+                    on_log(f"  (no output for {int(silent_since)}s — still running)")
+                    continue
                 if line is SENTINEL:
                     break
+                silent_since = 0.0
                 on_log(line)
         except asyncio.CancelledError:
             chan.close()
