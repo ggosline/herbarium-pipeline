@@ -1050,22 +1050,28 @@ repair_cache() {
   cache_push
 }
 
-case "${1:?usage: $0 [setup|download|prep|stage_images|train|identify|backup|restore|cache_pull|cache_push|cache_push_bg|venv_pull|venv_push|venv_push_bg|mirror_venv_local|repair_cache]}" in
-  setup)              setup ;;
-  download)           download ;;
-  prep)               prep ;;
-  stage_images)       stage_images ;;
-  train)              train ;;
-  identify)           identify ;;
-  backup)             backup ;;
-  restore)            restore ;;
-  cache_pull)         cache_pull ;;
-  cache_push)         cache_push ;;
-  cache_push_bg)      cache_push_bg ;;
-  venv_pull)          venv_pull ;;
-  venv_push)          venv_push ;;
-  venv_push_bg)       venv_push_bg ;;
-  mirror_venv_local)  mirror_venv_local ;;
-  repair_cache)       repair_cache ;;
-  *)            echo "unknown step: $1"; exit 1 ;;
-esac
+# Dispatcher only runs when the script is executed directly, not when sourced
+# (the webui sources this file to call individual functions like start_watchdog,
+# and an unguarded ${1:?...} aborts the source with no positional args).
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:?usage: $0 [setup|download|prep|stage_images|train|identify|backup|restore|cache_pull|cache_push|cache_push_bg|venv_pull|venv_push|venv_push_bg|mirror_venv_local|repair_cache|start_watchdog]}" in
+    setup)              setup ;;
+    download)           download ;;
+    prep)               prep ;;
+    stage_images)       stage_images ;;
+    train)              train ;;
+    identify)           identify ;;
+    backup)             backup ;;
+    restore)            restore ;;
+    cache_pull)         cache_pull ;;
+    cache_push)         cache_push ;;
+    cache_push_bg)      cache_push_bg ;;
+    venv_pull)          venv_pull ;;
+    venv_push)          venv_push ;;
+    venv_push_bg)       venv_push_bg ;;
+    mirror_venv_local)  mirror_venv_local ;;
+    repair_cache)       repair_cache ;;
+    start_watchdog)     start_watchdog ;;
+    *)            echo "unknown step: $1"; exit 1 ;;
+  esac
+fi

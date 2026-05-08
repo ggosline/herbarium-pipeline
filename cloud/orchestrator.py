@@ -229,9 +229,32 @@ class CloudOrchestrator:
     async def _ensure_volume(
         self, *, size_gb: int, data_center_id: str, on_log: LogFn,
     ) -> str:
-        """Return the project's network volume id, creating one if absent."""
+        """Return the project's network volume id, creating one if absent.
+
+        Validates a saved volume against the RunPod API before reusing it,
+        so a stale state file doesn't try to attach a volume that's been
+        deleted (or one in the wrong datacenter for this provision).
+        """
         if self._state.volume_id:
-            return self._state.volume_id
+            try:
+                vols = await self._rp().list_volumes()
+            except Exception as e:
+                on_log(f"  ⚠ couldn't list volumes ({e}) — trusting saved id")
+                return self._state.volume_id
+            match = next((v for v in vols if v.id == self._state.volume_id), None)
+            if match is None:
+                on_log(f"  ⚠ saved volume {self._state.volume_id} not found "
+                       f"in account — clearing and creating fresh")
+                self._state.volume_id = None
+                self._state.data_center_id = None
+            elif match.data_center_id != data_center_id:
+                on_log(f"  ⚠ saved volume is in {match.data_center_id} but "
+                       f"provision wants {data_center_id} — clearing and "
+                       f"creating fresh in {data_center_id}")
+                self._state.volume_id = None
+                self._state.data_center_id = None
+            else:
+                return self._state.volume_id
         on_log(f"Creating network volume ({size_gb} GB, {data_center_id})...")
         vol = await self._rp().create_volume(
             name=f"herb-{self._project}",
@@ -395,21 +418,40 @@ class CloudOrchestrator:
         self._state.pod_hourly_rate = p.cost_per_hr
         # Capture the pod's volume + region so a later provision() doesn't
         # reuse stale state from a different datacenter. The RunPod API has
-        # moved dataCenterId around between schema versions, so check a few
-        # plausible locations before giving up.
-        if p.network_volume_id:
+        # moved these fields around between schema versions, so check a few
+        # plausible locations.
+        raw = p.raw or {}
+        machine = raw.get("machine") or {}
+        nv_obj = raw.get("networkVolume") or {}
+        vol_id = (
+            p.network_volume_id
+            or raw.get("networkVolumeId")
+            or nv_obj.get("id")
+            or raw.get("volumeId")
+        )
+        if vol_id:
             prev_vol = self._state.volume_id
-            self._state.volume_id = p.network_volume_id
-            if prev_vol and prev_vol != p.network_volume_id:
-                on_log(f"  volume_id updated: {prev_vol} → {p.network_volume_id}")
-        dc = (p.raw.get("dataCenterId")
-              or (p.raw.get("machine") or {}).get("dataCenterId")
-              or (p.raw.get("machine") or {}).get("dataCenter", {}).get("id"))
+            self._state.volume_id = vol_id
+            if prev_vol and prev_vol != vol_id:
+                on_log(f"  volume_id updated: {prev_vol} → {vol_id}")
+        else:
+            # Help future-us figure out which key holds the volume id.
+            keys = sorted(raw.keys())
+            on_log(f"  ⚠ no volume id in pod payload — top-level keys: {keys}")
+            self._state.volume_id = None
+        dc = (
+            raw.get("dataCenterId")
+            or machine.get("dataCenterId")
+            or (machine.get("dataCenter") or {}).get("id")
+            or nv_obj.get("dataCenterId")
+        )
         if dc:
             prev_dc = self._state.data_center_id
             self._state.data_center_id = dc
             if prev_dc and prev_dc != dc:
                 on_log(f"  data_center_id updated: {prev_dc} → {dc}")
+        else:
+            self._state.data_center_id = None
         self._save_state()
         return handle
 

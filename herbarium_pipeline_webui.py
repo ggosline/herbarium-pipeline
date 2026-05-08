@@ -3145,15 +3145,22 @@ async def _do_attach() -> None:
     _cloud["pod"] = pod
     _cloud["purpose"] = "train"  # assume manually-created pod is train-capable
     await orch.sync_code(pod, on_log=_cloud_log)
-    # Start the idle watchdog so the pod self-terminates after inactivity
+    # Start the idle watchdog so the pod self-terminates after inactivity.
+    # Surface failures — silent best-effort previously hid bugs (eg the
+    # source-time dispatcher fault) and left attached pods billing forever.
     try:
         session = await orch._ensure_session(pod, on_log=_cloud_log)
-        await session.exec_capture(
-            f"source /workspace/Pipeline/pod_bootstrap.sh && "
-            f"RUNPOD_POD_ID={pod_id} start_watchdog"
+        rc, out = await session.exec_capture(
+            f"RUNPOD_POD_ID={pod_id} bash /workspace/Pipeline/pod_bootstrap.sh start_watchdog"
         )
-    except Exception:
-        pass  # best-effort
+        if rc != 0:
+            _cloud_warn(f"Watchdog start failed (rc={rc}): {out.strip() or '(no output)'}")
+        elif out.strip():
+            _cloud_log(out.rstrip())
+        # Reset the idle clock so the watchdog doesn't fire on history.
+        await session.exec_capture("touch /workspace/.last_activity")
+    except Exception as e:
+        _cloud_warn(f"Watchdog start raised: {e}")
     _refresh_cloud_status()
 
 
