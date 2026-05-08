@@ -790,7 +790,9 @@ class CloudOrchestrator:
                 tf.extractall(local_dir)
         finally:
             local_tar.unlink(missing_ok=True)
-            await session.exec_capture(f"rm -f {remote_tar}")
+            # Leave the remote tar in place so a follow-up `backup` can reuse
+            # it instead of re-tarring (~5–15 GB, slow on MooseFS). backup()
+            # cleans up after upload.
 
         out_dir = local_dir / chosen
         on_log(f"Done → {out_dir}")

@@ -976,11 +976,19 @@ backup() {
 
   # 4. Images — tar first so it's one large sequential upload
   #    instead of N small PUTs (faster + cheaper at R2's per-op pricing).
+  #    Reuse an existing tar (left by download_images) if it's newer than
+  #    every file in $IMAGES_DIR — saves ~5–15 minutes of re-taring on
+  #    MooseFS for projects we just pulled images from.
   IMG_BASENAME="$(basename "$IMAGES_DIR")"
   if [ -d "$IMAGES_DIR" ]; then
     IMG_TAR="$DATA/${IMG_BASENAME}.tar"
-    echo "  bundling $IMAGES_DIR → $(basename "$IMG_TAR")"
-    tar cf "$IMG_TAR" -C "$DATA" "$IMG_BASENAME"
+    if [ -f "$IMG_TAR" ] \
+       && [ -z "$(find "$IMAGES_DIR" -newer "$IMG_TAR" -print -quit 2>/dev/null)" ]; then
+      echo "  reusing existing $(basename "$IMG_TAR") ($(du -h "$IMG_TAR" | cut -f1))"
+    else
+      echo "  bundling $IMAGES_DIR → $(basename "$IMG_TAR")"
+      tar cf "$IMG_TAR" -C "$DATA" "$IMG_BASENAME"
+    fi
     echo "  uploading $(du -h "$IMG_TAR" | cut -f1)"
     rclone copy "$IMG_TAR" "$REMOTE/" \
       --progress --transfers 4 --s3-chunk-size 64M
