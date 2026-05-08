@@ -2980,6 +2980,33 @@ def _wrap_cloud(coro_factory):
     _cloud["task"] = asyncio.create_task(_run())
 
 
+def _wrap_cloud_aux(coro_factory):
+    """Run an auxiliary cloud task (download / restore / status fetch) on a
+    separate slot so it can run alongside a long-running step like identify
+    or train. Each aux slot still serialises against itself — clicking
+    "Pull images" twice while one is in flight gets the warning.
+
+    Logs interleave with the main task; that's deliberate and tolerable
+    because each operation's output is self-describing.
+    """
+    slot = "aux_task"
+    t = _cloud.get(slot)
+    if t is not None and not t.done():
+        ui.notify("A transfer is already running.", type="warning")
+        return
+    async def _run():
+        try:
+            await coro_factory()
+        except asyncio.CancelledError:
+            _cloud_log("[aux cancelled]")
+            raise
+        except Exception as e:
+            _cloud_err(f"Transfer failed: {e!r}")
+        finally:
+            _hide_progress()
+    _cloud[slot] = asyncio.create_task(_run())
+
+
 def _cancel_cloud() -> None:
     t = _cloud["task"]
     if t is not None and not t.done():
@@ -3561,16 +3588,16 @@ def _build_pod_strip() -> None:
                 .tooltip("Connect to an existing pod by its RunPod ID "
                          "(from the console URL or pod list).")
         ui.button("Upload DwC-A", icon="archive",
-                  on_click=lambda: _wrap_cloud(_do_upload_dwca))\
+                  on_click=lambda: _wrap_cloud_aux(_do_upload_dwca))\
             .props("dense flat color=teal-2")\
             .tooltip("Upload the DwC-A ZIP from Tab 1 (Download) to the pod.")
         ui.button("Upload specsin", icon="upload_file",
-                  on_click=lambda: _wrap_cloud(_do_upload_specsin))\
+                  on_click=lambda: _wrap_cloud_aux(_do_upload_specsin))\
             .props("dense flat color=teal-2")\
             .tooltip("Upload the specsin CSV from Tab 1 (Download) to the pod. "
                      "Set the remote path in Cloud Tools → From specsin.")
         ui.button("Download results", icon="cloud_download",
-                  on_click=lambda: _wrap_cloud(_do_download_results))\
+                  on_click=lambda: _wrap_cloud_aux(_do_download_results))\
             .props("dense flat color=teal-2")\
             .tooltip("Pull checkpoints, nameslist, predictions back locally. "
                      "Use the dropdown to control how many checkpoints. "
@@ -3595,7 +3622,7 @@ def _build_pod_strip() -> None:
                   "'best+latest' = also includes lowest-valid_loss. "
                   "'all' = every .ckpt under checkpoints/ (legacy, multi-GB).")
         ui.button("Pull images", icon="image",
-                  on_click=lambda: _wrap_cloud(_do_download_images))\
+                  on_click=lambda: _wrap_cloud_aux(_do_download_images))\
             .props("dense flat color=teal-2")\
             .tooltip("Tar /workspace/data/images/ on the pod (or /images_1024 "
                      "for legacy layouts) and pull the bundle back (typically "
@@ -3820,7 +3847,7 @@ def _build_cloud_tools() -> None:
 
         with ui.row().classes("w-full gap-2 mt-2 flex-wrap"):
             ui.button("Pull images (tar)", icon="image",
-                      on_click=lambda: _wrap_cloud(_do_download_images))\
+                      on_click=lambda: _wrap_cloud_aux(_do_download_images))\
                 .props("flat dense color=primary")\
                 .tooltip("Tar the resized image set on the pod and pull it back "
                          "so the Review tab can show specimens.")
