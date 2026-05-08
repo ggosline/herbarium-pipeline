@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -40,6 +41,57 @@ from .runpod_client import PodInfo, RunPodAPIError, RunPodClient
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int], None]
+
+
+# Parses a numeric val_loss from filenames like:
+#   epoch=07-valid_loss=0.4072.ckpt   (stage 2 best)
+#   s1-epoch=03-valid_loss=0.6797.ckpt
+#   cd-epoch=02-valid_loss=0.39.ckpt
+# Returns None for files without a parseable score (e.g. last.ckpt, last-v3.ckpt).
+_LOSS_RE = re.compile(r"valid_loss=(\d+\.\d+)")
+
+
+def _select_ckpts(
+    ckpts: list[tuple[float, str]],
+    mode: str,
+    *,
+    on_log: LogFn = print,
+) -> list[str]:
+    """Pick which remote checkpoint paths to include in a results download.
+
+    ``ckpts`` is a list of (mtime, remote_path). ``mode`` is one of
+    ``"all" | "latest" | "best+latest"``; unknown values fall back to "latest".
+    """
+    if not ckpts:
+        return []
+    if mode == "all":
+        return [p for _, p in ckpts]
+
+    latest = max(ckpts, key=lambda x: x[0])[1]
+    if mode == "latest" or mode not in ("best+latest",):
+        on_log(f"  ckpt filter=latest → {Path(latest).name}")
+        return [latest]
+
+    # best+latest
+    scored: list[tuple[float, str]] = []
+    for _, p in ckpts:
+        m = _LOSS_RE.search(Path(p).name)
+        if m:
+            try:
+                scored.append((float(m.group(1)), p))
+            except ValueError:
+                pass
+    chosen = {latest}
+    if scored:
+        scored.sort(key=lambda x: x[0])
+        best_loss, best_path = scored[0]
+        chosen.add(best_path)
+        on_log(f"  ckpt filter=best+latest → {Path(best_path).name} "
+               f"(valid_loss={best_loss:.4f}), {Path(latest).name}")
+    else:
+        on_log(f"  ckpt filter=best+latest → {Path(latest).name} "
+               f"(no parseable valid_loss in any filename — kept latest only)")
+    return list(chosen)
 
 # ── defaults ─────────────────────────────────────────────────────────────
 
@@ -62,7 +114,7 @@ DEFAULT_CONTAINER_DISK_GB = 40
 # Train tier is what the user actually picks for the long run.
 GPU_BY_PURPOSE: dict[str, str] = {
     "light": "NVIDIA L4",
-    "train": "NVIDIA GeForce RTX 4090",
+    "train": "NVIDIA A100-SXM4-80GB",
 }
 
 # Pod-side layout, mirrored in pod_bootstrap.sh.
@@ -323,6 +375,44 @@ class CloudOrchestrator:
         await self._ensure_session(handle, on_log=on_log)
         return handle
 
+    async def attach(self, pod_id: str, *, on_log: LogFn = print) -> PodHandle:
+        """Connect to a manually-created pod by its RunPod ID.
+
+        Stores the pod ID in state so subsequent ``provision()`` calls reuse it.
+        """
+        p = await self._rp().get_pod(pod_id)
+        if p.desired_status != "RUNNING" or p.ssh_endpoint is None:
+            raise RuntimeError(
+                f"Pod {pod_id} is not RUNNING or has no SSH endpoint "
+                f"(status={p.desired_status})"
+            )
+        on_log(f"Attaching to pod {p.id} ({p.ssh_endpoint[0]}:{p.ssh_endpoint[1]})")
+        handle = self._handle_from_pod(p)
+        await self._ensure_session(handle, on_log=on_log)
+        self._state.pod_id = pod_id
+        self._state.ssh_host = p.ssh_endpoint[0]
+        self._state.ssh_port = p.ssh_endpoint[1]
+        self._state.pod_hourly_rate = p.cost_per_hr
+        # Capture the pod's volume + region so a later provision() doesn't
+        # reuse stale state from a different datacenter. The RunPod API has
+        # moved dataCenterId around between schema versions, so check a few
+        # plausible locations before giving up.
+        if p.network_volume_id:
+            prev_vol = self._state.volume_id
+            self._state.volume_id = p.network_volume_id
+            if prev_vol and prev_vol != p.network_volume_id:
+                on_log(f"  volume_id updated: {prev_vol} → {p.network_volume_id}")
+        dc = (p.raw.get("dataCenterId")
+              or (p.raw.get("machine") or {}).get("dataCenterId")
+              or (p.raw.get("machine") or {}).get("dataCenter", {}).get("id"))
+        if dc:
+            prev_dc = self._state.data_center_id
+            self._state.data_center_id = dc
+            if prev_dc and prev_dc != dc:
+                on_log(f"  data_center_id updated: {prev_dc} → {dc}")
+        self._save_state()
+        return handle
+
     async def sync_code(self, handle: PodHandle, *, on_log: LogFn = print) -> None:
         """Push local pipeline scripts to ``/workspace/Pipeline`` on the pod.
 
@@ -449,6 +539,27 @@ class CloudOrchestrator:
         self._save_state()
         return True
 
+    async def upload_file(
+        self,
+        handle: PodHandle,
+        local: str | Path,
+        remote: str,
+        *,
+        on_log: LogFn = print,
+        on_progress: ProgressFn | None = None,
+    ) -> None:
+        """Upload a local file to an arbitrary path on the pod via SFTP."""
+        local_path = Path(local)
+        if not local_path.is_file():
+            raise FileNotFoundError(local_path)
+        size = local_path.stat().st_size
+        session = await self._ensure_session(handle, on_log=on_log)
+        # Ensure parent directory exists on the pod
+        remote_parent = "/".join(remote.rstrip("/").split("/")[:-1]) or "/"
+        await session.exec_capture(f"mkdir -p {remote_parent}")
+        on_log(f"Uploading {local_path.name} → {remote} ({size:,} bytes)")
+        await session.sftp_put(local_path, remote, on_progress=on_progress)
+
     async def run_step(
         self,
         handle: PodHandle,
@@ -496,18 +607,22 @@ class CloudOrchestrator:
         *,
         on_log: LogFn = print,
         on_progress: ProgressFn | None = None,
+        ckpt_filter: str = "latest",
     ) -> list[Path]:
-        """Pull every checkpoint, the names list, predictions, and specsin
-        back to ``local_dir``.
+        """Pull checkpoints, the names list, predictions, and specsin back
+        to ``local_dir``.
+
+        ``ckpt_filter`` selects which checkpoints to include:
+          - ``"latest"`` : the single most recent ``.ckpt`` by remote mtime
+            (e.g. ``last-v3.ckpt``). Cheapest — usually all the local
+            Identify run needs.
+          - ``"best+latest"`` : the lowest-valid_loss checkpoint (parsed
+            from the filename) plus the most recent one. ~2× the bytes.
+          - ``"all"`` : every ``.ckpt`` under ``checkpoints/`` (legacy
+            behaviour). Multi-GB; only useful when comparing checkpoints.
 
         Quietly skips files that don't exist on the pod (e.g. ``predictions.csv``
         before the identify step has run). Returns the list of files written.
-
-        Checkpoints are pulled by globbing ``checkpoints/*.ckpt`` rather than
-        a hardcoded list because Lightning emits one ``last.ckpt`` plus per-
-        stage best-of-run files like ``epoch=17-valid_loss=0.40.ckpt`` and
-        ``cd-epoch=03-valid_loss=0.39.ckpt``, and the user usually wants the
-        best one (lowest valid_loss) as well as last.
         """
         local_dir = Path(local_dir)
         local_dir.mkdir(parents=True, exist_ok=True)
@@ -524,18 +639,28 @@ class CloudOrchestrator:
             (f"{REMOTE_DATA}/specsin.csv",               local_dir / "specsin.csv"),
         ]
 
-        # Discover every checkpoint file rather than hardcoding names.
-        # Run as a single shell command so we don't pay per-file SFTP listing.
+        # Discover checkpoints AND their mtimes in one shell call so we can
+        # filter without paying per-file SFTP listing. `stat -c '%Y\t%n'`
+        # prints "<unix_mtime>\t<path>" per line — POSIX coreutils format.
         rc, ls_out = await session.exec_capture(
-            f"ls -1 {REMOTE_DATA}/checkpoints/*.ckpt 2>/dev/null"
+            f"stat -c '%Y\t%n' {REMOTE_DATA}/checkpoints/*.ckpt 2>/dev/null"
         )
+        ckpts: list[tuple[float, str]] = []
         if rc == 0 and ls_out.strip():
             for line in ls_out.strip().splitlines():
-                remote = line.strip()
-                if remote:
-                    wishlist.append((remote, local_dir / Path(remote).name))
-        else:
+                if "\t" not in line:
+                    continue
+                m_str, path = line.split("\t", 1)
+                try:
+                    ckpts.append((float(m_str), path.strip()))
+                except ValueError:
+                    continue
+        if not ckpts:
             on_log(f"  no checkpoints under {REMOTE_DATA}/checkpoints/")
+        else:
+            chosen = _select_ckpts(ckpts, ckpt_filter, on_log=on_log)
+            for remote in chosen:
+                wishlist.append((remote, local_dir / Path(remote).name))
 
         written: list[Path] = []
         for remote, local in wishlist:
@@ -571,8 +696,15 @@ class CloudOrchestrator:
         *,
         on_log: LogFn = print,
         on_progress: ProgressFn | None = None,
+        images_dirname: str | None = None,
     ) -> Path:
-        """Pull ``/workspace/data/images_1024/`` to ``local_dir/images_1024/``.
+        """Pull ``/workspace/data/<images_dirname>/`` to
+        ``local_dir/<images_dirname>/``.
+
+        ``images_dirname`` defaults to whichever of these exists on the pod
+        (in priority order): ``images`` (current unified layout), then
+        ``images_1024`` (legacy three-dir layout). Pass an explicit name to
+        override.
 
         Bundles the directory into an uncompressed tar on the pod first so the
         transfer is one large sequential SFTP read instead of ~15k file
@@ -583,19 +715,30 @@ class CloudOrchestrator:
         local_dir.mkdir(parents=True, exist_ok=True)
         session = await self._ensure_session(handle, on_log=on_log)
 
-        remote_dir = f"{REMOTE_DATA}/images_1024"
-        if not await session.remote_exists(remote_dir):
-            raise FileNotFoundError(f"{remote_dir} not present on pod")
+        # Resolve the directory name to use.
+        if images_dirname:
+            candidates = [images_dirname]
+        else:
+            candidates = ["images", "images_1024"]
+        chosen: str | None = None
+        for name in candidates:
+            if await session.remote_exists(f"{REMOTE_DATA}/{name}"):
+                chosen = name
+                break
+        if chosen is None:
+            tried = ", ".join(f"{REMOTE_DATA}/{n}" for n in candidates)
+            raise FileNotFoundError(f"No images dir on pod (tried {tried})")
 
-        remote_tar = f"{REMOTE_DATA}/images_1024.tar"
+        remote_dir = f"{REMOTE_DATA}/{chosen}"
+        remote_tar = f"{REMOTE_DATA}/{chosen}.tar"
         on_log(f"Bundling {remote_dir} into tar...")
         rc, out = await session.exec_capture(
-            f"tar cf {remote_tar} -C {REMOTE_DATA} images_1024"
+            f"tar cf {remote_tar} -C {REMOTE_DATA} {chosen}"
         )
         if rc != 0:
             raise RuntimeError(f"remote tar failed (rc={rc}): {out.strip()}")
 
-        local_tar = local_dir / "images_1024.tar"
+        local_tar = local_dir / f"{chosen}.tar"
         on_log(f"Downloading {local_tar.name}...")
         try:
             await session.sftp_get(remote_tar, local_tar, on_progress=on_progress)
@@ -607,7 +750,7 @@ class CloudOrchestrator:
             local_tar.unlink(missing_ok=True)
             await session.exec_capture(f"rm -f {remote_tar}")
 
-        out_dir = local_dir / "images_1024"
+        out_dir = local_dir / chosen
         on_log(f"Done → {out_dir}")
         return out_dir
 

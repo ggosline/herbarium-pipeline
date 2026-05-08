@@ -6,7 +6,7 @@ Two modes:
                output_dir/indets/{predicted_species}/ by top prediction.
   2. Flagged — images where indet=False but the model's top prediction
                disagrees with the recorded label OR confidence < threshold.
-               Sorted into output_dir/uncertain/{true_species}__pred_{predicted}/
+               Marked as flagged=True in predictions.csv (no image copies).
 
 A predictions CSV is saved to output_dir/predictions.csv.
 
@@ -275,6 +275,10 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
                 remapped["head." + k[len("head_species."):]] = v
             elif k.startswith("geo_mlp."):
                 remapped[k] = v  # preserve geo MLP weights
+            elif k.startswith("head."):
+                # Non-hierarchical geo checkpoint: head.* is already the
+                # species classifier, no rename needed.
+                remapped[k] = v
             # head_genus / head_family discarded — species head is sufficient
         cleaned = remapped
 
@@ -302,7 +306,16 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
     if not model_name:
         model_name = None  # caller must pass --model if needed
 
-    return cleaned, model_name, num_classes, nameslist, geo_dim
+    # What rank does this model classify at? Drives which columns get filled
+    # in the predictions CSV. Defaults to species for back-compat with old
+    # checkpoints that don't embed label_level.
+    label_level = (hparams.get("label_level")
+                   or hparams.get("config", {}).get("label_level")
+                   or "species")
+    if label_level not in ("species", "genus", "family"):
+        label_level = "species"
+
+    return cleaned, model_name, num_classes, nameslist, geo_dim, label_level
 
 
 # ---------------------------------------------------------------------------
@@ -379,9 +392,10 @@ def identify(args):
         print(f"Loaded {len(nameslist)} class names from {args.nameslist}")
 
     # Load model weights (may update nameslist + num_classes from embedded data)
-    state_dict, ckpt_model_name, num_classes, nameslist, geo_dim = load_model(
+    state_dict, ckpt_model_name, num_classes, nameslist, geo_dim, label_level = load_model(
         checkpoint_path, nameslist, args.image_sz
     )
+    print(f"  Model rank: {label_level}")
     if not nameslist:
         print("ERROR: no nameslist found. Pass --nameslist or use a checkpoint from a recent run.")
         sys.exit(1)
@@ -450,12 +464,51 @@ def identify(args):
     df_all = df_all[exists].copy()
     print(f"Total images with files: {len(df_all):,}")
 
-    # Build species → family lookup from specsin metadata (may be absent in older CSVs)
+    # Build species → family and genus → family lookups from specsin metadata
+    # (may be absent in older CSVs). Used to fill pred_family when the model
+    # only outputs species or genus directly.
     species_to_family: dict[str, str] = {}
+    genus_to_family:   dict[str, str] = {}
     if "family" in df_all.columns and "species" in df_all.columns:
         for sp, fam in zip(df_all["species"], df_all["family"]):
             if sp and fam and str(sp) not in ("nan", "") and str(fam) not in ("nan", ""):
                 species_to_family[str(sp)] = str(fam)
+                genus_to_family.setdefault(str(sp).split()[0], str(fam))
+
+    def _level_columns(pred_name: str) -> dict:
+        """Map a class-index name (whatever rank the model predicts at) to
+        the right pred_* / true_*-companion columns."""
+        if label_level == "family":
+            return {"pred_species": "", "pred_genus": "",
+                    "pred_family":  pred_name}
+        if label_level == "genus":
+            return {"pred_species": "", "pred_genus": pred_name,
+                    "pred_family":  genus_to_family.get(pred_name, "")}
+        # species (default)
+        return {"pred_species": pred_name,
+                "pred_genus":   pred_name.split()[0] if pred_name else "",
+                "pred_family":  species_to_family.get(pred_name, "")}
+
+    def _topk_columns(preds_k, probs_k) -> dict:
+        """Per-rank top-k columns mirror the pred_* convention.
+        - top{k}_name kept for back-compat (always the class-index name).
+        - top{k}_family / top{k}_genus added so Analysis can compute top-5
+          accuracy at the model's actual rank.
+        """
+        out: dict = {}
+        for k, (pi, pr) in enumerate(zip(preds_k, probs_k), 1):
+            name = nameslist[pi] if pi < len(nameslist) else "unknown"
+            out[f"top{k}_name"] = name
+            out[f"top{k}_prob"] = round(pr, 4)
+            if label_level == "family":
+                out[f"top{k}_family"] = name
+            elif label_level == "genus":
+                out[f"top{k}_genus"]  = name
+                out[f"top{k}_family"] = genus_to_family.get(name, "")
+            else:
+                out[f"top{k}_family"] = species_to_family.get(name, "")
+                out[f"top{k}_genus"]  = name.split()[0] if name else ""
+        return out
 
     # Build geographic occurrence index for post-hoc reranking
     geo_index: dict[int, np.ndarray] = {}
@@ -499,9 +552,7 @@ def identify(args):
         topk_preds, topk_probs = geo_rerank(topk_preds, topk_probs, df_indet,
                                              geo_index, args.geo_weight, args.geo_sigma)
         for row, preds_k, probs_k in zip(df_indet.itertuples(), topk_preds, topk_probs):
-            pred_species = nameslist[preds_k[0]] if preds_k[0] < len(nameslist) else "unknown"
-            dest = output_dir / "indets" / pred_species
-            copy_image(Path(row.abs_path), dest)
+            pred_name = nameslist[preds_k[0]] if preds_k[0] < len(nameslist) else "unknown"
             entry = {
                 "fname":          row.fname,
                 "abs_path":       row.abs_path,
@@ -512,18 +563,16 @@ def identify(args):
                 "decimalLatitude":  getattr(row, "decimalLatitude",  ""),
                 "decimalLongitude": getattr(row, "decimalLongitude", ""),
                 "true_species":   "",
+                "true_genus":     "",
                 "true_family":    getattr(row, "family", "") or "",
-                "pred_species":   pred_species,
-                "pred_family":    species_to_family.get(pred_species, ""),
+                **_level_columns(pred_name),
                 "confidence":     round(probs_k[0], 4),
                 "indet":          True,
                 "flagged":        False,
+                **_topk_columns(preds_k, probs_k),
             }
-            for k, (pi, pr) in enumerate(zip(preds_k, probs_k), 1):
-                entry[f"top{k}_name"] = nameslist[pi] if pi < len(nameslist) else "unknown"
-                entry[f"top{k}_prob"] = round(pr, 4)
             results.append(entry)
-        print(f"  → Sorted into {output_dir / 'indets'}/")
+        print(f"  → Wrote {len(df_indet):,} indet predictions to predictions.csv")
 
     # --- Identified: flag disagreements ---
     if len(df_ident) > 0:
@@ -536,18 +585,25 @@ def identify(args):
                                              geo_index, args.geo_weight, args.geo_sigma)
         flagged_count = 0
         for row, preds_k, probs_k in zip(df_ident.itertuples(), topk_preds, topk_probs):
-            pred_species  = nameslist[preds_k[0]] if preds_k[0] < len(nameslist) else "unknown"
+            pred_name     = nameslist[preds_k[0]] if preds_k[0] < len(nameslist) else "unknown"
             conf          = probs_k[0]
             true_species  = getattr(row, "species", "")
-            # Flag if model strongly disagrees OR if confidence is below threshold
-            mismatch = (pred_species != true_species) and (conf >= args.threshold)
+            true_family   = getattr(row, "family",  "") or ""
+            true_genus    = (true_species.split()[0] if true_species else "")
+            # Mismatch is evaluated at the rank the model actually predicts:
+            # for a family model, "Rosaceae" vs true_family — comparing it
+            # against true_species would always flag everything.
+            if label_level == "family":
+                true_at_rank = true_family
+            elif label_level == "genus":
+                true_at_rank = true_genus
+            else:
+                true_at_rank = true_species
+            mismatch = (pred_name != true_at_rank) and (conf >= args.threshold)
             low_conf = conf < args.low_conf_threshold if args.low_conf_threshold > 0 else False
             flagged  = mismatch or low_conf
 
             if flagged:
-                folder_name = f"{true_species}__pred_{pred_species}"
-                dest = output_dir / "uncertain" / folder_name
-                copy_image(Path(row.abs_path), dest)
                 flagged_count += 1
 
             entry = {
@@ -560,19 +616,17 @@ def identify(args):
                 "decimalLatitude":  getattr(row, "decimalLatitude",  ""),
                 "decimalLongitude": getattr(row, "decimalLongitude", ""),
                 "true_species":   true_species,
-                "true_family":    getattr(row, "family", "") or "",
-                "pred_species":   pred_species,
-                "pred_family":    species_to_family.get(pred_species, ""),
+                "true_genus":     true_genus,
+                "true_family":    true_family,
+                **_level_columns(pred_name),
                 "confidence":     round(conf, 4),
                 "indet":          False,
                 "flagged":        flagged,
+                **_topk_columns(preds_k, probs_k),
             }
-            for k, (pi, pr) in enumerate(zip(preds_k, probs_k), 1):
-                entry[f"top{k}_name"] = nameslist[pi] if pi < len(nameslist) else "unknown"
-                entry[f"top{k}_prob"] = round(pr, 4)
             results.append(entry)
 
-        print(f"  → Flagged {flagged_count:,} specimens → {output_dir / 'uncertain'}/")
+        print(f"  → Flagged {flagged_count:,} specimens (see flagged=True in predictions.csv)")
 
     # Save predictions CSV
     results_df = pd.DataFrame(results)

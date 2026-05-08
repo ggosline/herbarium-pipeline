@@ -15,9 +15,12 @@ WS=/workspace
 # REPO = directory containing this script, so the name on disk doesn't matter
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA=$WS/data
-IMG_RAW=$DATA/images_raw
-IMG_FILT=$DATA/images_filtered
-IMG_1024=$DATA/images_1024
+# Single image directory — download resizes, filter marks specsin, crop optional.
+# Override with IMAGES_DIR if you want a custom path or the old three-dir layout.
+IMAGES_DIR="${IMAGES_DIR:-$DATA/images}"
+IMG_RAW="$IMAGES_DIR"
+IMG_FILT="$IMAGES_DIR"
+IMG_1024="$IMAGES_DIR"
 CKPT=$DATA/checkpoints
 SPECSIN=$DATA/specsin.csv
 DWCA=$DATA/gbif.zip               # set to "" to use API (--family) instead
@@ -70,7 +73,7 @@ mkdir -p "$UV_CACHE_DIR" "$HF_HOME" "$UV_PYTHON_INSTALL_DIR"
 # multiple cache buckets, e.g. for different python versions.
 CACHE_REMOTE="${CACHE_REMOTE:-r2:herbarium-cache}"
 
-mkdir -p "$IMG_RAW" "$IMG_FILT" "$IMG_1024" "$CKPT"
+mkdir -p "$IMAGES_DIR" "$CKPT"
 
 # ─── shared cache push/pull (R2) ──────────────────────────────────────────
 # Both functions are best-effort: if rclone isn't installed yet, the R2
@@ -189,12 +192,16 @@ venv_cache_key() {
 }
 
 venv_pull() {
-  # 0. Local short-circuit: same volume already has a matching venv.
+  # 0. Local short-circuit: if the volume already has a working venv,
+  #    use it regardless of cache-key match. The key only changes when
+  #    pyproject.toml/uv.lock change — code-only changes don't invalidate
+  #    the venv, and re-pulling from R2 is pure overhead (and destructive
+  #    when the R2 tarball is corrupt).
   local key
   key=$(venv_cache_key)
-  if [ -f /workspace/venv/.cache_key ] \
-     && [ "$(cat /workspace/venv/.cache_key 2>/dev/null)" = "$key" ]; then
-    echo "✓ /workspace/venv already matches $key — skipping pull"
+  if [ -f /workspace/venv/bin/python ]; then
+    echo "✓ /workspace/venv exists — stamping cache key and skipping pull"
+    echo "$key" > /workspace/venv/.cache_key
     return 0
   fi
   if ! command -v rclone >/dev/null; then
@@ -357,9 +364,9 @@ setup() {
   #    apt is a no-op when these are present (e.g. on the bigger runpod
   #    pytorch image they're prebaked).
   if ! command -v curl >/dev/null || ! command -v git >/dev/null \
-       || ! command -v zstd >/dev/null; then
+       || ! command -v zstd >/dev/null || ! command -v rsync >/dev/null; then
     apt-get update -qq
-    apt-get install -y --no-install-recommends curl ca-certificates git zstd
+    apt-get install -y --no-install-recommends curl ca-certificates git zstd rsync
   fi
 
   # 3. rclone — installed BEFORE the venv pull so we can stream the tarball
@@ -447,6 +454,16 @@ setup() {
     echo "re-provisions) will hit the fast path once it finishes."
   fi
 
+  # 6e. Fix perms — some wheels ship binaries without execute bits
+  # (triton/ptxas, wandb-core, etc.). Runs regardless of fast/slow path.
+  local site_packages="$UV_PROJECT_ENVIRONMENT/lib/python"*"/site-packages"
+  find "$site_packages" -type f -path '*/bin/*' -exec chmod +x {} + 2>/dev/null || true
+
+  # 6f. Mirror the venv to local NVMe so subsequent python invocations don't
+  # walk MooseFS for every imported .py / .so. Cuts cold-import from
+  # ~30–60 s to ~5–8 s on torch/lightning/DALI.
+  mirror_venv_local || echo "⚠ venv mirror skipped — imports will be slower."
+
   # 7. wandb login. Independent of which path built the venv — the binary
   #    lives at $UV_PROJECT_ENVIRONMENT/bin/wandb either way.
   if [ -f "$WS/.wandb_key" ]; then
@@ -467,6 +484,8 @@ export UV_PYTHON_INSTALL_DIR=/workspace/.uv-python
 export HF_HOME=/workspace/.cache/huggingface
 export RCLONE_CONFIG=/workspace/.config/rclone/rclone.conf
 export PATH="$HOME/.local/bin:$PATH"
+# Send .pyc writes to tmpfs — saves repeated MFS round-trips on every import.
+export PYTHONPYCACHEPREFIX=/dev/shm/pycache
 BASHRC
     echo "Added herbarium env exports to /root/.bashrc"
   fi
@@ -518,7 +537,164 @@ EOF
   echo "Watchdog started (idle limit ${IDLE_LIMIT_SECONDS}s, log $WS/watchdog.log)"
 }
 
-activate() { source /workspace/venv/bin/activate; }
+# ─── local venv mirror (escape MooseFS for python imports) ────────────────
+# /workspace/venv is on MooseFS; cold `import torch` walks hundreds of
+# .py / .so files and each lookup is a network round-trip — ~30–60 s on
+# MFS vs ~5–8 s on local NVMe. Mirror the venv to container-disk NVMe
+# once, then `activate` prefers the local copy. Local copy dies with the
+# pod, but R2 → /workspace/venv is the source of truth so re-mirror is
+# cheap on a fresh pod.
+#
+# Shebangs in bin/* are rewritten to point at the local python so `wandb`,
+# `pytest`, etc. don't fall back to the network venv.
+_ensure_rsync() {
+  command -v rsync >/dev/null && return 0
+  echo "Installing rsync..."
+  apt-get update -qq
+  apt-get install -y --no-install-recommends rsync
+}
+
+# Run rsync with output adapted to where stdout is going.
+# Interactive TTY → live --info=progress2 (\r-updated single line).
+# Non-TTY (webui pipe) → quiet rsync + a periodic `du -sh` tick so the
+#   log panel gets one line every 30 s instead of thousands per second.
+# Args: <src/> <dst/>
+_rsync_piped() {
+  local src=$1 dst=$2
+  if [ -t 1 ]; then
+    rsync -a --info=progress2 "$src" "$dst"
+    return $?
+  fi
+  # Non-TTY: silent rsync in the background, periodic size ticks in the foreground.
+  rsync -aq "$src" "$dst" &
+  local rs_pid=$!
+  local started=$(date +%s)
+  while kill -0 "$rs_pid" 2>/dev/null; do
+    sleep 30
+    kill -0 "$rs_pid" 2>/dev/null || break
+    local size files elapsed
+    size=$(du -sh "$dst" 2>/dev/null | cut -f1)
+    files=$(find "$dst" -type f 2>/dev/null | wc -l)
+    elapsed=$(( $(date +%s) - started ))
+    echo "  rsync: ${elapsed}s elapsed, ${files} files, ${size} copied"
+  done
+  wait "$rs_pid"
+}
+
+LOCAL_VENV=/root/venv
+LOCAL_UV_PY_DIR=/root/.uv-python
+
+# Mirror the uv-managed CPython interpreter referenced by $src_venv to local
+# NVMe and return the local interpreter path on stdout.
+# The venv's python is a symlink to /workspace/.uv-python/<cpython-X>/bin/python3.X
+# whose stdlib (~hundreds of .py + .so files) lives on MooseFS — that's the
+# main source of slow imports, even after the venv tree itself is mirrored.
+_mirror_uv_python() {
+  local src_venv=$1
+  local cfg="$src_venv/pyvenv.cfg"
+  [ -f "$cfg" ] || { echo "no pyvenv.cfg in $src_venv" >&2; return 1; }
+  local home_dir
+  home_dir=$(awk -F' *= *' '/^home/{print $2}' "$cfg")    # .../bin
+  local uv_py_root="${home_dir%/bin}"                     # .../cpython-X.Y.Z-...
+  if [ ! -d "$uv_py_root" ]; then
+    echo "uv-python root $uv_py_root not present — skipping" >&2
+    return 1
+  fi
+  case "$uv_py_root" in
+    /workspace/*) : ;;                                    # on MooseFS, mirror it
+    *) echo "$uv_py_root" ; return 0 ;;                   # already local-ish
+  esac
+  local name dst
+  name=$(basename "$uv_py_root")
+  dst="$LOCAL_UV_PY_DIR/$name"
+  if [ ! -x "$dst/bin/python3" ] && [ ! -x "$dst/bin/python3."* ]; then
+    echo "→ Mirroring python interpreter $uv_py_root → $dst..." >&2
+    mkdir -p "$LOCAL_UV_PY_DIR"
+    rm -rf "$dst.new"
+    _rsync_piped "$uv_py_root/" "$dst.new/" >&2
+    rm -rf "$dst.old"
+    [ -d "$dst" ] && mv "$dst" "$dst.old"
+    mv "$dst.new" "$dst"
+    rm -rf "$dst.old"
+  fi
+  echo "$dst"
+}
+
+mirror_venv_local() {
+  _ensure_rsync
+  local src=/workspace/venv
+  local dst="$LOCAL_VENV"
+  [ -d "$src" ] || { echo "mirror_venv_local: $src missing — skipping"; return 1; }
+  # Skip if a previous mirror is current (compare the cache_key stamp set
+  # by venv_pull / venv_push). No stamp = always re-mirror to be safe.
+  # Also re-mirror if the local interpreter is missing (e.g. an older mirror
+  # that pre-dated the uv-python relocation).
+  if [ -f "$src/.cache_key" ] && [ -f "$dst/.cache_key" ] \
+     && [ "$(cat "$src/.cache_key")" = "$(cat "$dst/.cache_key")" ] \
+     && [ -x "$(readlink -f "$dst/bin/python" 2>/dev/null)" ] \
+     && case "$(readlink -f "$dst/bin/python" 2>/dev/null)" in /root/*) true;; *) false;; esac
+  then
+    echo "Local venv at $dst is current ($(cat "$dst/.cache_key"))"
+    return 0
+  fi
+  local size
+  size=$(du -sh "$src" 2>/dev/null | cut -f1)
+  echo "→ Mirroring venv $src → $dst ($size)..."
+  rm -rf "$dst.new"
+  mkdir -p "$dst.new"
+  _rsync_piped "$src/" "$dst.new/"
+  # uv writes absolute shebangs into bin/ entry-point scripts. Rewrite so
+  # `wandb` etc. invoke the local python and import from local site-packages.
+  find "$dst.new/bin" -maxdepth 1 -type f \
+    -exec sed -i "1s|^#!$src/bin/|#!$dst/bin/|" {} + 2>/dev/null || true
+
+  # Mirror the uv-managed Python interpreter (its stdlib is on MooseFS too)
+  # and re-point pyvenv.cfg + python symlinks at the local copy.
+  local local_py_root
+  if local_py_root=$(_mirror_uv_python "$src"); then
+    local local_py_bin="$local_py_root/bin"
+    # Find the python3.X executable in the interpreter dir.
+    local local_py
+    local_py=$(ls "$local_py_bin"/python3.* 2>/dev/null | grep -E '/python3\.[0-9]+$' | head -1)
+    if [ -z "$local_py" ]; then
+      local_py="$local_py_bin/python3"
+    fi
+    # Rewrite pyvenv.cfg → local interpreter.
+    sed -i "s|^home = .*|home = $local_py_bin|" "$dst.new/pyvenv.cfg"
+    # Replace the python symlinks in the venv's bin/ with links to the local interpreter.
+    for n in python python3; do
+      if [ -L "$dst.new/bin/$n" ] || [ -e "$dst.new/bin/$n" ]; then
+        ln -snf "$local_py" "$dst.new/bin/$n"
+      fi
+    done
+    # python3.X — keep the same minor-version name if present.
+    for f in "$dst.new"/bin/python3.*; do
+      [ -e "$f" ] || continue
+      ln -snf "$local_py" "$f"
+    done
+  else
+    echo "⚠ Could not mirror uv-python; venv will still load stdlib from MooseFS." >&2
+  fi
+
+  rm -rf "$dst.old"
+  [ -d "$dst" ] && mv "$dst" "$dst.old"
+  mv "$dst.new" "$dst"
+  rm -rf "$dst.old"
+  echo "✓ Local venv ready at $dst (python → $(readlink -f "$dst/bin/python"))"
+}
+
+activate() {
+  # Prefer local-NVMe mirror; fall back to network venv if no mirror exists.
+  if [ -d "$LOCAL_VENV/bin" ]; then
+    source "$LOCAL_VENV/bin/activate"
+  else
+    source /workspace/venv/bin/activate
+  fi
+  # Send .pyc writes to tmpfs so import-time bytecode regeneration doesn't
+  # touch the (slow) network FS or churn container disk.
+  export PYTHONPYCACHEPREFIX=/dev/shm/pycache
+  mkdir -p "$PYTHONPYCACHEPREFIX" 2>/dev/null || true
+}
 
 # ─── step 1: download (runs fine on a CPU pod) ────────────────────────────
 download() {
@@ -528,29 +704,44 @@ download() {
   # right after each download. 1024 / 1200 are good defaults — keeps headroom
   # over the 640px training size while cutting disk ~10× vs full scans.
   # Override any of these via env vars from the orchestrator / Cloud tab:
-  #   IIIF=2048  MAX_SIZE=1200  LIMIT=500  MAX_PER_SP=30  bash pod_bootstrap.sh download
+  #   IIIF=2048  MAX_SIZE=1200  LIMIT=500  MAX_PER_SP=30  \
+  #   MAX_PER_GENUS=50  MAX_PER_FAMILY=750  FROM_SPECSIN=/workspace/data/my.csv  \
+  #   bash pod_bootstrap.sh download
   IIIF="${IIIF:-1200}"
+  WORKERS="${WORKERS:-16}"
   EXTRA=()
-  if [ -n "${MAX_SIZE:-}" ];   then EXTRA+=(--max-size "$MAX_SIZE"); fi
-  if [ -n "${LIMIT:-}" ];      then EXTRA+=(--limit "$LIMIT"); fi
-  if [ -n "${MAX_PER_SP:-}" ]; then EXTRA+=(--max-per-species "$MAX_PER_SP"); fi
-  if [ -n "$DWCA" ] && [ -f "$DWCA" ]; then
-    echo "Using local DwC-A: $DWCA (iiif-size=$IIIF${MAX_SIZE:+ max-size=$MAX_SIZE}${LIMIT:+ limit=$LIMIT}${MAX_PER_SP:+ max-per-sp=$MAX_PER_SP})"
+  if [ -n "${MAX_SIZE:-}" ];       then EXTRA+=(--max-size "$MAX_SIZE"); fi
+  if [ -n "${LIMIT:-}" ];          then EXTRA+=(--limit "$LIMIT"); fi
+  if [ -n "${MAX_PER_SP:-}" ];     then EXTRA+=(--max-per-species "$MAX_PER_SP"); fi
+  if [ -n "${MAX_PER_GENUS:-}" ];  then EXTRA+=(--max-per-genus "$MAX_PER_GENUS"); fi
+  if [ -n "${MAX_PER_FAMILY:-}" ]; then EXTRA+=(--max-per-family "$MAX_PER_FAMILY"); fi
+  if [ "${SPECSIN_ONLY:-}" = "True" ]; then EXTRA+=(--specsin-only); fi
+  if [ -n "${FROM_SPECSIN:-}" ] && [ -f "$FROM_SPECSIN" ]; then
+    echo "Using specsin CSV: $FROM_SPECSIN (iiif-size=$IIIF${MAX_SIZE:+ max-size=$MAX_SIZE}${LIMIT:+ limit=$LIMIT}${MAX_PER_SP:+ max-per-sp=$MAX_PER_SP}${MAX_PER_GENUS:+ max-per-genus=$MAX_PER_GENUS}${MAX_PER_FAMILY:+ max-per-family=$MAX_PER_FAMILY})"
+    python -u "$REPO/download_gbif_images.py" \
+      --from-specsin "$FROM_SPECSIN" \
+      --output-dir "$IMG_RAW" \
+      --specsin "$SPECSIN" \
+      --iiif-size "$IIIF" \
+      --workers "$WORKERS" \
+      "${EXTRA[@]}"
+  elif [ -n "$DWCA" ] && [ -f "$DWCA" ]; then
+    echo "Using local DwC-A: $DWCA (iiif-size=$IIIF${MAX_SIZE:+ max-size=$MAX_SIZE}${LIMIT:+ limit=$LIMIT}${MAX_PER_SP:+ max-per-sp=$MAX_PER_SP}${MAX_PER_GENUS:+ max-per-genus=$MAX_PER_GENUS}${MAX_PER_FAMILY:+ max-per-family=$MAX_PER_FAMILY})"
     python -u "$REPO/download_gbif_images.py" \
       --dwca "$DWCA" \
       --output-dir "$IMG_RAW" \
       --specsin "$SPECSIN" \
       --iiif-size "$IIIF" \
-      --workers 16 \
+      --workers "$WORKERS" \
       "${EXTRA[@]}"
   else
-    echo "No DWCA zip at $DWCA — falling back to GBIF API (--family $TAXON_FAMILY)"
+    echo "No DwC-A or specsin found — falling back to GBIF API (--family $TAXON_FAMILY)"
     python -u "$REPO/download_gbif_images.py" \
       --family "$TAXON_FAMILY" \
       --output-dir "$IMG_RAW" \
       --specsin "$SPECSIN" \
       --iiif-size "$IIIF" \
-      --workers 16 \
+      --workers "$WORKERS" \
       "${EXTRA[@]}"
   fi
 }
@@ -558,6 +749,14 @@ download() {
 # ─── step 2: filter + crop + resize ───────────────────────────────────────
 prep() {
   activate
+  # Override via env: FILTER_METHOD=hsv (default clip), NO_FILTER=1, NO_CROP=1
+  FILTER_METHOD="${FILTER_METHOD:-clip}"
+  FILTER_EXTRA=()
+  if [ "${NO_FILTER:-0}" = "1" ]; then FILTER_EXTRA+=(--no-filter); fi
+  if [ "${NO_CROP:-0}"   = "1" ]; then FILTER_EXTRA+=(--no-crop); fi
+  # Single-dir layout: input == output, so every image looks "already done."
+  # Force re-processing to ensure the specsin gets classification labels.
+  if [ "$IMG_RAW" = "$IMG_FILT" ]; then FILTER_EXTRA+=(--force); fi
   # -u unbuffers stdout so tqdm bars stream live to the orchestrator's log
   # panel; without it Python buffers in chunks of ~4 KB and progress only
   # appears every few minutes on a slow CPU pod.
@@ -565,23 +764,64 @@ prep() {
     --input-dir "$IMG_RAW" \
     --output-dir "$IMG_FILT" \
     --specsin "$SPECSIN" \
-    --batch-size 32 --workers 8
+    --filter-method "$FILTER_METHOD" \
+    --batch-size 32 --workers 8 \
+    "${FILTER_EXTRA[@]}"
 
-  python -u "$REPO/resize_images.py" \
-    --input-dir "$IMG_FILT" \
-    --output-dir "$IMG_1024" \
-    --max-size 1024 --no-upscale \
-    --batch-size 16 --workers 8
+  # Resize is skipped — download already resizes via MAX_SIZE.
+  # Run resize_images.py manually if you need a different output size.
 
-  # Reconcile hasfile against what actually landed in IMG_1024 (resize failures
-  # / decode errors silently leave specsin out of sync with disk).
+  # Reconcile hasfile against what actually landed on disk.
   python -u "$REPO/verify_specsin.py" \
     --specsin "$SPECSIN" \
-    --image-dir "$IMG_1024"
+    --image-dir "$IMG_1024" --restore --rebuild-fnames
 
-  # Push the CLIP weights (~600 MB) that filter_and_crop just cached to
-  # HF_HOME, so other projects skip the download on their first prep.
-  cache_push
+  # Push caches only when new models were likely downloaded (CLIP filter).
+  # HSV and subsequent preps don't need this — set NO_CACHE_PUSH=1 to skip.
+  if [ "${NO_CACHE_PUSH:-0}" != "1" ] && [ "$FILTER_METHOD" != "hsv" ]; then
+    cache_push
+  fi
+}
+
+# ─── stage images to local storage (escape MooseFS for training) ──────────
+# /workspace is a MooseFS network volume on RunPod (mfs#…runpod.net:9421).
+# Per-file read latency is ~ms, which starves DALI and pins the A100 at
+# ~20% util during training. Copy the dataset to local NVMe (or tmpfs if
+# it fits) once at the start of a run and DALI feeds the GPU at line rate.
+#
+# Picks tmpfs (/dev/shm) when the dataset comfortably fits with 25% RAM
+# headroom; falls back to container-disk NVMe at /root/staged_images.
+# Idempotent: rsync only copies new/changed files, so re-running after a
+# partial download adds the diff cheaply.
+#
+# Sets STAGED_IMAGES_DIR for downstream steps (consumed by train()).
+stage_images() {
+  _ensure_rsync
+  local src="${IMAGES_DIR}"
+  if [ ! -d "$src" ]; then
+    echo "stage_images: source $src does not exist"; return 1
+  fi
+  local src_kb shm_free_kb need_kb
+  src_kb=$(du -sk "$src" | cut -f1)
+  shm_free_kb=$(df -k --output=avail /dev/shm 2>/dev/null | tail -1)
+  # Need 1.25× source size to leave RAM headroom for DALI buffers + the
+  # python/torch process. Without this guard a tight tmpfs fills, OOM-kills
+  # the trainer mid-epoch.
+  need_kb=$(( src_kb * 5 / 4 ))
+  local dest
+  if [ -n "$shm_free_kb" ] && [ "$shm_free_kb" -gt "$need_kb" ]; then
+    dest=/dev/shm/staged_images
+    echo "stage_images: tmpfs has $((shm_free_kb/1024)) MB free, source $((src_kb/1024)) MB → $dest"
+  else
+    dest=/root/staged_images
+    echo "stage_images: tmpfs too small ($((shm_free_kb/1024)) MB free, need $((need_kb/1024)) MB) → $dest"
+  fi
+  mkdir -p "$dest"
+  _rsync_piped "$src/" "$dest/"
+  echo "stage_images: staged $(find "$dest" -type f | wc -l) files at $dest"
+  export STAGED_IMAGES_DIR="$dest"
+  # Persist for follow-up commands (train() in a separate invocation).
+  echo "$dest" > "$WS/.staged_images_dir"
 }
 
 # ─── step 3: train (needs GPU pod, DALI installed) ────────────────────────
@@ -620,13 +860,36 @@ train() {
   [ -n "${RESUME:-}" ] && EXTRA+=(--resume "$RESUME")
   [ "${RESET_OPTIMIZER:-0}" = "1" ] && EXTRA+=(--reset-optimizer)
   [ "${MAX_PER_SP}" != "0" ] && EXTRA+=(--max-per-species "$MAX_PER_SP")
+  [ "${NO_GRAD_CKPT:-0}" = "1" ] && EXTRA+=(--no-grad-checkpoint)
+  [ -n "${PREFETCH_QUEUE:-}" ] && EXTRA+=(--prefetch-queue "$PREFETCH_QUEUE")
+
+  # Stage images to local storage if requested (escapes MooseFS I/O bottleneck).
+  # STAGE_IMAGES=1 → run stage_images now and override the source dir.
+  # If a previous step already staged, reuse $WS/.staged_images_dir.
+  TRAIN_IMG_DIR="$IMG_1024"
+  if [ "${STAGE_IMAGES:-0}" = "1" ]; then
+    stage_images
+    TRAIN_IMG_DIR="$STAGED_IMAGES_DIR"
+    EXTRA+=(--use-mmap)        # safe on local FS, faster than non-mmap
+  elif [ -f "$WS/.staged_images_dir" ]; then
+    _staged=$(cat "$WS/.staged_images_dir")
+    if [ -d "$_staged" ]; then
+      echo "Reusing previously staged images: $_staged"
+      TRAIN_IMG_DIR="$_staged"
+      EXTRA+=(--use-mmap)
+    fi
+  fi
 
   echo "Train recipe: model=$MODEL  batch=$BATCH_SIZE×accum=$ACCUM  "\
        "stages=${STAGE1_EPOCHS}+${STAGE2_EPOCHS}+${COOLDOWN_EPOCHS}  "\
        "lr=${STAGE1_LR}/${STAGE2_LR}/${COOLDOWN_LR}  gpus=$NUM_GPUS"
 
+  # Capture full output to a log on the network volume so SSH-channel reaps
+  # (the webui losing the stream) don't lose the training output.
+  TRAIN_LOG="$WS/train-$(date +%Y%m%d-%H%M%S).log"
+  echo "Logging to $TRAIN_LOG"
   python -u train_herbarium.py \
-    --sources "$SPECSIN:$IMG_1024" \
+    --sources "$SPECSIN:$TRAIN_IMG_DIR" \
     --output-dir "$DATA" \
     --model "$MODEL" \
     --image-sz "$IMAGE_SZ" \
@@ -639,7 +902,12 @@ train() {
     --num-gpus "$NUM_GPUS" --num-workers "$NUM_WORKERS" \
     --wandb-project "$WANDB_PROJECT" \
     --wandb-run-name "$WANDB_RUN_NAME" \
-    "${EXTRA[@]}"
+    "${EXTRA[@]}" 2>&1 | tee -a "$TRAIN_LOG"
+  rc=${PIPESTATUS[0]}
+  if [ "$rc" -ne 0 ]; then
+    echo "✗ training exited with rc=$rc — see $TRAIN_LOG"
+    return "$rc"
+  fi
 
   # Push the timm/DINOv3 backbone weights (~1.2 GB) downloaded on first
   # train, so other projects skip the download on their first train.
@@ -706,12 +974,13 @@ backup() {
     rclone copy "$DATA/predictions" "$REMOTE/predictions/" --progress
   fi
 
-  # 4. Resized images — tar first so it's one large sequential upload
+  # 4. Images — tar first so it's one large sequential upload
   #    instead of N small PUTs (faster + cheaper at R2's per-op pricing).
-  if [ -d "$IMG_1024" ]; then
-    IMG_TAR="$DATA/images_1024.tar"
-    echo "  bundling $IMG_1024 → $(basename "$IMG_TAR")"
-    tar cf "$IMG_TAR" -C "$DATA" images_1024
+  IMG_BASENAME="$(basename "$IMAGES_DIR")"
+  if [ -d "$IMAGES_DIR" ]; then
+    IMG_TAR="$DATA/${IMG_BASENAME}.tar"
+    echo "  bundling $IMAGES_DIR → $(basename "$IMG_TAR")"
+    tar cf "$IMG_TAR" -C "$DATA" "$IMG_BASENAME"
     echo "  uploading $(du -h "$IMG_TAR" | cut -f1)"
     rclone copy "$IMG_TAR" "$REMOTE/" \
       --progress --transfers 4 --s3-chunk-size 64M
@@ -740,16 +1009,22 @@ restore() {
   rclone copy "$REMOTE/predictions/" "$DATA/predictions/" --progress 2>/dev/null || true
 
   # Images tarball — pull then unpack on-pod (tar lives only briefly)
-  if rclone lsf "$REMOTE/images_1024.tar" >/dev/null 2>&1; then
-    IMG_TAR="$DATA/images_1024.tar"
-    echo "  pulling images tar..."
-    rclone copy "$REMOTE/images_1024.tar" "$DATA/" --progress \
-      --transfers 4 --s3-chunk-size 64M
-    echo "  extracting..."
-    rm -rf "$IMG_1024"
-    tar xf "$IMG_TAR" -C "$DATA"
-    rm -f "$IMG_TAR"
-  fi
+  IMG_BASENAME="$(basename "$IMAGES_DIR")"
+  TAR_NAME="${IMG_BASENAME}.tar"
+  # Also check legacy name for projects migrated from the three-dir layout
+  for _try in "$TAR_NAME" "images_1024.tar"; do
+    if rclone lsf "$REMOTE/$_try" >/dev/null 2>&1; then
+      IMG_TAR="$DATA/$_try"
+      echo "  pulling images tar ($_try)..."
+      rclone copy "$REMOTE/$_try" "$DATA/" --progress \
+        --transfers 4 --s3-chunk-size 64M
+      echo "  extracting..."
+      rm -rf "$IMAGES_DIR"
+      tar xf "$IMG_TAR" -C "$DATA"
+      rm -f "$IMG_TAR"
+      break
+    fi
+  done
 
   echo "✓ Restore complete. Skip download/prep — go straight to identify or further training."
 }
@@ -775,20 +1050,22 @@ repair_cache() {
   cache_push
 }
 
-case "${1:?usage: $0 [setup|download|prep|train|identify|backup|restore|cache_pull|cache_push|cache_push_bg|venv_pull|venv_push|venv_push_bg|repair_cache]}" in
-  setup)         setup ;;
-  download)      download ;;
-  prep)          prep ;;
-  train)         train ;;
-  identify)      identify ;;
-  backup)        backup ;;
-  restore)       restore ;;
-  cache_pull)    cache_pull ;;
-  cache_push)    cache_push ;;
-  cache_push_bg) cache_push_bg ;;
-  venv_pull)     venv_pull ;;
-  venv_push)     venv_push ;;
-  venv_push_bg)  venv_push_bg ;;
-  repair_cache)  repair_cache ;;
+case "${1:?usage: $0 [setup|download|prep|stage_images|train|identify|backup|restore|cache_pull|cache_push|cache_push_bg|venv_pull|venv_push|venv_push_bg|mirror_venv_local|repair_cache]}" in
+  setup)              setup ;;
+  download)           download ;;
+  prep)               prep ;;
+  stage_images)       stage_images ;;
+  train)              train ;;
+  identify)           identify ;;
+  backup)             backup ;;
+  restore)            restore ;;
+  cache_pull)         cache_pull ;;
+  cache_push)         cache_push ;;
+  cache_push_bg)      cache_push_bg ;;
+  venv_pull)          venv_pull ;;
+  venv_push)          venv_push ;;
+  venv_push_bg)       venv_push_bg ;;
+  mirror_venv_local)  mirror_venv_local ;;
+  repair_cache)       repair_cache ;;
   *)            echo "unknown step: $1"; exit 1 ;;
 esac

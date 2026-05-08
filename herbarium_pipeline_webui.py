@@ -307,7 +307,7 @@ def _qi_infer(ckpt_path: str, image_path: str,
 
     cache = _quick_id_cache
     if cache.get("ckpt") != ckpt_path:
-        state_dict, model_name, num_classes, nameslist, geo_dim = load_model(
+        state_dict, model_name, num_classes, nameslist, geo_dim, _label_level = load_model(
             Path(ckpt_path), [], 640)
         if not model_name:
             model_name = model_name_hint.strip()
@@ -571,6 +571,24 @@ def _build_download() -> callable:
             ui.label("Max per species (0=all):").classes("text-sm")
             max_per_sp = ui.input(value="0").classes("w-20").props("dense outlined").bind_value(gs, "dl_max_per_sp")
             ui.label("random subsample per species").classes("text-caption text-grey-7")
+        with ui.row().classes("items-center gap-1"):
+            ui.label("Max per genus (0=all):").classes("text-sm")
+            max_per_ge = ui.input(value="0").classes("w-20").props("dense outlined").bind_value(gs, "dl_max_per_ge")
+            ui.label("random subsample per genus").classes("text-caption text-grey-7")
+        with ui.row().classes("items-center gap-1"):
+            ui.label("Max per family (0=all):").classes("text-sm")
+            max_per_fa = ui.input(value="0").classes("w-20").props("dense outlined").bind_value(gs, "dl_max_per_fa")
+            ui.label("stratified — ≥1 per genus, remainder random").classes("text-caption text-grey-7")
+
+        with ui.row().classes("items-center gap-3 mt-1"):
+            specsin_only = ui.checkbox("Specsin only (no download)", value=False)\
+                .bind_value(gs, "dl_specsin_only")
+        with ui.row().classes("items-center gap-1"):
+            ui.label("From specsin (optional):").classes("text-sm")
+            from_specsin = ui.input(value="").classes("w-72").props("dense outlined")\
+                .bind_value(gs, "dl_from_specsin")
+            ui.label("use specsin CSV as source instead of DwC-A/API").classes(
+                "text-caption text-grey-7")
 
     ui.button("Run Download", icon="download",
               on_click=lambda: _run_step_mode_aware(
@@ -607,6 +625,15 @@ def _build_download() -> callable:
         if ms and ms != "0": cmd += ["--max-size", ms]
         mps = _v(max_per_sp)
         if mps and mps != "0": cmd += ["--max-per-species", mps]
+        mpg = _v(max_per_ge)
+        if mpg and mpg != "0": cmd += ["--max-per-genus", mpg]
+        mpf = _v(max_per_fa)
+        if mpf and mpf != "0": cmd += ["--max-per-family", mpf]
+        if specsin_only.value:
+            cmd += ["--specsin-only"]
+        fs = _v(from_specsin)
+        if fs:
+            cmd += ["--from-specsin", fs]
         return cmd
 
     return _dl_cmd, out_dir, specsin
@@ -669,7 +696,8 @@ def _build_filter_crop() -> callable:
     force = ui.checkbox("Force reprocess (ignore already-processed images)", value=False).bind_value(gs, "fc_force")
 
     ui.button("Run Filter & Crop", icon="filter_alt",
-              on_click=lambda: _run_step_mode_aware("prep", _fc_cmd)
+              on_click=lambda: _run_step_mode_aware("prep", _fc_cmd,
+                                                    cloud_env_fn=_cloud_env_prep)
               ).props("color=primary unelevated").classes("mt-4")\
               .tooltip("Cloud mode: runs the bootstrap 'prep' step (filter + crop "
                        "+ resize with hardcoded defaults). Configure here only "
@@ -738,7 +766,8 @@ def _build_resize() -> callable:
             rs_workers = ui.input(value="8").classes("w-16").props("dense outlined").bind_value(gs, "rs_workers")
 
     ui.button("Run Resize", icon="photo_size_select_large",
-              on_click=lambda: _run_step_mode_aware("prep", _rs_cmd)
+              on_click=lambda: _run_step_mode_aware("prep", _rs_cmd,
+                                                    cloud_env_fn=_cloud_env_prep)
               ).props("color=primary unelevated").classes("mt-4")\
               .tooltip("Cloud mode: runs the bootstrap 'prep' step (filter + "
                        "crop + resize 1024 px). Same step as Filter & Crop.")
@@ -894,6 +923,28 @@ def _build_train() -> tuple:
             .tooltip("Discards the saved optimizer/LR-schedule state so stage 2 starts "
                      "with a clean optimizer at the LR you specify above. "
                      "Leave unticked to continue an interrupted stage-2 run."))
+        with ui.row().classes("w-full items-center gap-4"):
+            (ui.checkbox(
+                "Stage images to local disk (escape MooseFS — needed on RunPod for full GPU util)",
+                value=True).bind_value(gs, "tr_stage_images")
+                .tooltip("Rsync the image dir to /dev/shm (or /root/staged_images) on the pod "
+                         "before training. /workspace is a network FS; per-file reads starve "
+                         "the GPU. Local staging typically lifts A100 utilisation from ~20% "
+                         "to 90%+. Idempotent — only copies new/changed files."))
+            (ui.checkbox(
+                "Disable gradient checkpointing (A100/H100 only — uses more VRAM, ~30% faster)",
+                value=False).bind_value(gs, "tr_no_grad_ckpt")
+                .tooltip("Default on (safe on 24 GB cards). Turn off only on a 40+ GB GPU "
+                         "where the batch fits without checkpointing — gives back the "
+                         "30% compute that checkpointing trades for memory."))
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.label("DALI prefetch queue:").classes("w-36 text-right shrink-0 font-medium")\
+                .style("color:#455a64")
+            (ui.number(value=2, min=1, max=8, step=1, format="%d")
+                .classes("w-24").props("dense outlined")
+                .bind_value(gs, "tr_prefetch_queue")
+                .tooltip("DALI prefetch queue depth. 2 is fine for local NVMe; bump to 4 "
+                         "when training directly off the network volume."))
 
     def _tr_env() -> dict:
         env = {}
@@ -2101,8 +2152,8 @@ def _build_confusion() -> "ui.input":
     }
     chart = ui.echart(copy.deepcopy(_BASE)).style("height:600px; width:100%")
 
-    # Accuracy bar chart
-    _section("Per-species Accuracy")
+    # Accuracy bar chart — generic title; the per-level label sits on the X-axis.
+    _section("Accuracy by class")
     _ACC_BASE = {
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"},
                     "confine": True,
@@ -2149,38 +2200,94 @@ def _build_confusion() -> "ui.input":
         df = df[~indet_mask].copy()
 
         level = level_sel.value
-        pred_sp_col = "pred_species" if "pred_species" in df.columns else "top1_name"
-        if "true_species" not in df.columns or pred_sp_col not in df.columns:
-            ui.notify("Need 'true_species' and 'pred_species' columns.", type="warning")
-            return
+        # Resolve the (true_col, pred_col) pair lazily per level so a
+        # family-only predictions CSV (no pred_species / true_species) plots
+        # correctly when level=family. Each branch checks only the columns
+        # it actually needs.
+        pred_sp_col = "pred_species" if "pred_species" in df.columns else (
+                      "top1_name" if "top1_name" in df.columns else None)
 
-        if level == "genus":
-            df["_true"] = df["true_species"].astype(str).str.split().str[0]
-            df["_pred"] = df[pred_sp_col].astype(str).str.split().str[0]
-            level_label = "Genus"
-        elif level == "family":
-            if "true_family" not in df.columns or "pred_family" not in df.columns:
-                ui.notify("Family columns not in this CSV — re-run Identify to add them.",
-                          type="warning")
+        def _missing(*cols: str) -> str:
+            return ", ".join(c for c in cols if c not in df.columns)
+
+        if level == "family":
+            if "true_family" not in df.columns:
+                ui.notify("Family-level analysis needs the 'true_family' "
+                          "column. Re-run Identify after upgrading specsin "
+                          "with the family field.", type="warning")
                 return
             df["_true"] = df["true_family"].astype(str).str.strip()
-            df["_pred"] = df["pred_family"].astype(str).str.strip()
+            # Prefer pred_family when populated; fall back to pred_species /
+            # top1_name for legacy CSVs where a family-level identify run
+            # mistakenly wrote family names into the species column.
+            fam_col = None
+            for cand in ("pred_family", "pred_species", "top1_name"):
+                if cand in df.columns:
+                    s = df[cand].astype(str).str.strip().replace("nan", "")
+                    if (s != "").any():
+                        # Heuristic: do these values overlap the known true
+                        # families? If yes, this column holds family-rank
+                        # predictions and is safe to use.
+                        true_fams = set(df["true_family"].astype(str).str.strip())
+                        if (s.isin(true_fams)).any():
+                            fam_col = cand
+                            break
+            if fam_col is None:
+                ui.notify("No usable predicted-family column found "
+                          "(checked pred_family, pred_species, top1_name). "
+                          "Re-run Identify.", type="warning")
+                return
+            df["_pred"] = df[fam_col].astype(str).str.strip()
             level_label = "Family"
+            if fam_col != "pred_family":
+                ui.notify(f"Using legacy '{fam_col}' as family predictions "
+                          f"(pred_family was empty/missing).", type="info")
+        elif level == "genus":
+            # Prefer explicit genus columns when present (hierarchical model);
+            # otherwise derive genus = first word of species.
+            has_genus_cols = ("true_genus" in df.columns and
+                              "pred_genus" in df.columns)
+            if has_genus_cols:
+                df["_true"] = df["true_genus"].astype(str).str.strip()
+                df["_pred"] = df["pred_genus"].astype(str).str.strip()
+            else:
+                if "true_species" not in df.columns or pred_sp_col is None:
+                    ui.notify("Genus-level analysis needs either "
+                              "(true_genus + pred_genus) or "
+                              "(true_species + pred_species).",
+                              type="warning")
+                    return
+                df["_true"] = df["true_species"].astype(str).str.split().str[0]
+                df["_pred"] = df[pred_sp_col].astype(str).str.split().str[0]
+            level_label = "Genus"
         else:
+            if "true_species" not in df.columns or pred_sp_col is None:
+                ui.notify("Species-level analysis needs 'true_species' and "
+                          "'pred_species' (or 'top1_name'). This CSV looks "
+                          "like a family-only predictions file — switch the "
+                          "Level toggle to Family.", type="warning")
+                return
             df["_true"] = df["true_species"].astype(str).str.strip()
             df["_pred"] = df[pred_sp_col].astype(str).str.strip()
             level_label = "Species"
 
         true_col = "_true"
         pred_col = "_pred"
+        # Keep the full frame around as df_full so the Top-5 block can still
+        # see true_species / top{k}_* columns. The narrow `df` is just for
+        # the heatmap and per-class accuracy.
+        df_full = df.copy()
         df = df[[true_col, pred_col]].dropna()
         df = df[df[true_col].str.strip().replace("nan", "") != ""]
         df = df[df[pred_col].str.strip().replace("nan", "") != ""]
+        # Apply the same row filtering to df_full so the two stay aligned.
+        df_full = df_full.loc[df.index]
 
         # Min-samples filter
         min_s = max(1, int(min_s_inp.value or 1))
         vc = df[true_col].value_counts()
         df = df[df[true_col].isin(vc[vc >= min_s].index)]
+        df_full = df_full.loc[df.index]
 
         if df.empty:
             ui.notify("No identified specimens after filtering.", type="info")
@@ -2270,20 +2377,58 @@ def _build_confusion() -> "ui.input":
         f1     = f1_score(       y_true, y_pred, average="macro", zero_division=0)
 
         # Top-5 accuracy: is the true label among the top-5 predictions?
-        top5_cols = [c for c in df.columns if c in {f"top{k}_name" for k in range(1, 6)}]
-        top5_acc  = None
-        if top5_cols:
-            true_series = df["true_species"].astype(str)
-            if level == "genus":
-                true_series = true_series.str.split().str[0]
-                hit = _pd.Series(False, index=df.index)
+        # Source columns differ per level:
+        #   species → top{k}_name (the species columns; the model's own top-5)
+        #   genus   → top{k}_genus if present, else first word of top{k}_name
+        #   family  → top{k}_family if present (hierarchical model) — otherwise
+        #             top-5 isn't meaningful at the family rank, so we skip it.
+        top5_acc = None
+        if level == "family":
+            top5_cols = [f"top{k}_family" for k in range(1, 6)
+                         if f"top{k}_family" in df_full.columns]
+            # Legacy fallback: family-level run may have written family names
+            # into the top{k}_name columns instead of top{k}_family.
+            if not top5_cols:
+                cand = [f"top{k}_name" for k in range(1, 6)
+                        if f"top{k}_name" in df_full.columns]
+                if cand and "true_family" in df_full.columns:
+                    true_fams = set(df_full["true_family"].astype(str).str.strip())
+                    if df_full[cand[0]].astype(str).str.strip().isin(true_fams).any():
+                        top5_cols = cand
+            if top5_cols and "true_family" in df_full.columns:
+                true_series = df_full["true_family"].astype(str).str.strip()
+                hit = _pd.Series(False, index=df_full.index)
                 for col in top5_cols:
-                    hit |= (true_series == df[col].astype(str).str.split().str[0])
-            else:  # species (family top-5 not meaningful without per-rank lookup)
-                hit = _pd.Series(False, index=df.index)
+                    hit |= (true_series == df_full[col].astype(str).str.strip())
+                top5_acc = hit.mean()
+        elif level == "genus":
+            top5_cols = [f"top{k}_genus" for k in range(1, 6)
+                         if f"top{k}_genus" in df_full.columns]
+            if top5_cols and "true_genus" in df_full.columns:
+                true_series = df_full["true_genus"].astype(str).str.strip()
+                hit = _pd.Series(False, index=df_full.index)
                 for col in top5_cols:
-                    hit |= (true_series == df[col].astype(str))
-            top5_acc = hit.mean()
+                    hit |= (true_series == df_full[col].astype(str).str.strip())
+                top5_acc = hit.mean()
+            else:
+                # Derive from species top-5 when the run wasn't hierarchical.
+                top5_cols = [f"top{k}_name" for k in range(1, 6)
+                             if f"top{k}_name" in df_full.columns]
+                if top5_cols and "true_species" in df_full.columns:
+                    true_series = df_full["true_species"].astype(str).str.split().str[0]
+                    hit = _pd.Series(False, index=df_full.index)
+                    for col in top5_cols:
+                        hit |= (true_series == df_full[col].astype(str).str.split().str[0])
+                    top5_acc = hit.mean()
+        else:  # species
+            top5_cols = [f"top{k}_name" for k in range(1, 6)
+                         if f"top{k}_name" in df_full.columns]
+            if top5_cols and "true_species" in df_full.columns:
+                true_series = df_full["true_species"].astype(str).str.strip()
+                hit = _pd.Series(False, index=df_full.index)
+                for col in top5_cols:
+                    hit |= (true_series == df_full[col].astype(str).str.strip())
+                top5_acc = hit.mean()
 
         status_lbl.set_text(
             f"{total:,} identified  ·  "
@@ -2311,10 +2456,14 @@ def _build_confusion() -> "ui.input":
         )
 
         # ── Accuracy bar chart ──────────────────────────────────────────────
-        acc_df = (df.groupby(true_col)
-                  .apply(lambda g: (g[true_col] == g[pred_col]).mean() * 100)
-                  .sort_values(ascending=True)
-                  .rename("accuracy"))
+        # Vectorised per-class accuracy. Avoids a `groupby(col).apply(lambda g:
+        # g[col]==…)` pattern that breaks under pandas ≥2.2 (group columns
+        # excluded from the lambda's frame by default → silent KeyError →
+        # empty chart).
+        matches = (df[true_col] == df[pred_col]).astype(float)
+        acc_df = (matches.groupby(df[true_col]).mean()
+                          .mul(100)
+                          .sort_values(ascending=True))
         acc_labels = acc_df.index.tolist()
         acc_values = [round(v, 1) for v in acc_df.values]
         acc_height = max(300, len(acc_labels) * 16 + 80)
@@ -2883,10 +3032,23 @@ def _env_from_gs(mapping: dict[str, object], *, drop_zero: bool = True) -> dict[
 
 def _cloud_env_download() -> dict[str, str]:
     return _env_from_gs({
-        "MAX_PER_SP": ("cloud_max_per_sp", "dl_max_per_sp"),
-        "LIMIT":      ("cloud_limit",       "dl_limit"),
-        "IIIF":       ("cloud_iiif",        "dl_iiif"),
-        "MAX_SIZE":   ("cloud_max_size",    "dl_max_size"),
+        "MAX_PER_SP":     ("cloud_max_per_sp",  "dl_max_per_sp"),
+        "MAX_PER_GENUS":  ("cloud_max_per_ge",  "dl_max_per_ge"),
+        "MAX_PER_FAMILY": ("cloud_max_per_fa",  "dl_max_per_fa"),
+        "LIMIT":          ("cloud_limit",       "dl_limit"),
+        "IIIF":           ("cloud_iiif",        "dl_iiif"),
+        "MAX_SIZE":       ("cloud_max_size",    "dl_max_size"),
+        "FROM_SPECSIN":   "cloud_from_specsin",
+        "SPECSIN_ONLY":   ("cloud_specsin_only", "dl_specsin_only"),
+        "WORKERS":        ("cloud_workers",      "dl_workers"),
+    })
+
+
+def _cloud_env_prep() -> dict[str, str]:
+    return _env_from_gs({
+        "FILTER_METHOD": "cloud_filter_method",
+        "NO_FILTER":     "cloud_no_filter",
+        "NO_CROP":       "cloud_no_crop",
     })
 
 
@@ -2914,11 +3076,15 @@ def _cloud_env_train() -> dict[str, str]:
         "GENUS_WEIGHT":         "tr_w_ge",
         "FAMILY_WEIGHT":        "tr_w_fa",
         "WANDB_RUN_NAME":       "tr_wandb_name",
+        "RESUME":               "tr_resume",
+        "PREFETCH_QUEUE":       "tr_prefetch_queue",
     }, drop_zero=False)
     gs = app.storage.general
     if gs.get("tr_hier"):            env["HIERARCHICAL"]    = "1"
     if gs.get("tr_use_location"):    env["USE_LOCATION"]    = "1"
     if gs.get("tr_reset_optimizer"): env["RESET_OPTIMIZER"] = "1"
+    if gs.get("tr_stage_images", True): env["STAGE_IMAGES"] = "1"
+    if gs.get("tr_no_grad_ckpt"):    env["NO_GRAD_CKPT"]    = "1"
     return env
 
 
@@ -2961,6 +3127,36 @@ async def _do_provision(purpose: str | None = None) -> None:
     _refresh_cloud_status()
 
 
+async def _do_attach() -> None:
+    """Connect to an existing pod by its RunPod ID (from the console)."""
+    orch = _ensure_orch()
+    if orch is None:
+        return
+    gs = app.storage.general
+    pod_id = (gs.get("cloud_attach_pod_id") or "").strip()
+    if not pod_id:
+        _cloud_warn("Enter a pod ID first.")
+        return
+    try:
+        pod = await orch.attach(pod_id, on_log=_cloud_log)
+    except Exception as e:
+        _cloud_warn(f"Attach failed: {e}")
+        return
+    _cloud["pod"] = pod
+    _cloud["purpose"] = "train"  # assume manually-created pod is train-capable
+    await orch.sync_code(pod, on_log=_cloud_log)
+    # Start the idle watchdog so the pod self-terminates after inactivity
+    try:
+        session = await orch._ensure_session(pod, on_log=_cloud_log)
+        await session.exec_capture(
+            f"source /workspace/Pipeline/pod_bootstrap.sh && "
+            f"RUNPOD_POD_ID={pod_id} start_watchdog"
+        )
+    except Exception:
+        pass  # best-effort
+    _refresh_cloud_status()
+
+
 async def _do_upload_dwca() -> None:
     orch = _cloud["orch"]; pod = _cloud["pod"]
     if not (orch and pod):
@@ -2972,6 +3168,23 @@ async def _do_upload_dwca() -> None:
         return
     cb = _make_progress_cb(f"upload {Path(local).name}")
     await orch.upload_dwca(pod, local, on_log=_cloud_log, on_progress=cb)
+
+
+async def _do_upload_specsin() -> None:
+    orch = _cloud["orch"]; pod = _cloud["pod"]
+    if not (orch and pod):
+        _cloud_warn("Provision or attach a pod first.")
+        return
+    gs = app.storage.general
+    local = (gs.get("dl_specsin") or "").strip()
+    if not local:
+        _cloud_warn("No specsin path. Set it in Tab 1 (Download) specsin field.")
+        return
+    remote = (gs.get("cloud_from_specsin") or "").strip()
+    if not remote:
+        remote = "/workspace/data/specsin.csv"
+    cb = _make_progress_cb(f"upload {Path(local).name}")
+    await orch.upload_file(pod, local, remote, on_log=_cloud_log, on_progress=cb)
 
 
 async def _do_step(step: str, *, env: dict[str, str] | None = None) -> int:
@@ -3008,7 +3221,11 @@ async def _do_download_results() -> None:
     gs = app.storage.general
     local_dir = _cloud_results_dir(orch)
     cb = _make_progress_cb("download")
-    written = await orch.download_results(pod, local_dir, on_log=_cloud_log, on_progress=cb)
+    ckpt_filter = (gs.get("cloud_ckpt_filter") or "latest").strip() or "latest"
+    written = await orch.download_results(
+        pod, local_dir, on_log=_cloud_log, on_progress=cb,
+        ckpt_filter=ckpt_filter,
+    )
     names = {p.name: str(p) for p in written}
 
     # Pick the lowest-valid_loss checkpoint over last.ckpt for inference.
@@ -3046,7 +3263,7 @@ async def _do_download_images() -> None:
         return
     gs = app.storage.general
     local_dir = _cloud_results_dir(orch)
-    cb = _make_progress_cb("images_1024.tar")
+    cb = _make_progress_cb("images.tar")
     out = await orch.download_images(pod, local_dir, on_log=_cloud_log, on_progress=cb)
     gs["review_imgs"] = str(out)
     _cloud_info(f"Pulled images → {out}")
@@ -3108,6 +3325,7 @@ async def _do_wipe(target: str) -> None:
         _cloud_warn("Provision a pod first.")
         return
     targets = {
+        "images":          "/workspace/data/images",
         "images_raw":      "/workspace/data/images_raw",
         "images_filtered": "/workspace/data/images_filtered",
         "images_1024":     "/workspace/data/images_1024",
@@ -3138,6 +3356,30 @@ def _confirm_wipe(target: str, label: str) -> None:
                 _wrap_cloud(lambda: _do_wipe(target))
             ui.button("Wipe", on_click=_ok).props("color=negative unelevated")
     dlg.open()
+
+
+def _do_restore_local() -> None:
+    """Run restore_local.py against the user's chosen target dir.
+
+    Uses the same _launch machinery as the local pipeline tabs, so output
+    streams to the existing log panel. Defaults the project to main_proj
+    when the local-restore field is empty.
+    """
+    gs = app.storage.general
+    project = (gs.get("rl_project") or gs.get("main_proj") or "").strip()
+    remote  = (gs.get("rl_remote")  or "r2:herbarium-backup").strip()
+    target  = (gs.get("rl_target")  or "").strip()
+    if not project:
+        ui.notify("Set a Project name (or fill 'main_proj' on the Project tab).",
+                  type="warning")
+        return
+    if not target:
+        ui.notify("Pick a Target directory first.", type="warning")
+        return
+    script = str(Path(__file__).with_name("restore_local.py"))
+    cmd = [sys.executable, "-u", script,
+           "--project", project, "--target", target, "--remote", remote]
+    asyncio.create_task(_launch(cmd))
 
 
 def _confirm_restore() -> None:
@@ -3196,7 +3438,7 @@ def _confirm_train_upgrade(then_run: callable) -> None:
         ui.label(
             "Training needs a beefier GPU. We'll terminate the current "
             "light pod (volume + downloaded images preserved) and "
-            "provision an RTX 4090."
+            "provision an A100 (80 GB)."
         ).classes("text-body2 mt-1").style("max-width:520px")
         dont_ask = ui.checkbox("Don't ask again — auto-upgrade for future trainings",
                                value=False)
@@ -3291,7 +3533,7 @@ def _build_pod_strip() -> None:
         ui.space()
 
         ui.label("Purpose:").classes("text-caption").style("color:#b2dfdb")
-        ui.select({"light": "light (L4)", "train": "train (RTX 4090)"},
+        ui.select({"light": "light (L4)", "train": "train (A100)"},
                   value=gs.get("cloud_purpose") or "light")\
             .props("dense outlined dark options-dense")\
             .classes("w-44").bind_value(gs, "cloud_purpose")
@@ -3301,22 +3543,57 @@ def _build_pod_strip() -> None:
             .props("dense color=teal-3 unelevated")\
             .tooltip("Create or reuse a pod for this project, sync code, "
                      "push wandb / R2 keys.")
+        with ui.row().classes("items-center gap-1"):
+            pod_id_inp = ui.input(value="", placeholder="Pod ID")\
+                .props("dense outlined dark").classes("w-52")\
+                .style("font-size:11px; color:#e0f2f1")\
+                .bind_value(gs, "cloud_attach_pod_id")
+            ui.button("Attach", icon="link",
+                      on_click=lambda: _wrap_cloud(_do_attach))\
+                .props("dense flat color=teal-2")\
+                .tooltip("Connect to an existing pod by its RunPod ID "
+                         "(from the console URL or pod list).")
         ui.button("Upload DwC-A", icon="archive",
                   on_click=lambda: _wrap_cloud(_do_upload_dwca))\
             .props("dense flat color=teal-2")\
             .tooltip("Upload the DwC-A ZIP from Tab 1 (Download) to the pod.")
+        ui.button("Upload specsin", icon="upload_file",
+                  on_click=lambda: _wrap_cloud(_do_upload_specsin))\
+            .props("dense flat color=teal-2")\
+            .tooltip("Upload the specsin CSV from Tab 1 (Download) to the pod. "
+                     "Set the remote path in Cloud Tools → From specsin.")
         ui.button("Download results", icon="cloud_download",
                   on_click=lambda: _wrap_cloud(_do_download_results))\
             .props("dense flat color=teal-2")\
             .tooltip("Pull checkpoints, nameslist, predictions back locally. "
-                     "Fast (~MB-scale). Does NOT include images — use the "
-                     "next button for those.")
+                     "Use the dropdown to control how many checkpoints. "
+                     "Does NOT include images — use the next button for those.")
+        # Default to "latest" — the most recent .ckpt is what the local
+        # Identify run almost always uses; pulling all checkpoints is
+        # multi-GB over single-threaded SFTP and rarely worth it.
+        if not gs.get("cloud_ckpt_filter"):
+            gs["cloud_ckpt_filter"] = "latest"
+        ui.select(
+            options={
+                "latest":      "ckpts: latest only",
+                "best+latest": "ckpts: best + latest",
+                "all":         "ckpts: all",
+            },
+            value=gs.get("cloud_ckpt_filter") or "latest",
+        ).classes("w-44").props("dense outlined")\
+         .bind_value(gs, "cloud_ckpt_filter")\
+         .tooltip("Which checkpoints to include in 'Download results'. "
+                  "'latest' = single most recent .ckpt by mtime "
+                  "(usually all you need for local Identify). "
+                  "'best+latest' = also includes lowest-valid_loss. "
+                  "'all' = every .ckpt under checkpoints/ (legacy, multi-GB).")
         ui.button("Pull images", icon="image",
                   on_click=lambda: _wrap_cloud(_do_download_images))\
             .props("dense flat color=teal-2")\
-            .tooltip("Tar /workspace/data/images_1024/ on the pod and pull "
-                     "the bundle back (typically 5–15 GB; takes minutes). "
-                     "Required for the Review tab to render specimens.")
+            .tooltip("Tar /workspace/data/images/ on the pod (or /images_1024 "
+                     "for legacy layouts) and pull the bundle back (typically "
+                     "5–15 GB; takes minutes). Required for the Review tab to "
+                     "render specimens.")
         ui.button("Cancel step", icon="stop",
                   on_click=_cancel_cloud).props("dense flat color=warning")
         ui.button("Terminate", icon="power_settings_new",
@@ -3452,6 +3729,16 @@ def _build_cloud_tools() -> None:
                   .props("dense outlined placeholder=all")\
                   .bind_value(gs, "cloud_max_per_sp")
             with ui.row().classes("items-center gap-1"):
+                ui.label("Max per genus:").classes("text-sm")
+                ui.input(value="").classes("w-20")\
+                  .props("dense outlined placeholder=all")\
+                  .bind_value(gs, "cloud_max_per_ge")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Max per family:").classes("text-sm")
+                ui.input(value="").classes("w-20")\
+                  .props("dense outlined placeholder=all")\
+                  .bind_value(gs, "cloud_max_per_fa")
+            with ui.row().classes("items-center gap-1"):
                 ui.label("Total limit:").classes("text-sm")
                 ui.input(value="").classes("w-20")\
                   .props("dense outlined placeholder=all")\
@@ -3464,10 +3751,52 @@ def _build_cloud_tools() -> None:
                 ui.label("Resize after download (px):").classes("text-sm")
                 ui.input(value="1200").classes("w-24")\
                   .props("dense outlined").bind_value(gs, "cloud_max_size")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Workers:").classes("text-sm")
+                ui.input(value="16").classes("w-20")\
+                  .props("dense outlined").bind_value(gs, "cloud_workers")
+        with ui.row().classes("items-center gap-1 mt-1"):
+            ui.label("From specsin (pod path):").classes("text-sm")
+            ui.input(value="").classes("w-72")\
+              .props("dense outlined placeholder='e.g. /workspace/data/my_specsin.csv'")\
+              .bind_value(gs, "cloud_from_specsin")
+        with ui.row().classes("items-center gap-3 mt-1"):
+            ui.checkbox("Specsin only (no download)", value=False)\
+              .bind_value(gs, "cloud_specsin_only")
         ui.label(
             "Many institutions ignore IIIF size and serve full scans; the "
             "Resize-after-download value shrinks each fetched image with PIL "
-            "regardless. Tip: tighten DwC-A filters in GBIF for the cleanest cut."
+            "regardless. Max-per-family ensures ≥1 record per genus when the "
+            "cap is high enough. Leave \"From specsin\" blank to use the DwC-A "
+            "ZIP or GBIF API instead."
+        ).classes("text-caption mt-1").style("color:#546e7a;max-width:780px")
+
+    # ── Prep settings ────────────────────────────────────────────────────
+    with ui.card().classes("w-full mt-2").style("border-left:3px solid #00897b"):
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.icon("tune").style("color:#00897b;font-size:20px")
+            ui.label("Prep (filter + crop + resize)").classes("text-subtitle1 font-bold")\
+                .style("color:#00695c")
+        with ui.row().classes("w-full items-center gap-4 flex-wrap pt-1"):
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Filter method:").classes("text-sm")
+                ui.select(["clip", "hsv"], value="clip")\
+                  .props("dense outlined").classes("w-24")\
+                  .bind_value(gs, "cloud_filter_method")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("No filter:").classes("text-sm")
+                ui.select(["", "1"], value="")\
+                  .props("dense outlined").classes("w-20")\
+                  .bind_value(gs, "cloud_no_filter")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("No crop:").classes("text-sm")
+                ui.select(["", "1"], value="")\
+                  .props("dense outlined").classes("w-20")\
+                  .bind_value(gs, "cloud_no_crop")
+        ui.label(
+            "Filter method: clip = CLIP zero-shot (GPU, more accurate), "
+            "hsv = HSV heuristic (CPU, faster). Set No filter / No crop to "
+            "\"1\" to skip those phases. The resize step always runs."
         ).classes("text-caption mt-1").style("color:#546e7a;max-width:780px")
 
     # ── Pull images / R2 archive ─────────────────────────────────────────
@@ -3483,7 +3812,7 @@ def _build_cloud_tools() -> None:
         ).classes("text-body2 mt-1").style("color:#455a64;max-width:820px")
 
         with ui.row().classes("w-full gap-2 mt-2 flex-wrap"):
-            ui.button("Pull images_1024 (tar)", icon="image",
+            ui.button("Pull images (tar)", icon="image",
                       on_click=lambda: _wrap_cloud(_do_download_images))\
                 .props("flat dense color=primary")\
                 .tooltip("Tar the resized image set on the pod and pull it back "
@@ -3494,12 +3823,40 @@ def _build_cloud_tools() -> None:
                               env={"PROJECT": (gs.get("main_proj") or "").strip()})))\
                 .props("outlined dense color=primary")\
                 .tooltip("Push ckpt, specsin, DwC-A, predictions, and "
-                         "images_1024.tar to r2:<bucket>/<project>/.")
+                         "the images tar to r2:<bucket>/<project>/.")
             ui.button("Restore project from R2", icon="cloud_download",
                       on_click=_confirm_restore)\
                 .props("outlined dense color=primary")\
                 .tooltip("Pull a previously archived project back onto a "
                          "fresh volume — skip download/prep entirely.")
+
+        # ── Restore to LOCAL machine (no pod required) ────────────────────
+        with ui.row().classes("w-full items-center gap-2 mt-4"):
+            ui.icon("download_for_offline").style("color:#00897b;font-size:20px")
+            ui.label("Restore to this machine").classes("text-subtitle1 font-bold")\
+                .style("color:#00695c")
+        ui.label(
+            "Pull an archived project directly onto this computer for local "
+            "review / Identify, no pod needed. Requires rclone on PATH "
+            "(https://rclone.org/install/) configured with the same R2 remote "
+            "(default name 'r2'). Cross-platform — works on Windows, macOS, Linux."
+        ).classes("text-body2 mt-1").style("color:#455a64;max-width:820px")
+        with ui.row().classes("w-full items-center gap-2 mt-1"):
+            ui.label("Project:").classes("w-24 text-right shrink-0")
+            ui.input(value="").classes("w-48").props("dense outlined")\
+              .bind_value(gs, "rl_project")\
+              .tooltip("Project name as used at backup (PROJECT env var). "
+                       "Defaults to the current 'main_proj' if blank.")
+            ui.label("Remote:").classes("w-20 text-right shrink-0")
+            ui.input(value="r2:herbarium-backup").classes("w-56")\
+              .props("dense outlined").bind_value(gs, "rl_remote")\
+              .tooltip("rclone remote + bucket, e.g. r2:herbarium-backup")
+        with ui.row().classes("w-full items-center gap-2 mt-1"):
+            rl_target = _path_input("Target directory:", mode="dir")\
+                .bind_value(gs, "rl_target")
+        ui.button("Restore to local", icon="download_for_offline",
+                  on_click=lambda: _do_restore_local())\
+            .props("unelevated dense color=primary").classes("mt-2")
 
     # ── Maintenance ────────────────────────────────────────────────────────
     with ui.card().classes("w-full mt-2").style("border-left:3px solid #ffa726"):
@@ -3533,17 +3890,21 @@ def _build_cloud_tools() -> None:
             "archived them. Useful when re-running a step from scratch."
         ).classes("text-body2 mt-1").style("color:#c62828;max-width:780px")
         with ui.row().classes("w-full gap-2 mt-2 flex-wrap"):
+            ui.button("images",
+                      on_click=lambda: _confirm_wipe(
+                          "images", "all images (unified layout)"))\
+                .props("flat dense color=negative")
             ui.button("images_raw",
                       on_click=lambda: _confirm_wipe(
-                          "images_raw", "raw downloaded images"))\
+                          "images_raw", "raw downloaded images (legacy layout)"))\
                 .props("flat dense color=negative")
             ui.button("images_filtered",
                       on_click=lambda: _confirm_wipe(
-                          "images_filtered", "filter+crop output"))\
+                          "images_filtered", "filter+crop output (legacy layout)"))\
                 .props("flat dense color=negative")
             ui.button("images_1024",
                       on_click=lambda: _confirm_wipe(
-                          "images_1024", "resized training images"))\
+                          "images_1024", "resized training images (legacy layout)"))\
                 .props("flat dense color=negative")
             ui.button("predictions",
                       on_click=lambda: _confirm_wipe(
@@ -3618,7 +3979,7 @@ def _build_run_all(dl_cmd, fc_cmd, rs_cmd, tr_cmd, id_cmd) -> None:
                 _cloud_warn("Download failed — stopping. Inspect logs, fix, re-run.")
                 return
         if run_fc.value or run_rs.value:
-            rc = await _do_step("prep")
+            rc = await _do_step("prep", env=_cloud_env_prep())
             if rc != 0:
                 _cloud_warn("Prep failed — stopping.")
                 return

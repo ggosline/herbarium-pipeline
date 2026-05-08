@@ -19,6 +19,9 @@ Resume after crash:
   python train_herbarium.py ... --resume ./runs/ebenaceae/checkpoints/last.ckpt
 """
 
+import sys as _sys
+_print = _sys.stderr.write  # stderr is unbuffered; visible before torch swallows stdout
+
 import argparse
 import json
 import math
@@ -32,12 +35,16 @@ from pathlib import Path
 # fit on 24 GB cards at ViT-Large / 640px.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+_print("Loading numpy/pandas...\n")
 import numpy as np
 import pandas as pd
+_print("Loading torch...\n")
 import torch
 import torch.nn as nn
+_print("Loading timm...\n")
 import timm
 import timm.optim
+_print("Loading pytorch_lightning...\n")
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
@@ -125,11 +132,19 @@ class HerbariumData:
         # Derive genus from species (first word)
         combined["genus"] = combined["species"].str.split().str[0]
 
-        # Filter by sparse_threshold at species level (always)
-        species_counts = combined["species"].value_counts()
-        combined = combined[combined["species"].isin(
-            species_counts[species_counts >= sparse_threshold].index
+        # Filter by sparse_threshold at the rank we'll actually train on.
+        # Hierarchical models always index by species, so use species there.
+        rank_col = "species" if hierarchical else label_level
+        if rank_col not in combined.columns:
+            raise ValueError(
+                f"Cannot apply sparse filter: column '{rank_col}' not in specsin "
+                f"(available: {list(combined.columns)})")
+        rank_counts = combined[rank_col].value_counts()
+        combined = combined[combined[rank_col].isin(
+            rank_counts[rank_counts >= sparse_threshold].index
         )].copy()
+        print(f"  Sparse filter @ {rank_col} (≥{sparse_threshold}): "
+              f"{len(combined):,} rows, {combined[rank_col].nunique():,} classes")
 
         # Cap images per species (applied before split so stratification still works)
         if max_per_species and max_per_species > 0:
@@ -208,12 +223,16 @@ class HerbariumData:
 
 @pipeline_def(enable_conditionals=True)
 def create_dali_pipeline(files, labels, crop, size, shard_id, num_shards,
-                         file_root="", dali_cpu=False, is_training=True):
+                         file_root="", dali_cpu=False, is_training=True,
+                         use_mmap=False):
     images, labels = fn.readers.file(
         files=files, labels=labels, file_root=file_root,
         shard_id=shard_id, num_shards=num_shards,
         pad_last_batch=True, name="Reader",
-        dont_use_mmap=True,        # avoids mmap failures on some mounted filesystems
+        # mmap is faster on local NVMe / tmpfs but fails on some network FS
+        # (MooseFS, NFS without locking). Default off; set use_mmap=True after
+        # staging images to local storage.
+        dont_use_mmap=not use_mmap,
         random_shuffle=is_training, # stagger I/O between ranks; also improves generalisation
     )
     dali_device  = "cpu" if dali_cpu else "gpu"
@@ -265,14 +284,12 @@ class TimmModel(nn.Module):
         if geo_dim:
             self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
             feat_dim = self.backbone.num_features
-            self.backbone.set_grad_checkpointing(True)
             self.geo_mlp = nn.Sequential(
                 nn.Linear(4, geo_dim), nn.GELU(), nn.Linear(geo_dim, geo_dim)
             )
             self.head = nn.Linear(feat_dim + geo_dim, num_classes)
         else:
             self.model = timm.create_model(model_name, pretrained=pretrained, num_classes=num_classes)
-            self.model.set_grad_checkpointing(True)
 
     def forward(self, x, geo=None):
         if self.geo_dim:
@@ -326,7 +343,6 @@ class TimmModelHierarchical(nn.Module):
         super().__init__()
         self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
         feat_dim = self.backbone.num_features
-        self.backbone.set_grad_checkpointing(True)
         self.geo_dim = geo_dim
         if geo_dim:
             self.geo_mlp = nn.Sequential(
@@ -504,6 +520,8 @@ class LitHerbarium(pl.LightningModule):
             train_dali_labels = self.data.train_labels[:keep]
             valid_dali_labels = self.data.valid_labels
 
+        prefetch = max(1, int(cfg.get("prefetch_queue", 2)))
+        use_mmap = bool(cfg.get("use_mmap", False))
         try:
             pipe = create_dali_pipeline(
                 batch_size=batch, num_threads=cfg["num_workers"],
@@ -511,7 +529,8 @@ class LitHerbarium(pl.LightningModule):
                 num_shards=world, file_root=self.data.imagepath,
                 files=train_files, labels=train_dali_labels,
                 crop=sz, size=sz, dali_cpu=False, is_training=True,
-                prefetch_queue_depth=1,
+                use_mmap=use_mmap,
+                prefetch_queue_depth=prefetch,
             )
             self.train_loader = DALIClassificationIterator(pipe, reader_name="Reader",
                                                            last_batch_policy=LastBatchPolicy.DROP,
@@ -527,7 +546,8 @@ class LitHerbarium(pl.LightningModule):
                 num_shards=world, file_root=self.data.imagepath,
                 files=self.data.valid_files, labels=valid_dali_labels,
                 crop=sz, size=sz, dali_cpu=False, is_training=False,
-                prefetch_queue_depth=1,
+                use_mmap=use_mmap,
+                prefetch_queue_depth=prefetch,
             )
             self.val_loader = DALIClassificationIterator(pipe, reader_name="Reader",
                                                          last_batch_policy=LastBatchPolicy.FILL,
@@ -546,13 +566,15 @@ class LitHerbarium(pl.LightningModule):
         # passes, preventing layer-by-layer freeing and causing a large memory spike.
         # Disable it for validation; no_grad already prevents grad computation.
         super().on_validation_model_eval()
-        self.model.set_grad_checkpointing(False)
+        if self.config.get("grad_checkpoint", True):
+            self.model.set_grad_checkpointing(False)
 
     def on_validation_model_train(self):
         # Called by Lightning to restore train mode after validation.
         # Must set model back to train() ourselves since we overrode this hook.
         self.train()
-        self.model.set_grad_checkpointing(True)
+        if self.config.get("grad_checkpoint", True):
+            self.model.set_grad_checkpointing(True)
 
     def on_validation_epoch_start(self):
         # Free gradient buffers before validation (set_to_none releases the memory
@@ -724,7 +746,8 @@ def build_trainer(config: dict, output_dir: Path, logger, callbacks: list,
         devices=num_gpus,
         strategy=strategy,
         accumulate_grad_batches=config.get("accum", 2),
-        precision=config.get("precision", "16-mixed"),
+        precision=config.get("precision", "bf16-mixed"),
+        gradient_clip_val=config.get("gradient_clip_val", 1.0),
         callbacks=callbacks,
         logger=logger,
         log_every_n_steps=5,
@@ -793,6 +816,16 @@ def train(config: dict):
         model = TimmModel(config["model_name"], num_classes=data.num_classes,
                           pretrained=config.get("pretrained", True),
                           geo_dim=geo_dim)
+    # Gradient checkpointing trades ~30% compute for activation memory.
+    # Required on 24 GB cards (3090) at ViT-L 640px batch=4. On A100s with
+    # plenty of VRAM headroom, disabling it gives back the compute and lifts
+    # GPU utilisation. Default on for safety; webui passes NO_GRAD_CKPT=1
+    # / --no-grad-checkpoint to opt out.
+    if config.get("grad_checkpoint", True) and hasattr(model, "set_grad_checkpointing"):
+        model.set_grad_checkpointing(True)
+        print("Gradient checkpointing: enabled")
+    else:
+        print("Gradient checkpointing: disabled")
     num_gpus = config.get("num_gpus", 1)
     # torch.compile triggers AccumulateGrad stream mismatch with DDP backward hooks;
     # only use it for single-GPU runs where there are no cross-rank sync concerns.
@@ -875,6 +908,7 @@ def train(config: dict):
     # have requires_grad=True at initialisation; unfreezing mid-run means the
     # backbone gradients are never all-reduced across GPUs and training goes flat.
     checkpoint_cb = None
+    acc_ckpt_cb   = None
     # Track whichever trainer ran last so the final summary can pull the
     # last-epoch metrics from its callback_metrics dict.
     last_trainer = None
@@ -887,11 +921,20 @@ def train(config: dict):
             filename="s1-{epoch:02d}-{valid_loss:.4f}",
             monitor="valid_loss", save_top_k=1, save_last=True, mode="min",
         )
+        # Parallel best-by-accuracy tracker. Lightning keeps both top files
+        # independently in the same dir; loss-best and acc-best can diverge
+        # late in training (model becomes more confident → fewer-but-bigger
+        # losses on hard examples) and we want both available for identify.
+        s1_acc_cb = ModelCheckpoint(
+            dirpath=str(output_dir / "checkpoints"),
+            filename="s1-acc-{epoch:02d}-{val_Accuracy:.4f}",
+            monitor="val_Accuracy", save_top_k=1, save_last=False, mode="max",
+        )
         print(f"\n{'='*50}\n"
               f"STAGE 1: frozen backbone, {stage1_epochs} epochs, lr={config['stage1_lr']}\n"
               f"{'='*50}")
         s1_trainer = build_trainer(config, output_dir, logger,
-                                   [s1_ckpt_cb,
+                                   [s1_ckpt_cb, s1_acc_cb,
                                     EarlyStopping(monitor="valid_loss", patience=5, mode="min")],
                                    stage1_epochs, num_gpus)
         s1_trainer.fit(lit)
@@ -926,6 +969,11 @@ def train(config: dict):
             filename="{epoch:02d}-{valid_loss:.4f}",
             monitor="valid_loss", save_top_k=1, save_last=True, mode="min",
         )
+        acc_ckpt_cb = ModelCheckpoint(
+            dirpath=str(output_dir / "checkpoints"),
+            filename="acc-{epoch:02d}-{val_Accuracy:.4f}",
+            monitor="val_Accuracy", save_top_k=1, save_last=False, mode="max",
+        )
 
         # When resuming, optionally discard saved optimizer state (e.g. resuming
         # from a stage-1 checkpoint whose LR has decayed to min_lr).
@@ -940,7 +988,7 @@ def train(config: dict):
             model_module.unfreeze_all()
 
         s2_trainer = build_trainer(config, output_dir, logger,
-                                   [checkpoint_cb,
+                                   [checkpoint_cb, acc_ckpt_cb,
                                     EarlyStopping(monitor="valid_loss", patience=5, mode="min")],
                                    stage2_epochs, num_gpus)
         s2_trainer.fit(lit, ckpt_path=fit_ckpt)
@@ -978,9 +1026,15 @@ def train(config: dict):
             filename="cd-{epoch:02d}-{valid_loss:.4f}",
             monitor="valid_loss", save_top_k=1, save_last=True, mode="min",
         )
+        cooldown_acc_cb = ModelCheckpoint(
+            dirpath=str(output_dir / "checkpoints"),
+            filename="cd-acc-{epoch:02d}-{val_Accuracy:.4f}",
+            monitor="val_Accuracy", save_top_k=1, save_last=False, mode="max",
+        )
         cooldown_trainer = build_trainer(
             config, output_dir, logger,
-            [cooldown_ckpt_cb, EarlyStopping(monitor="valid_loss", patience=3, mode="min")],
+            [cooldown_ckpt_cb, cooldown_acc_cb,
+             EarlyStopping(monitor="valid_loss", patience=3, mode="min")],
             cooldown_epochs, num_gpus,
         )
         cooldown_trainer.fit(lit)
@@ -989,6 +1043,7 @@ def train(config: dict):
             _step_offset[0] += cooldown_trainer.global_step
             wandb_offset_file.write_text(str(_step_offset[0]))
         checkpoint_cb = cooldown_ckpt_cb
+        acc_ckpt_cb   = cooldown_acc_cb
 
     # wandb.finish() prints its own (long) Run summary table, which can be
     # truncated by output viewers (NiceGUI's log panel collapses long
@@ -1037,6 +1092,10 @@ def train(config: dict):
     if "val_family_Accuracy" in final_metrics:
         print(f"  Final val_family_Accuracy : {_fmt('val_family_Accuracy', '.4f')}")
     print(f"  Best checkpoint    : {best_ckpt}")
+    if acc_ckpt_cb is not None and acc_ckpt_cb.best_model_path:
+        score = acc_ckpt_cb.best_model_score
+        score_str = f"{float(score):.4f}" if score is not None else "n/a"
+        print(f"  Best by val_Accuracy ({score_str}): {acc_ckpt_cb.best_model_path}")
     print(f"  Nameslist          : {nameslist_path}")
     print(f"{'='*50}")
 
@@ -1049,7 +1108,7 @@ DEFAULT_CONFIG = dict(
     seed=42,
     train_val_split=0.2,
     sparse_threshold=5,
-    model_name="vit_large_patch16_dinov3.lvd1689m",
+    model_name="vit_largeimage staging is done_patch16_dinov3.lvd1689m",
     pretrained=True,
     compile_model=True,
     image_sz=640,
@@ -1064,7 +1123,7 @@ DEFAULT_CONFIG = dict(
     cooldown_batch_size=5,
     cooldown_lr=0.0001,
     cooldown_accum=2,
-    precision="16-mixed",
+    precision="bf16-mixed",
     num_workers=8,
     num_gpus=2,
     wandb_project=None,
@@ -1114,6 +1173,15 @@ def parse_args():
                         "optimizer/scheduler state. Use when starting a fresh stage 2 "
                         "from a stage-1 checkpoint.")
     p.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
+    p.add_argument("--no-grad-checkpoint", action="store_true",
+                   help="Disable activation gradient checkpointing. Saves ~30%% compute "
+                        "but increases VRAM. Recommended on A100/H100; do not use on 24 GB cards.")
+    p.add_argument("--prefetch-queue", type=int, default=2, metavar="N",
+                   help="DALI prefetch queue depth (default 2). Higher hides I/O latency at "
+                        "the cost of VRAM; 4 helps on slow / network filesystems.")
+    p.add_argument("--use-mmap", action="store_true",
+                   help="Enable mmap in DALI file reader. Faster on local NVMe / tmpfs; "
+                        "do not use on MooseFS / NFS.")
 
     # Hierarchical / label-level options
     p.add_argument("--label-level", default="species",
@@ -1144,6 +1212,9 @@ if __name__ == "__main__":
     if int(_os.environ.get("LOCAL_RANK", "0")) != 0:
         sys.stdout = open(_os.devnull, "w")
         # stderr stays open so errors from non-zero ranks remain visible
+    else:
+        print("Starting train_herbarium.py (imports may take ~30s for torch/timm/lightning)...",
+              flush=True)
 
     args = parse_args()
     config = dict(
@@ -1174,8 +1245,11 @@ if __name__ == "__main__":
         resume=args.resume,
         reset_optimizer=args.reset_optimizer,
         compile_model=not args.no_compile,
+        grad_checkpoint=not args.no_grad_checkpoint,
+        prefetch_queue=args.prefetch_queue,
+        use_mmap=args.use_mmap,
         pretrained=True,
-        precision="16-mixed",
+        precision="bf16-mixed",
         label_level=args.label_level,
         hierarchical=args.hierarchical,
         species_weight=args.species_weight,

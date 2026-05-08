@@ -15,10 +15,28 @@ from pathlib import Path
 import pandas as pd
 
 
-def reconcile(specsin: Path, image_dir: Path, restore: bool = False) -> tuple[int, int]:
+def reconcile(specsin: Path, image_dir: Path, restore: bool = False,
+              rebuild_fnames: bool = False) -> tuple[int, int]:
     df = pd.read_csv(specsin)
     if "hasfile" not in df.columns or "fname" not in df.columns:
         raise SystemExit(f"{specsin} missing required columns (fname, hasfile)")
+
+    n_rebuilt = 0
+    if rebuild_fnames:
+        # Rebuild fnames from family, species, catalogNumber — used after
+        # --specsin-only or when fnames are NaN / empty.
+        import re as _re
+        def _safe(s):
+            return str(s).strip().replace(" ", "_").replace("/", "_") if pd.notna(s) else "unknown"
+        new_fnames = df.apply(
+            lambda r: f"{_safe(r.get('family',''))}_{_safe(r.get('species',''))}_{_safe(r.get('catalogNumber',''))}.jpg",
+            axis=1,
+        )
+        old_null = df["fname"].isna() | (df["fname"].astype(str).str.strip() == "")
+        df["fname"] = df["fname"].astype(object)  # allow string assignment into NaN column
+        df.loc[old_null, "fname"] = new_fnames[old_null]
+        n_rebuilt = int(old_null.sum())
+        print(f"  Rebuilt {n_rebuilt} empty fname(s) from metadata")
 
     exists = df["fname"].apply(lambda f: (image_dir / str(f)).is_file())
     had = df["hasfile"].astype(str).str.lower().isin(("true", "1"))
@@ -46,6 +64,8 @@ def main() -> None:
     p.add_argument("--image-dir", type=Path, required=True)
     p.add_argument("--restore", action="store_true",
                    help="Also flip hasfile back to True for rows whose file has reappeared")
+    p.add_argument("--rebuild-fnames", action="store_true",
+                   help="Regenerate empty fname values from family/species/catalogNumber metadata")
     args = p.parse_args()
 
     if not args.specsin.is_file():
@@ -53,7 +73,9 @@ def main() -> None:
     if not args.image_dir.is_dir():
         raise SystemExit(f"image dir not found: {args.image_dir}")
 
-    n_cleared, n_restored = reconcile(args.specsin, args.image_dir, restore=args.restore)
+    n_cleared, n_restored = reconcile(args.specsin, args.image_dir,
+                                       restore=args.restore,
+                                       rebuild_fnames=args.rebuild_fnames)
     print(f"  Cleared hasfile for {n_cleared} missing file(s) → {args.specsin}")
     if args.restore:
         print(f"  Restored hasfile for {n_restored} reappeared file(s)")

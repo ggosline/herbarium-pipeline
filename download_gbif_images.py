@@ -20,8 +20,10 @@ Country codes are ISO 3166-1 alpha-2 (e.g. MG=Madagascar, ZA=South Africa, NG=Ni
 """
 
 import csv
+import http.client
 import io
 import json
+import random
 import re
 import sys
 import time
@@ -151,7 +153,10 @@ def load_dwca(
     continent: str | None = None,
     countries: list[str] | None = None,
     exclude_countries: list[str] | None = None,
+    basis_of_record: str | None = "PRESERVED_SPECIMEN",
 ) -> list[dict]:
+    # GBIF occurrence.txt can have fields larger than the default 128 KB limit
+    csv.field_size_limit(sys.maxsize)
     """
     Parse a locally saved GBIF Darwin Core Archive ZIP and return records in
     the same format as search_occurrences(), so the rest of the pipeline is
@@ -205,33 +210,40 @@ def load_dwca(
         # Parse occurrences and apply filters
         print(f"  Parsing {occ_file}...")
         records: list[dict] = []
-        skipped = 0
+        no_media = no_family = no_genus = no_basis = no_geo = 0
+        basis_filter = basis_of_record.strip() if basis_of_record else ""
         with zf.open(occ_file) as raw:
             reader = csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8"), delimiter="\t")
             for row in reader:
                 gid = row.get("gbifID", "").strip()
                 urls = media_map.get(gid, [])
                 if not urls:
-                    skipped += 1
-                    continue  # no image — skip
+                    no_media += 1
+                    continue
 
                 # Taxon filter
                 if family and row.get("family", "").lower() != family.lower():
+                    no_family += 1
                     continue
                 if genus and row.get("genus", "").lower() != genus.lower():
+                    no_genus += 1
                     continue
 
                 # Basis of record filter
-                if row.get("basisOfRecord") != "PRESERVED_SPECIMEN":
+                if basis_filter and row.get("basisOfRecord", "").upper() != basis_filter.upper():
+                    no_basis += 1
                     continue
 
                 # Geography filters
                 cc = (row.get("countryCode") or "").upper()
                 if continent and row.get("continent", "").upper().replace(" ", "_") != continent.upper():
+                    no_geo += 1
                     continue
                 if include_set is not None and cc not in include_set:
+                    no_geo += 1
                     continue
                 if exclude_set is not None and cc in exclude_set:
+                    no_geo += 1
                     continue
 
                 records.append({
@@ -250,8 +262,13 @@ def load_dwca(
                     "media": [{"type": "StillImage", "identifier": u} for u in urls],
                 })
 
-    print(f"  Loaded {len(records):,} records with images "
-          f"({skipped:,} skipped — no media).")
+        basis_label = f"not {basis_filter}" if basis_filter else "not PRESERVED_SPECIMEN (disabled)"
+        print(f"  {len(records):,} kept — "
+              f"no media: {no_media:,}, "
+              f"wrong family: {no_family:,}, "
+              f"wrong genus: {no_genus:,}, "
+              f"{basis_label}: {no_basis:,}, "
+              f"wrong geography: {no_geo:,}")
     return records
 
 
@@ -363,12 +380,23 @@ def _iiif_upgrade(url: str, iiif_size: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _fetch_bytes(url: str, retries: int = 3) -> bytes | None:
-    """Fetch URL, retrying on transient errors. Returns None on any failure."""
+    """Fetch URL, retrying on transient errors and truncation. Returns None on any failure."""
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
             with urllib.request.urlopen(req, timeout=30) as resp:
-                return resp.read()
+                data = resp.read()
+            # Check for truncated response — some servers silently cut off
+            content_length = resp.headers.get("Content-Length")
+            if content_length is not None:
+                expected = int(content_length)
+                actual = len(data)
+                if actual < expected:
+                    if attempt < retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    return None
+            return data
         except urllib.error.HTTPError as exc:
             if exc.code in (400, 403, 404, 410, 501):
                 return None  # permanent — don't retry
@@ -376,7 +404,7 @@ def _fetch_bytes(url: str, retries: int = 3) -> bytes | None:
                 time.sleep(2 ** attempt)
             else:
                 return None
-        except (urllib.error.URLError, OSError):
+        except (urllib.error.URLError, OSError, http.client.IncompleteRead):
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
             else:
@@ -405,7 +433,7 @@ def download_image(img_url: str, dest: Path, max_size: int | None = None,
             break
 
     if data is None:
-        print(f"  FAILED {dest.name}")
+        (tqdm.write if tqdm else print)(f"  FAILED {dest.name}")
         return False
 
     try:
@@ -417,11 +445,17 @@ def download_image(img_url: str, dest: Path, max_size: int | None = None,
             img.save(dest, format="JPEG", quality=90)
         else:
             dest.write_bytes(data)
+            # Validate the image can be decoded even when not resizing
+            from PIL import Image
+            Image.open(dest).verify()
         if iiif_size and used_url != img_url:
-            print(f"  [IIIF↑] {dest.name}")
+            (tqdm.write if tqdm else print)(f"  [IIIF↑] {dest.name}")
         return True
     except Exception as exc:
-        print(f"  FAILED {dest.name}: {exc}")
+        # Remove any partial/truncated file
+        if dest.exists():
+            dest.unlink()
+        (tqdm.write if tqdm else print)(f"  FAILED {dest.name}: {exc}")
         return False
 
 
@@ -485,6 +519,29 @@ def load_specsin(path: Path) -> dict[str, dict]:
         return {row["catalogNumber"]: row for row in reader}
 
 
+def specsin_to_records(path: Path) -> list[dict]:
+    """Load a specsin CSV and convert rows to GBIF-like record dicts for downloading."""
+    records: list[dict] = []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            url = (row.get("image_url") or "").strip()
+            records.append({
+                "key":             (row.get("gbifID") or "").strip(),
+                "catalogNumber":   (row.get("catalogNumber") or "").strip(),
+                "species":         (row.get("species") or "").strip(),
+                "genus":           (row.get("genus") or "").strip(),
+                "family":          (row.get("family") or "").strip(),
+                "countryCode":     (row.get("countryCode") or "").strip(),
+                "decimalLatitude":  (row.get("decimalLatitude") or "").strip(),
+                "decimalLongitude": (row.get("decimalLongitude") or "").strip(),
+                "coordinateUncertaintyInMeters": (row.get("coordinateUncertaintyInMeters") or "").strip(),
+                "publishingOrgKey": (row.get("institutionID") or "").strip(),
+                "institutionCode":  (row.get("institutionCode") or "").strip(),
+                "media": [{"type": "StillImage", "identifier": url}] if url else [],
+            })
+    return records
+
+
 def save_specsin(path: Path, rows: dict[str, dict]) -> None:
     """Compute sparse flag and write specsin CSV."""
     # sparse: species with fewer than 5 images on disk
@@ -528,6 +585,9 @@ def main() -> None:
 
     parser.add_argument("--continent", metavar="CONTINENT", default=None,
                         help=f"GBIF continent code: {', '.join(sorted(VALID_CONTINENTS))}")
+    parser.add_argument("--basis-of-record", metavar="BASIS", default="PRESERVED_SPECIMEN",
+                        help="Basis of record filter for DwC-A (default: PRESERVED_SPECIMEN). "
+                             "Use 'any' to skip this filter.")
 
     country_group = parser.add_mutually_exclusive_group()
     country_group.add_argument("--countries", nargs="+", metavar="CC",
@@ -554,16 +614,34 @@ def main() -> None:
     parser.add_argument("--max-per-species", type=int, default=0, metavar="N",
                         help="Randomly subsample to at most N records per species before "
                              "downloading (0 = no cap).  Applied after --limit.")
+    parser.add_argument("--max-per-genus", type=int, default=0, metavar="N",
+                        help="Randomly subsample to at most N records per genus "
+                             "(0 = no cap).  Applied after --max-per-species.")
+    parser.add_argument("--max-per-family", type=int, default=0, metavar="N",
+                        help="Randomly subsample to at most N records per family, "
+                             "ensuring at least 1 record per genus when possible "
+                             "(0 = no cap).  Applied after --max-per-genus.")
+    parser.add_argument("--from-specsin", type=Path, default=None, metavar="CSV",
+                        help="Download images for records listed in an existing specsin CSV "
+                             "instead of querying GBIF or parsing a DwC-A.  The specsin "
+                             "provides image URLs and metadata; --limit and per-taxon caps "
+                             "may still be applied.")
+    parser.add_argument("--specsin-only", action="store_true",
+                        help="Parse, filter, and sample records, then write the specsin CSV "
+                             "and exit WITHOUT downloading any images.")
 
     args = parser.parse_args()
 
-    if not args.dwca and not args.family and not args.genus:
-        parser.error("Provide --family or --genus (for API search), or --dwca (for local ZIP).")
+    if not args.dwca and not args.family and not args.genus and not args.from_specsin:
+        parser.error("Provide --from-specsin, --family, --genus, or --dwca.")
 
     if args.continent and args.continent.upper() not in VALID_CONTINENTS:
         parser.error(f"Unknown continent '{args.continent}'. Valid: {', '.join(sorted(VALID_CONTINENTS))}")
 
-    taxon     = args.family or args.genus or args.dwca.stem
+    if args.from_specsin:
+        taxon     = args.from_specsin.stem
+    else:
+        taxon     = args.family or args.genus or (args.dwca.stem if args.dwca else "download")
     taxon_key = safe_name(taxon)
     out_dir   = args.output_dir or Path(f"{taxon_key}_images")
     specsin_path = args.specsin or Path(f"{taxon_key}_specsin.csv")
@@ -573,27 +651,40 @@ def main() -> None:
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load existing specsin (for species verification)
+    # Load existing specsin (for species verification / merging)
     existing = load_specsin(specsin_path)
     print(f"Loaded {len(existing)} existing records from {specsin_path}")
 
-    # Get records — from local DwC-A ZIP or live GBIF API
+    # Get records — from specsin CSV, local DwC-A ZIP, or live GBIF API
+    basis_of_record = args.basis_of_record.strip()
+    if basis_of_record.lower() == "any":
+        basis_of_record = None
     kw = dict(
         family=args.family,
         genus=args.genus,
         continent=args.continent.upper() if args.continent else None,
         countries=[c.upper() for c in args.countries] if args.countries else None,
         exclude_countries=[c.upper() for c in args.exclude_countries] if args.exclude_countries else None,
+        basis_of_record=basis_of_record,
     )
-    if args.dwca:
+    if args.from_specsin:
+        if not args.from_specsin.exists():
+            raise FileNotFoundError(f"Specsin not found: {args.from_specsin}")
+        records = specsin_to_records(args.from_specsin)
+        print(f"Loaded {len(records)} records from specsin: {args.from_specsin}")
+    elif args.dwca:
         records = load_dwca(args.dwca, **kw)
-    else:
+    elif args.family or args.genus:
         records = search_occurrences(**kw)
+    else:
+        parser.error("Provide --from-specsin, --dwca, --family, or --genus to specify "
+                      "which records to download.")
+
     if args.limit:
         records = records[: args.limit]
 
+    # --- per-taxon caps (applied in order: species → genus → family) ---
     if args.max_per_species and args.max_per_species > 0:
-        import random as _random
         by_species: dict[str, list] = {}
         for r in records:
             sp = (r.get("species") or r.get("genus") or "unknown").strip()
@@ -601,12 +692,77 @@ def main() -> None:
         records = []
         for sp, recs in by_species.items():
             if len(recs) > args.max_per_species:
-                recs = _random.sample(recs, args.max_per_species)
+                recs = random.sample(recs, args.max_per_species)
             records.extend(recs)
         print(f"After per-species cap ({args.max_per_species}): {len(records)} records "
               f"across {len(by_species)} species/taxa")
 
+    if args.max_per_genus and args.max_per_genus > 0:
+        by_genus: dict[str, list] = {}
+        for r in records:
+            g = (r.get("genus") or "unknown").strip()
+            by_genus.setdefault(g, []).append(r)
+        records = []
+        for g, recs in by_genus.items():
+            if len(recs) > args.max_per_genus:
+                recs = random.sample(recs, args.max_per_genus)
+            records.extend(recs)
+        print(f"After per-genus cap ({args.max_per_genus}): {len(records)} records "
+              f"across {len(by_genus)} genera")
+
+    if args.max_per_family and args.max_per_family > 0:
+        by_family: dict[str, list] = {}
+        for r in records:
+            f = (r.get("family") or "unknown").strip()
+            by_family.setdefault(f, []).append(r)
+        records = []
+        for fam, frecs in by_family.items():
+            if len(frecs) <= args.max_per_family:
+                records.extend(frecs)
+            else:
+                # Stratified: at least 1 per genus, remainder filled randomly
+                by_gen: dict[str, list] = {}
+                for r in frecs:
+                    g = (r.get("genus") or "unknown").strip()
+                    by_gen.setdefault(g, []).append(r)
+
+                cap = args.max_per_family
+                selected: list[dict] = []
+                selected_keys: set[str] = set()
+
+                # Floor: 1 per genus (random pick within each)
+                for g, grecs in by_gen.items():
+                    if len(selected) < cap:
+                        pick = random.sample(grecs, 1)[0]
+                        selected.append(pick)
+                        selected_keys.add(pick.get("key", ""))
+
+                # Fill remainder randomly from the pool
+                if len(selected) < cap:
+                    pool = [r for r in frecs if r.get("key", "") not in selected_keys]
+                    needed = cap - len(selected)
+                    if pool:
+                        extra = random.sample(pool, min(needed, len(pool)))
+                        selected.extend(extra)
+
+                records.extend(selected)
+        print(f"After per-family cap ({args.max_per_family}): {len(records)} records "
+              f"across {len(by_family)} families")
+
     total = len(records)
+    print(f"\n{total} records after all filters/caps.")
+
+    if args.specsin_only:
+        # Convert records to specsin rows and write CSV — no downloads.
+        rows: dict[str, dict] = {}
+        for r in records:
+            url = get_image_urls(r)
+            row = record_to_row(r, "", False, image_url=url[0] if url else "")
+            rows[row["catalogNumber"]] = row
+        save_specsin(specsin_path, rows)
+        print(f"Specsin-only mode: {len(rows)} rows written, no images downloaded.")
+        return
+
     print(f"\nProcessing {total} records with {args.workers} workers...")
     print(f"Output directory: {out_dir}\n")
 
