@@ -3606,6 +3606,37 @@ def _build_pod_strip() -> None:
             .props("dense outlined dark options-dense")\
             .classes("w-44").bind_value(gs, "cloud_purpose")
 
+        # Effective-GPU readout: shows what provision would actually request.
+        # If a Cloud Tools override is set, surface it here (instead of letting
+        # it be invisible) so the user can see the surprising value before
+        # committing to a pod, and clear it inline.
+        from cloud.orchestrator import GPU_BY_PURPOSE as _GPU_BY_PURPOSE
+        def _gpu_label_text() -> str:
+            override = (gs.get("cloud_gpu_override") or "").strip()
+            if override:
+                return f"GPU: {override} (override)"
+            purp = gs.get("cloud_purpose") or "light"
+            return f"GPU: {_GPU_BY_PURPOSE.get(purp, '?')} (auto)"
+        gpu_lbl = ui.label(_gpu_label_text())\
+            .classes("text-caption font-mono")\
+            .style("color:#b2dfdb;border-left:2px solid #4db6ac;padding-left:6px")
+        def _refresh_gpu_lbl() -> None:
+            gpu_lbl.set_text(_gpu_label_text())
+        # Re-render on either control change. NiceGUI propagates gs changes
+        # via bind, but the label needs a tick to recompute.
+        ui.timer(1.0, _refresh_gpu_lbl)
+
+        def _clear_gpu_override() -> None:
+            gs["cloud_gpu_override"] = ""
+            _refresh_gpu_lbl()
+            ui.notify("GPU override cleared — purpose default will be used.",
+                      type="info")
+        ui.button(icon="close",
+                  on_click=_clear_gpu_override)\
+            .props("dense flat round color=teal-2 size=sm")\
+            .tooltip("Clear the Cloud Tools GPU override so this provision "
+                     "uses the purpose default.")
+
         ui.button("Provision", icon="cloud_upload",
                   on_click=lambda: _wrap_cloud(_do_provision))\
             .props("dense color=teal-3 unelevated")\
