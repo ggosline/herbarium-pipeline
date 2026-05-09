@@ -798,11 +798,17 @@ def main() -> None:
         futures = {pool.submit(process_record, r, out_dir, max_size, iiif_size): r for r in records}
 
         if tqdm is not None:
+            # mininterval/miniters throttle the refresh rate. Without these,
+            # tqdm emits a refresh for every postfix update / write, which
+            # the webui's SSH-stream reader splits on \r and renders as N
+            # separate lines all showing the same count before the next jump.
             completed = tqdm(
                 as_completed(futures), total=total,
                 desc="Downloading", unit="img",
                 dynamic_ncols=True,
                 postfix={"new": 0, "fail": 0, "sp_upd": 0},
+                mininterval=5.0,
+                miniters=50,
             )
         else:
             completed = as_completed(futures)
