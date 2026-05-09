@@ -520,7 +520,13 @@ def load_specsin(path: Path) -> dict[str, dict]:
 
 
 def specsin_to_records(path: Path) -> list[dict]:
-    """Load a specsin CSV and convert rows to GBIF-like record dicts for downloading."""
+    """Load a specsin CSV and convert rows to GBIF-like record dicts for downloading.
+
+    Each record carries a ``_hasfile_prev`` flag echoing the input row's
+    ``hasfile`` column ("True" / "False" / ""). main() uses this to skip
+    rows that previously failed when ``--skip-failed`` is set, since
+    re-attempting them on every run is the dominant cost on big specsins.
+    """
     records: list[dict] = []
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
@@ -538,6 +544,7 @@ def specsin_to_records(path: Path) -> list[dict]:
                 "publishingOrgKey": (row.get("institutionID") or "").strip(),
                 "institutionCode":  (row.get("institutionCode") or "").strip(),
                 "media": [{"type": "StillImage", "identifier": url}] if url else [],
+                "_hasfile_prev":   (row.get("hasfile") or "").strip().lower(),
             })
     return records
 
@@ -629,6 +636,12 @@ def main() -> None:
     parser.add_argument("--specsin-only", action="store_true",
                         help="Parse, filter, and sample records, then write the specsin CSV "
                              "and exit WITHOUT downloading any images.")
+    parser.add_argument("--skip-failed", action="store_true",
+                        help="When loading from --from-specsin, skip records whose "
+                             "input row already has hasfile=False (i.e. failed in a "
+                             "previous run). Big speed-up for re-runs since failed "
+                             "URLs cost up to ~90s each to retry. Omit (default) "
+                             "to retry every failed row.")
 
     args = parser.parse_args()
 
@@ -672,6 +685,16 @@ def main() -> None:
             raise FileNotFoundError(f"Specsin not found: {args.from_specsin}")
         records = specsin_to_records(args.from_specsin)
         print(f"Loaded {len(records)} records from specsin: {args.from_specsin}")
+        if args.skip_failed:
+            before = len(records)
+            records = [r for r in records if r.pop("_hasfile_prev", "") != "false"]
+            skipped = before - len(records)
+            print(f"--skip-failed: dropped {skipped:,} records previously marked "
+                  f"hasfile=False ({len(records):,} remain). Use --retry-failed "
+                  f"or omit --skip-failed to retry them.")
+        else:
+            for r in records:
+                r.pop("_hasfile_prev", None)
     elif args.dwca:
         records = load_dwca(args.dwca, **kw)
     elif args.family or args.genus:

@@ -716,6 +716,7 @@ download() {
   if [ -n "${MAX_PER_GENUS:-}" ];  then EXTRA+=(--max-per-genus "$MAX_PER_GENUS"); fi
   if [ -n "${MAX_PER_FAMILY:-}" ]; then EXTRA+=(--max-per-family "$MAX_PER_FAMILY"); fi
   if [ "${SPECSIN_ONLY:-}" = "True" ]; then EXTRA+=(--specsin-only); fi
+  if [ "${SKIP_FAILED:-0}" = "1" ];   then EXTRA+=(--skip-failed); fi
   if [ -n "${FROM_SPECSIN:-}" ] && [ -f "$FROM_SPECSIN" ]; then
     echo "Using specsin CSV: $FROM_SPECSIN (iiif-size=$IIIF${MAX_SIZE:+ max-size=$MAX_SIZE}${LIMIT:+ limit=$LIMIT}${MAX_PER_SP:+ max-per-sp=$MAX_PER_SP}${MAX_PER_GENUS:+ max-per-genus=$MAX_PER_GENUS}${MAX_PER_FAMILY:+ max-per-family=$MAX_PER_FAMILY})"
     python -u "$REPO/download_gbif_images.py" \

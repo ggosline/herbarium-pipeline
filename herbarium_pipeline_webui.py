@@ -3090,6 +3090,7 @@ def _cloud_env_download() -> dict[str, str]:
         "FROM_SPECSIN":   "cloud_from_specsin",
         "SPECSIN_ONLY":   ("cloud_specsin_only", "dl_specsin_only"),
         "WORKERS":        ("cloud_workers",      "dl_workers"),
+        "SKIP_FAILED":    ("cloud_skip_failed",  "dl_skip_failed"),
     })
 
 
@@ -3823,6 +3824,12 @@ def _build_cloud_tools() -> None:
         with ui.row().classes("items-center gap-3 mt-1"):
             ui.checkbox("Specsin only (no download)", value=False)\
               .bind_value(gs, "cloud_specsin_only")
+            ui.checkbox("Skip previously-failed", value=False)\
+              .bind_value(gs, "cloud_skip_failed")\
+              .tooltip("On a re-run, drop rows whose hasfile column is False "
+                       "(i.e. previously failed). Each failed URL otherwise "
+                       "costs up to ~90s to re-attempt. Leave off to retry "
+                       "every failed row (transient failures get a chance).")
         ui.label(
             "Many institutions ignore IIIF size and serve full scans; the "
             "Resize-after-download value shrinks each fetched image with PIL "
