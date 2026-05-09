@@ -228,19 +228,24 @@ class CloudOrchestrator:
 
     async def _ensure_volume(
         self, *, size_gb: int, data_center_id: str, on_log: LogFn,
-    ) -> str:
-        """Return the project's network volume id, creating one if absent.
+    ) -> tuple[str, str]:
+        """Return ``(volume_id, data_center_id)`` for the project's network
+        volume, creating one if absent.
 
-        Validates a saved volume against the RunPod API before reusing it,
-        so a stale state file doesn't try to attach a volume that's been
-        deleted (or one in the wrong datacenter for this provision).
+        Returns the *actual* DC of the volume — which may differ from the
+        requested one when a saved volume exists in another region. Network
+        volumes can't move between DCs; rather than silently delete the
+        volume to honour a DC change, we honour the saved volume's DC and
+        warn. To switch regions, the user must delete the saved volume
+        explicitly.
         """
         if self._state.volume_id:
             try:
                 vols = await self._rp().list_volumes()
             except Exception as e:
                 on_log(f"  ⚠ couldn't list volumes ({e}) — trusting saved id")
-                return self._state.volume_id
+                return self._state.volume_id, (self._state.data_center_id
+                                                or data_center_id)
             match = next((v for v in vols if v.id == self._state.volume_id), None)
             if match is None:
                 on_log(f"  ⚠ saved volume {self._state.volume_id} not found "
@@ -248,13 +253,16 @@ class CloudOrchestrator:
                 self._state.volume_id = None
                 self._state.data_center_id = None
             elif match.data_center_id != data_center_id:
-                on_log(f"  ⚠ saved volume is in {match.data_center_id} but "
-                       f"provision wants {data_center_id} — clearing and "
-                       f"creating fresh in {data_center_id}")
-                self._state.volume_id = None
-                self._state.data_center_id = None
+                on_log(f"  ⚠ saved volume {match.id} is in "
+                       f"{match.data_center_id}; provision asked for "
+                       f"{data_center_id}. Honouring the volume's DC to keep "
+                       f"data — pod will be placed in {match.data_center_id}. "
+                       f"Delete the volume manually to switch regions.")
+                self._state.data_center_id = match.data_center_id
+                self._save_state()
+                return match.id, match.data_center_id
             else:
-                return self._state.volume_id
+                return self._state.volume_id, match.data_center_id
         on_log(f"Creating network volume ({size_gb} GB, {data_center_id})...")
         vol = await self._rp().create_volume(
             name=f"herb-{self._project}",
@@ -265,7 +273,7 @@ class CloudOrchestrator:
         self._state.volume_id = vol.id
         self._state.data_center_id = vol.data_center_id
         self._save_state()
-        return vol.id
+        return vol.id, vol.data_center_id
 
     async def _ensure_session(
         self, handle: PodHandle, *, on_log: LogFn,
@@ -359,7 +367,10 @@ class CloudOrchestrator:
         if not gpu:
             raise ValueError(f"unknown purpose {purpose!r}; pass gpu_type explicitly")
         dc = data_center_id or self._state.data_center_id or DEFAULT_DATACENTER
-        volume_id = await self._ensure_volume(
+        # _ensure_volume may override `dc` if a saved volume lives in a
+        # different region (network volumes can't move; the volume's DC
+        # wins so we don't silently destroy data on a GPU-only override).
+        volume_id, dc = await self._ensure_volume(
             size_gb=volume_gb, data_center_id=dc, on_log=on_log,
         )
 
