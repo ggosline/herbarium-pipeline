@@ -1695,7 +1695,8 @@ def _build_review() -> tuple:
         filter_sel = ui.select(
             {"all": "All", "indets": "Indets only",
              "flagged": "Flagged only", "misid": "Misidentified (pred ≠ true)",
-             "high_conf": "High confidence (≥ 90%)"},
+             "high_conf": "High confidence (≥ 90%)",
+             "sparse": "Sparse only (true species below threshold)"},
             value="all", label="Show"
         ).classes("w-52").props("dense outlined")
         sort_sel = ui.select(
@@ -1922,6 +1923,12 @@ def _build_review() -> tuple:
                     mask = _pd.Series(False, index=df.index)
         elif filt == "high_conf":
             mask = df[conf_col].astype(float) >= 0.90
+        elif filt == "sparse":
+            if "sparse" in df.columns:
+                mask = df["sparse"].astype(str).str.lower().isin(("true", "1"))
+            else:
+                # Pre-sparse-column predictions.csv — fall through to "no rows".
+                mask = _pd.Series(False, index=df.index)
         else:
             mask = _pd.Series(True, index=df.index)
 
