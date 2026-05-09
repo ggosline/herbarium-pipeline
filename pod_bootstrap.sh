@@ -459,10 +459,10 @@ setup() {
   local site_packages="$UV_PROJECT_ENVIRONMENT/lib/python"*"/site-packages"
   find "$site_packages" -type f -path '*/bin/*' -exec chmod +x {} + 2>/dev/null || true
 
-  # 6f. Mirror the venv to local NVMe so subsequent python invocations don't
-  # walk MooseFS for every imported .py / .so. Cuts cold-import from
-  # ~30–60 s to ~5–8 s on torch/lightning/DALI.
-  mirror_venv_local || echo "⚠ venv mirror skipped — imports will be slower."
+  # 6f. Venv mirror moved to train() / identify() — those are the only steps
+  # whose cold-import cost (torch, lightning, DALI ~30–60 s on MooseFS)
+  # outweighs the 5+ min mirror itself. download / prep have minimal
+  # imports and don't benefit, so we skip the mirror at setup time.
 
   # 7. wandb login. Independent of which path built the venv — the binary
   #    lives at $UV_PROJECT_ENVIRONMENT/bin/wandb either way.
@@ -708,6 +708,10 @@ download() {
   #   MAX_PER_GENUS=50  MAX_PER_FAMILY=750  FROM_SPECSIN=/workspace/data/my.csv  \
   #   bash pod_bootstrap.sh download
   IIIF="${IIIF:-1200}"
+  # Default MAX_SIZE to 1200: training is 640px, so a 1200-px longest-side
+  # JPEG keeps headroom for review/inspection without ballooning disk.
+  # Without a default, full archival scans (5–15 MB each) accumulate.
+  MAX_SIZE="${MAX_SIZE:-1200}"
   WORKERS="${WORKERS:-16}"
   EXTRA=()
   if [ -n "${MAX_SIZE:-}" ];       then EXTRA+=(--max-size "$MAX_SIZE"); fi
@@ -769,8 +773,22 @@ prep() {
     --batch-size 32 --workers 8 \
     "${FILTER_EXTRA[@]}"
 
-  # Resize is skipped — download already resizes via MAX_SIZE.
-  # Run resize_images.py manually if you need a different output size.
+  # Resize anything still over RESIZE_MAX (default 1200). Idempotent —
+  # resize_images.py with --no-upscale skips files already within bounds.
+  # Catches images downloaded before MAX_SIZE was defaulted, and any that
+  # were filtered/cropped into a larger frame. Single-dir layout uses
+  # --in-place since IMG_FILT and IMG_1024 are the same dir.
+  RESIZE_MAX="${RESIZE_MAX:-1200}"
+  RESIZE_OUT=(--in-place)
+  if [ "$IMG_FILT" != "$IMG_1024" ]; then
+    RESIZE_OUT=(--output-dir "$IMG_1024")
+  fi
+  python -u "$REPO/resize_images.py" \
+    --input-dir "$IMG_FILT" \
+    "${RESIZE_OUT[@]}" \
+    --max-size "$RESIZE_MAX" \
+    --no-upscale \
+    --workers 8
 
   # Reconcile hasfile against what actually landed on disk.
   python -u "$REPO/verify_specsin.py" \
@@ -830,6 +848,10 @@ stage_images() {
 # pinned recipe in project_training_recipe.md.  Pass via the orchestrator's
 # `env=` dict from the Cloud tab, or export them before calling this script.
 train() {
+  # Mirror venv to local NVMe — torch/DALI/lightning cold imports dominate
+  # the first ~minute on MooseFS otherwise. Idempotent: re-mirroring after
+  # the first run is a sub-second cache_key check.
+  mirror_venv_local || echo "⚠ venv mirror skipped — imports will be slower."
   activate
   cd "$REPO"
 
@@ -917,6 +939,9 @@ train() {
 
 # ─── step 4: identify ─────────────────────────────────────────────────────
 identify() {
+  # Same rationale as train(): only steps importing torch/timm benefit
+  # from the venv mirror. Cached after first run.
+  mirror_venv_local || echo "⚠ venv mirror skipped — imports will be slower."
   activate
   # Pick the most recent .ckpt unless caller passed CKPT_FILE explicitly.
   : "${CKPT_FILE:=$(ls -t "$CKPT"/*.ckpt | head -1)}"
