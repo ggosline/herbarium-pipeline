@@ -1018,7 +1018,13 @@ backup() {
     echo "  uploading $(du -h "$IMG_TAR" | cut -f1)"
     rclone copy "$IMG_TAR" "$REMOTE/" \
       --progress --transfers 4 --s3-chunk-size 64M
-    rm -f "$IMG_TAR"
+    # Leave the tar in place — symmetric with download_images, so a
+    # follow-up download_results doesn't have to re-tar (~5–15 min on
+    # MooseFS). Disk gets reclaimed when the pod terminates anyway.
+    # Set BACKUP_REMOVE_TAR=1 to delete it explicitly if disk is tight.
+    if [ "${BACKUP_REMOVE_TAR:-0}" = "1" ]; then
+      rm -f "$IMG_TAR"
+    fi
   fi
 
   echo "✓ Backup complete: $REMOTE"
