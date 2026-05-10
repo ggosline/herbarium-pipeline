@@ -3037,10 +3037,20 @@ def _wrap_cloud_aux(coro_factory):
 
 
 def _cancel_cloud() -> None:
-    t = _cloud["task"]
-    if t is not None and not t.done():
-        t.cancel()
-        ui.notify("Cancellation requested.", type="info")
+    """Cancel any in-flight cloud work — both the main step task and the
+    aux transfer task (download_results / download_images / uploads).
+    Earlier this only cancelled the main task, leaving aux transfers
+    uncancellable from the UI."""
+    cancelled = []
+    for slot in ("task", "aux_task"):
+        t = _cloud.get(slot)
+        if t is not None and not t.done():
+            t.cancel()
+            cancelled.append(slot)
+    if cancelled:
+        ui.notify(f"Cancellation requested ({', '.join(cancelled)}).", type="info")
+    else:
+        ui.notify("Nothing to cancel.", type="warning")
 
 
 # ── per-step env builders (read from gs[...] — same keys the local tabs bind) ──
