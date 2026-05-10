@@ -784,12 +784,24 @@ class CloudOrchestrator:
 
         remote_dir = f"{REMOTE_DATA}/{chosen}"
         remote_tar = f"{REMOTE_DATA}/{chosen}.tar"
-        on_log(f"Bundling {remote_dir} into tar...")
-        rc, out = await session.exec_capture(
-            f"tar cf {remote_tar} -C {REMOTE_DATA} {chosen}"
+        # Reuse an existing tar (left by a prior download_images / backup)
+        # if no file in the source dir is newer than the tar — saves
+        # ~5–15 min of re-taring on MooseFS for the common case where
+        # the user pulls images, runs backup, pulls again.
+        rc_chk, out_chk = await session.exec_capture(
+            f"[ -f {remote_tar} ] && "
+            f"[ -z \"$(find {remote_dir} -newer {remote_tar} -print -quit 2>/dev/null)\" ] "
+            f"&& echo reuse || echo rebuild"
         )
-        if rc != 0:
-            raise RuntimeError(f"remote tar failed (rc={rc}): {out.strip()}")
+        if "reuse" in out_chk:
+            on_log(f"Reusing existing {remote_tar.rsplit('/', 1)[-1]}")
+        else:
+            on_log(f"Bundling {remote_dir} into tar...")
+            rc, out = await session.exec_capture(
+                f"tar cf {remote_tar} -C {REMOTE_DATA} {chosen}"
+            )
+            if rc != 0:
+                raise RuntimeError(f"remote tar failed (rc={rc}): {out.strip()}")
 
         local_tar = local_dir / f"{chosen}.tar"
         on_log(f"Downloading {local_tar.name}...")
