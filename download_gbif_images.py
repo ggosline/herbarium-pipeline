@@ -421,6 +421,14 @@ def download_image(img_url: str, dest: Path, max_size: int | None = None,
     """
     if dest.exists():
         return True
+    # If a previous filter run classified this image as non-herbarium and
+    # moved it to live/ or rejected/, treat it as already-handled — don't
+    # re-download. Otherwise the re-download recreates the file at root,
+    # verify_specsin --restore flips hasfile back to True, and the
+    # rejected image leaks into identify / Review.
+    for sub in ("live", "rejected"):
+        if (dest.parent / sub / dest.name).is_file():
+            return True
 
     candidates = (_iiif_upgrade(img_url, iiif_size) if iiif_size else []) + [img_url]
 

@@ -38,7 +38,34 @@ def reconcile(specsin: Path, image_dir: Path, restore: bool = False,
         n_rebuilt = int(old_null.sum())
         print(f"  Rebuilt {n_rebuilt} empty fname(s) from metadata")
 
-    exists = df["fname"].apply(lambda f: (image_dir / str(f)).is_file())
+    # A file is "present" only if it sits at the canonical root path AND
+    # isn't ALSO in a classification subdir (live/, rejected/) — those
+    # subdirs hold filter results, and a duplicate at root means a
+    # re-download recreated a previously-rejected file. Resolve in
+    # favour of the classification: delete the stale root copy and
+    # treat the row as not present so hasfile stays False.
+    classified_subdirs = (image_dir / "live", image_dir / "rejected")
+    n_dedup = 0
+
+    def _present(fname: str) -> bool:
+        nonlocal n_dedup
+        f = image_dir / str(fname)
+        if not f.is_file():
+            return False
+        for sub in classified_subdirs:
+            if (sub / str(fname)).is_file():
+                # Stale duplicate at root — classification wins.
+                try:
+                    f.unlink()
+                    n_dedup += 1
+                except OSError:
+                    pass
+                return False
+        return True
+
+    exists = df["fname"].apply(_present)
+    if n_dedup:
+        print(f"  Removed {n_dedup} stale root duplicate(s) of classified images")
     had = df["hasfile"].astype(str).str.lower().isin(("true", "1"))
 
     # Rows claiming hasfile=True but file is gone → set False.
