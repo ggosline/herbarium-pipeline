@@ -71,6 +71,12 @@ class PodSession:
         self.connect_timeout = connect_timeout
         self._client: paramiko.SSHClient | None = None
         self._sftp: paramiko.SFTPClient | None = None
+        # paramiko's SFTPClient is NOT thread-safe — concurrent put/get
+        # from different asyncio tasks (e.g. sync_code racing with an
+        # aux-slot download_images) corrupt the SSH transport state and
+        # raise "Garbage packet received". Serialize SFTP work behind a
+        # lock so the channel stays coherent.
+        self._sftp_lock: asyncio.Lock | None = None
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -275,6 +281,24 @@ class PodSession:
             self._sftp = await asyncio.to_thread(client.open_sftp)
         return self._sftp
 
+    def _sftp_guard(self) -> asyncio.Lock:
+        """Lazy-init the lock on first use (so PodSession can be created
+        outside an event-loop context, then used from inside one)."""
+        if self._sftp_lock is None:
+            self._sftp_lock = asyncio.Lock()
+        return self._sftp_lock
+
+    async def _reset_sftp(self) -> None:
+        """Close and forget the cached SFTPClient — called when an
+        operation raises so the next caller opens a fresh channel
+        instead of inheriting a broken one."""
+        if self._sftp is not None:
+            try:
+                await asyncio.to_thread(self._sftp.close)
+            except Exception:
+                pass
+            self._sftp = None
+
     async def sftp_put(
         self,
         local: str | Path,
@@ -290,39 +314,44 @@ class PodSession:
         making paramiko raise a spurious "size mismatch" OSError. Polling
         ``stat`` for up to ~3 seconds covers the race.
         """
-        sftp = await self._open_sftp()
         local_path = Path(local)
         expected = local_path.stat().st_size
-        # Make remote parent dirs (mkdir -p) — paramiko's SFTP doesn't.
-        await self._mkdir_p(remote.rsplit("/", 1)[0])
 
         def _progress_thread_safe(transferred: int, total: int) -> None:
             if on_progress is not None:
                 on_progress(transferred, total)
 
-        await asyncio.to_thread(
-            sftp.put, str(local_path), remote,
-            _progress_thread_safe if on_progress else None,
-            confirm=False,
-        )
-
-        # Verify ourselves with retry. expected==0 needs no verification.
-        if expected == 0:
-            return
-        delay = 0.1
-        for _ in range(6):  # ~0.1+0.2+0.4+0.8+1.6+3.2s ≈ 6.3s total worst-case
+        async with self._sftp_guard():
+            sftp = await self._open_sftp()
+            # Make remote parent dirs (mkdir -p) — paramiko's SFTP doesn't.
+            await self._mkdir_p(remote.rsplit("/", 1)[0])
             try:
-                actual = (await asyncio.to_thread(sftp.stat, remote)).st_size
-            except OSError:
-                actual = -1
-            if actual == expected:
+                await asyncio.to_thread(
+                    sftp.put, str(local_path), remote,
+                    _progress_thread_safe if on_progress else None,
+                    confirm=False,
+                )
+            except Exception:
+                await self._reset_sftp()
+                raise
+
+            # Verify ourselves with retry. expected==0 needs no verification.
+            if expected == 0:
                 return
-            await asyncio.sleep(delay)
-            delay *= 2
-        raise OSError(
-            f"sftp_put size mismatch after retries: {actual} != {expected} "
-            f"(remote={remote!r}, local={local_path})"
-        )
+            delay = 0.1
+            for _ in range(6):  # ~0.1+0.2+0.4+0.8+1.6+3.2s ≈ 6.3s total worst-case
+                try:
+                    actual = (await asyncio.to_thread(sftp.stat, remote)).st_size
+                except OSError:
+                    actual = -1
+                if actual == expected:
+                    return
+                await asyncio.sleep(delay)
+                delay *= 2
+            raise OSError(
+                f"sftp_put size mismatch after retries: {actual} != {expected} "
+                f"(remote={remote!r}, local={local_path})"
+            )
 
     async def sftp_put_bytes(
         self,
@@ -337,15 +366,20 @@ class PodSession:
         (wandb / R2 keys). ``mode`` is applied to the remote file with
         ``chmod`` after the write.
         """
-        sftp = await self._open_sftp()
-        await self._mkdir_p(remote.rsplit("/", 1)[0])
+        async with self._sftp_guard():
+            sftp = await self._open_sftp()
+            await self._mkdir_p(remote.rsplit("/", 1)[0])
 
-        def _write() -> None:
-            with sftp.open(remote, "wb") as fh:
-                fh.write(data)
-            sftp.chmod(remote, mode)
+            def _write() -> None:
+                with sftp.open(remote, "wb") as fh:
+                    fh.write(data)
+                sftp.chmod(remote, mode)
 
-        await asyncio.to_thread(_write)
+            try:
+                await asyncio.to_thread(_write)
+            except Exception:
+                await self._reset_sftp()
+                raise
 
     async def sftp_get(
         self,
@@ -360,21 +394,26 @@ class PodSession:
         size+mtime comparisons can correctly detect whether the remote has
         moved on since the last download.
         """
-        sftp = await self._open_sftp()
         local_path = Path(local)
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(
-            sftp.get, remote, str(local_path),
-            on_progress if on_progress else None,
-        )
-        try:
-            st = await asyncio.to_thread(sftp.stat, remote)
-            if st.st_mtime is not None:
-                import os as _os
-                _os.utime(local_path, (float(st.st_atime or st.st_mtime),
-                                       float(st.st_mtime)))
-        except Exception:
-            pass  # mtime preservation is best-effort
+        async with self._sftp_guard():
+            sftp = await self._open_sftp()
+            try:
+                await asyncio.to_thread(
+                    sftp.get, remote, str(local_path),
+                    on_progress if on_progress else None,
+                )
+            except Exception:
+                await self._reset_sftp()
+                raise
+            try:
+                st = await asyncio.to_thread(sftp.stat, remote)
+                if st.st_mtime is not None:
+                    import os as _os
+                    _os.utime(local_path, (float(st.st_atime or st.st_mtime),
+                                           float(st.st_mtime)))
+            except Exception:
+                pass  # mtime preservation is best-effort
 
     async def _mkdir_p(self, remote_dir: str) -> None:
         """Equivalent of ``mkdir -p`` on the remote, via shell."""
@@ -401,9 +440,10 @@ class PodSession:
 
     async def remote_stat(self, path: str) -> tuple[int, float] | None:
         """Return (size_bytes, mtime_unix) for a remote file, or None if absent."""
-        sftp = await self._open_sftp()
-        try:
-            st = await asyncio.to_thread(sftp.stat, path)
-        except (IOError, FileNotFoundError):
-            return None
-        return int(st.st_size), float(st.st_mtime or 0.0)
+        async with self._sftp_guard():
+            sftp = await self._open_sftp()
+            try:
+                st = await asyncio.to_thread(sftp.stat, path)
+            except (IOError, FileNotFoundError):
+                return None
+            return int(st.st_size), float(st.st_mtime or 0.0)
