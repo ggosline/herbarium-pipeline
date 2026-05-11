@@ -1883,7 +1883,7 @@ def _build_review() -> tuple:
                + (f" | 📍 {geo_str}" if geo_str else "")
                + "</small><br>"
                if source or (cat and cat != "nan") or geo_str else "")
-            + f"<small style='color:#aaa;font-family:monospace'>{Path(fname).name}</small>"
+            + f"<span style='color:#bbb;font-family:monospace;font-size:13px'>{Path(fname).name}</span>"
             "</div>"
         )
         bars_html.set_content(_bars_html(row, level=level))
