@@ -20,9 +20,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
+
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
 import tarfile
 from pathlib import Path
 
@@ -38,13 +45,38 @@ def _have_rclone() -> str:
     return exe
 
 
-def _run(cmd: list[str]) -> int:
+def _r2_env() -> dict[str, str]:
+    """Return rclone env vars for the r2 remote read from the OS keyring.
+
+    If no credentials are stored returns an empty dict (rclone will fall back
+    to whatever is in rclone.conf, or fail with its own error message).
+    """
+    try:
+        from cloud.secrets import get_r2_credentials
+        creds = get_r2_credentials()
+    except Exception:
+        return {}
+    if creds is None:
+        return {}
+    return {
+        "RCLONE_CONFIG_R2_TYPE": "s3",
+        "RCLONE_CONFIG_R2_PROVIDER": "Other",
+        "RCLONE_CONFIG_R2_ACCESS_KEY_ID": creds.access_key_id,
+        "RCLONE_CONFIG_R2_SECRET_ACCESS_KEY": creds.secret_access_key,
+        "RCLONE_CONFIG_R2_ENDPOINT": creds.endpoint,
+        "RCLONE_CONFIG_R2_ACL": "private",
+        "RCLONE_CONFIG_R2_NO_CHECK_BUCKET": "true",
+    }
+
+
+def _run(cmd: list[str], extra_env: dict[str, str] | None = None) -> int:
     """Run a command, streaming its output line-by-line to stdout (which the
     webui captures). Returns the process exit code."""
     print(f"$ {' '.join(cmd)}", flush=True)
+    env = {**os.environ, **(extra_env or {})}
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        bufsize=1,
+        bufsize=1, env=env,
     )
     assert proc.stdout is not None
     for line in proc.stdout:
@@ -53,12 +85,14 @@ def _run(cmd: list[str]) -> int:
     return proc.returncode
 
 
-def _rclone_lsf(rclone: str, remote_path: str) -> list[str]:
+def _rclone_lsf(rclone: str, remote_path: str,
+                env: dict[str, str] | None = None) -> list[str]:
     """List files at remote_path (no recursion). Empty list if missing."""
     try:
         out = subprocess.run(
             [rclone, "lsf", remote_path],
             capture_output=True, text=True, check=False,
+            env={**os.environ, **(env or {})},
         )
     except FileNotFoundError:
         return []
@@ -67,31 +101,36 @@ def _rclone_lsf(rclone: str, remote_path: str) -> list[str]:
     return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
 
 
-def _copy(rclone: str, src: str, dst: Path, *extra: str) -> int:
+def _copy(rclone: str, src: str, dst: Path, *extra: str,
+          env: dict[str, str] | None = None) -> int:
     dst.mkdir(parents=True, exist_ok=True)
     return _run([rclone, "copy", src, str(dst), "--progress",
-                 "--transfers", "4", "--s3-chunk-size", "64M", *extra])
+                 "--transfers", "4", "--s3-chunk-size", "64M", *extra],
+                extra_env=env)
 
 
 def restore(project: str, target: Path, remote: str = "r2:herbarium-backup",
             images_dirname: str = "images") -> int:
     rclone = _have_rclone()
+    env = _r2_env()
+    if env:
+        print("  (using R2 credentials from OS keyring)", flush=True)
     base = f"{remote}/{project}"
     print(f"→ Restoring '{project}' from {base} to {target}", flush=True)
     target.mkdir(parents=True, exist_ok=True)
 
     # 1. Checkpoints (+ nameslist.json next to them)
-    rc = _copy(rclone, f"{base}/checkpoints/", target / "checkpoints")
+    rc = _copy(rclone, f"{base}/checkpoints/", target / "checkpoints", env=env)
     if rc != 0:
         print(f"⚠ checkpoint copy returned {rc}", flush=True)
 
     # 2. Per-project state (specsin, dwca) — copied selectively from project root
     _copy(rclone, f"{base}/", target,
-          "--include", "specsin.csv", "--include", "gbif.zip")
+          "--include", "specsin.csv", "--include", "gbif.zip", env=env)
 
     # 3. Predictions (optional)
-    if _rclone_lsf(rclone, f"{base}/predictions/"):
-        _copy(rclone, f"{base}/predictions/", target / "predictions")
+    if _rclone_lsf(rclone, f"{base}/predictions/", env=env):
+        _copy(rclone, f"{base}/predictions/", target / "predictions", env=env)
     else:
         print("  (no predictions/ in archive — skipping)", flush=True)
 
@@ -100,7 +139,7 @@ def restore(project: str, target: Path, remote: str = "r2:herbarium-backup",
     candidates = [f"{images_dirname}.tar", "images_1024.tar"]
     found = None
     for name in candidates:
-        if _rclone_lsf(rclone, f"{base}/{name}"):
+        if _rclone_lsf(rclone, f"{base}/{name}", env=env):
             found = name
             break
     if found is None:
@@ -110,7 +149,8 @@ def restore(project: str, target: Path, remote: str = "r2:herbarium-backup",
         tar_path = target / found
         print(f"→ Pulling {found}…", flush=True)
         rc = _run([rclone, "copy", f"{base}/{found}", str(target),
-                   "--progress", "--transfers", "4", "--s3-chunk-size", "64M"])
+                   "--progress", "--transfers", "4", "--s3-chunk-size", "64M"],
+                  extra_env=env)
         if rc != 0:
             return rc
         # Extract with stdlib tarfile so Windows doesn't need tar.exe.

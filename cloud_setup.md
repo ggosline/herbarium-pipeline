@@ -25,7 +25,14 @@ Total time: **~30 minutes** the first time, **~2 minutes** for every subsequent 
 
 The pipeline talks to your pod over SSH. You need a passwordless key-pair that RunPod knows about.
 
-On Linux/Mac/WSL:
+**Windows (PowerShell):**
+
+```powershell
+ssh-keygen -t ed25519 -f "$env:USERPROFILE\.ssh\id_ed25519_herbarium" -N ""
+Get-Content "$env:USERPROFILE\.ssh\id_ed25519_herbarium.pub"
+```
+
+**Linux / macOS / WSL:**
 
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_herbarium -N ""

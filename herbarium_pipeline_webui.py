@@ -4396,6 +4396,10 @@ def main_page():
                     (ui.button("Quit", icon="power_settings_new", on_click=_quit)
                      .props("flat color=white")
                      .classes("text-white"))
+                    log_vis_btn = (ui.button(icon="terminal",
+                                             on_click=lambda: _toggle_log_panel())
+                                   .props("flat color=white")
+                                   .tooltip("Hide / show output panel"))
 
             # Pod-status strip — visible only in Cloud mode.
             pod_strip_row = ui.column().classes("w-full")
@@ -4546,7 +4550,7 @@ def main_page():
         # ---- Right panel: log (full height, dark terminal) ----
         with ui.column().classes("gap-0 shrink-0").style(
                 "width:42%; height:100%; overflow:hidden;"
-                "background:#1e1e1e; border-left:1px solid #333"):
+                "background:#1e1e1e; border-left:1px solid #333") as log_col:
             with ui.row().classes("items-center justify-between px-3 py-2 shrink-0").style(
                     "background:#2d2d2d; border-bottom:1px solid #444"):
                 ui.label("Output").classes("text-sm font-bold").style("color:#d4d4d4")
@@ -4557,6 +4561,18 @@ def main_page():
                 "flex:1 1 0; min-height:0; width:100%; overflow-y:auto;"
                 "font-family:'Roboto Mono',monospace; font-size:13px;"
                 "background:#1e1e1e; color:#d4d4d4; padding:10px")
+
+    # ---- Output-panel toggle ----
+    _log_panel_vis = [True]
+
+    def _toggle_log_panel():
+        _log_panel_vis[0] = not _log_panel_vis[0]
+        vis = _log_panel_vis[0]
+        log_col.set_visibility(vis)
+        log_vis_btn.props(
+            f"flat {'color=white' if vis else 'color=teal-2'} "
+            f"icon={'terminal' if vis else 'chevron_right'}"
+        )
 
     # ---- Apply-paths logic (closure over all inputs) ----
     def _apply_paths():
