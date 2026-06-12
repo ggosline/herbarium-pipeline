@@ -1,0 +1,11 @@
+# Always check out shell scripts with LF so they run on Linux pods without dos2unix
+*.sh text eol=lf
+
+# Python and other text files: use platform default on checkout, LF in repo
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.csv text eol=lf
+*.txt text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf

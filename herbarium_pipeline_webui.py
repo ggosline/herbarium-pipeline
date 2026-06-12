@@ -531,6 +531,11 @@ def _build_download() -> callable:
                      value="family").props("inline dense")
             .bind_value(gs, "dl_rank"))
     taxon     = _text_row("Taxon name:", "Ebenaceae", "w-48").bind_value(gs, "dl_taxon")
+    families  = (_text_row("Families (multi):", "", "w-full")
+                 .bind_value(gs, "dl_families"))
+    ui.label("Space-separated list for a combined GBIF bulk download (e.g. split clades). "
+             "Overrides Taxon name. Cloud mode only — requires GBIF credentials in Setup tab."
+             ).classes("text-caption text-grey-7 ml-48")
     continent = _text_row("Continent:", "AFRICA", "w-36").bind_value(gs, "dl_continent")
 
     _section("Country filter  (mutually exclusive)")
@@ -596,13 +601,15 @@ def _build_download() -> callable:
               ).props("color=primary unelevated").classes("mt-4")
 
     def _dl_cmd() -> list[str]:
-        d = _v(dwca)
-        t = _v(taxon)
-        if not d and not t:
-            raise ValueError("Enter a taxon name or select a DwC-A ZIP.")
+        d  = _v(dwca)
+        t  = _v(taxon)
+        ff = _v(families).split()
+        if not d and not t and not ff:
+            raise ValueError("Enter a taxon name, a families list, or select a DwC-A ZIP.")
         cmd = [sys.executable, str(SCRIPTS["download"])]
-        if d: cmd += ["--dwca", d]
-        if t: cmd += [f"--{rank.value}", t]
+        if d:  cmd += ["--dwca", d]
+        elif ff: cmd += ["--families"] + ff
+        elif t: cmd += [f"--{rank.value}", t]
         c = _v(continent)
         if c: cmd += ["--continent", c]
         i_  = _v(inc).split()
@@ -3043,6 +3050,9 @@ def _wrap_cloud(coro_factory):
     """
     if _cloud_running():
         ui.notify("A cloud step is already running.", type="warning")
+        _cloud_log("⚠ A cloud step is already in flight — click 'Cancel step' to abort it, "
+                   "then retry. (If the server was not restarted, a browser refresh leaves "
+                   "the old task running in the background.)\n")
         return
     async def _run():
         try:
@@ -3147,16 +3157,20 @@ def _env_from_gs(mapping: dict[str, object], *, drop_zero: bool = True) -> dict[
 
 def _cloud_env_download() -> dict[str, str]:
     return _env_from_gs({
-        "MAX_PER_SP":     ("cloud_max_per_sp",  "dl_max_per_sp"),
-        "MAX_PER_GENUS":  ("cloud_max_per_ge",  "dl_max_per_ge"),
-        "MAX_PER_FAMILY": ("cloud_max_per_fa",  "dl_max_per_fa"),
-        "LIMIT":          ("cloud_limit",       "dl_limit"),
-        "IIIF":           ("cloud_iiif",        "dl_iiif"),
-        "MAX_SIZE":       ("cloud_max_size",    "dl_max_size"),
-        "FROM_SPECSIN":   "cloud_from_specsin",
-        "SPECSIN_ONLY":   ("cloud_specsin_only", "dl_specsin_only"),
-        "WORKERS":        ("cloud_workers",      "dl_workers"),
-        "SKIP_FAILED":    ("cloud_skip_failed",  "dl_skip_failed"),
+        "TAXON_FAMILIES":    "dl_families",
+        "CONTINENT":         "dl_continent",
+        "EXCLUDE_COUNTRIES": "dl_exc",
+        "COUNTRIES":         "dl_inc",
+        "MAX_PER_SP":        ("cloud_max_per_sp",  "dl_max_per_sp"),
+        "MAX_PER_GENUS":     ("cloud_max_per_ge",  "dl_max_per_ge"),
+        "MAX_PER_FAMILY":    ("cloud_max_per_fa",  "dl_max_per_fa"),
+        "LIMIT":             ("cloud_limit",       "dl_limit"),
+        "IIIF":              ("cloud_iiif",        "dl_iiif"),
+        "MAX_SIZE":          ("cloud_max_size",    "dl_max_size"),
+        "FROM_SPECSIN":      "cloud_from_specsin",
+        "SPECSIN_ONLY":      ("cloud_specsin_only", "dl_specsin_only"),
+        "WORKERS":           ("cloud_workers",      "dl_workers"),
+        "SKIP_FAILED":       ("cloud_skip_failed",  "dl_skip_failed"),
     })
 
 

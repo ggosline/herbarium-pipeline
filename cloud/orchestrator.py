@@ -484,7 +484,10 @@ class CloudOrchestrator:
         on_log(f"Syncing {len(files)} files → {REMOTE_REPO}")
         for f in files:
             await session.sftp_put(f, f"{REMOTE_REPO}/{f.name}")
-        await session.exec_capture(f"chmod +x {REMOTE_REPO}/pod_bootstrap.sh")
+        await session.exec_capture(
+            f"chmod +x {REMOTE_REPO}/pod_bootstrap.sh && "
+            f"sed -i 's/\\r//' {REMOTE_REPO}/pod_bootstrap.sh"
+        )
         await self.push_wandb_key(handle, on_log=on_log)
         await self.push_r2_config(handle, on_log=on_log)
 
