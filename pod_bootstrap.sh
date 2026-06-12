@@ -680,6 +680,10 @@ mirror_venv_local() {
   [ -d "$dst" ] && mv "$dst" "$dst.old"
   mv "$dst.new" "$dst"
   rm -rf "$dst.old"
+  # Some wheels (triton/ptxas, wandb-core) ship without execute bits.
+  # Fix here too — rsync preserves the bad perms from the source venv.
+  find "$dst/lib" -type f \( -path '*/bin/*' -o -name '*.so' \) \
+    -exec chmod +x {} + 2>/dev/null || true
   echo "✓ Local venv ready at $dst (python → $(readlink -f "$dst/bin/python"))"
 }
 
