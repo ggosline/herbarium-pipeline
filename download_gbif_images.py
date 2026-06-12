@@ -19,10 +19,12 @@ Country codes are ISO 3166-1 alpha-2 (e.g. MG=Madagascar, ZA=South Africa, NG=Ni
 --countries and --exclude-countries are mutually exclusive.
 """
 
+import base64
 import csv
 import http.client
 import io
 import json
+import os
 import random
 import re
 import sys
@@ -41,7 +43,9 @@ try:
 except ImportError:
     tqdm = None
 
-GBIF_SEARCH_API = "https://api.gbif.org/v1/occurrence/search"
+GBIF_SEARCH_API    = "https://api.gbif.org/v1/occurrence/search"
+GBIF_DOWNLOAD_API  = "https://api.gbif.org/v1/occurrence/download/request"
+GBIF_DOWNLOAD_INFO = "https://api.gbif.org/v1/occurrence/download/{key}"
 HEADERS = {"User-Agent": "HerbariumImageDownloader/1.0 (research)"}
 PAGE_SIZE = 300  # GBIF max per request
 GBIF_MAX_OFFSET = 100_000  # GBIF hard cap on paged results
@@ -64,18 +68,20 @@ VALID_CONTINENTS = {
 # GBIF helpers
 # ---------------------------------------------------------------------------
 
-def gbif_get(url: str, retries: int = 3) -> dict:
+def gbif_get(url: str, retries: int = 5) -> dict:
     """HTTP GET a GBIF API URL, with retries on transient errors."""
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=60) as resp:
                 return json.loads(resp.read())
-        except (urllib.error.URLError, json.JSONDecodeError) as exc:
+        except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
             if attempt < retries - 1:
-                time.sleep(2 ** attempt)
+                wait = 2 ** attempt
+                print(f"\n  GBIF request failed (attempt {attempt+1}/{retries}), retrying in {wait}s: {exc}")
+                time.sleep(wait)
             else:
-                raise RuntimeError(f"GBIF request failed: {url}") from exc
+                raise RuntimeError(f"GBIF request failed after {retries} attempts: {url}") from exc
 
 
 def search_occurrences(
@@ -84,6 +90,7 @@ def search_occurrences(
     continent: str | None,
     countries: list[str] | None = None,
     exclude_countries: list[str] | None = None,
+    basis_of_record: str | None = "PRESERVED_SPECIMEN",
 ) -> list[dict]:
     """
     Page through the GBIF occurrence search API and return all records that
@@ -93,8 +100,9 @@ def search_occurrences(
     country filtering is done client-side so that --exclude-countries works
     cleanly alongside a continent filter.
     """
-    params: dict = {"mediaType": "StillImage", "basisOfRecord": "PRESERVED_SPECIMEN",
-                    "limit": PAGE_SIZE, "offset": 0}
+    params: dict = {"mediaType": "StillImage", "limit": PAGE_SIZE, "offset": 0}
+    if basis_of_record:
+        params["basisOfRecord"] = basis_of_record
     if family:
         params["family"] = family
     if genus:
@@ -579,6 +587,92 @@ def save_specsin(path: Path, rows: dict[str, dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# GBIF asynchronous bulk download (for --families)
+# ---------------------------------------------------------------------------
+
+def request_gbif_download(
+    families: list[str],
+    continent: str | None,
+    countries: list[str] | None,
+    exclude_countries: list[str] | None,
+    basis_of_record: str | None,
+    username: str,
+    password: str,
+    dest: Path,
+) -> Path:
+    """Submit a GBIF bulk download for multiple families, poll until ready, save zip to dest."""
+    predicates: list[dict] = []
+
+    # Taxon: one family or OR of many
+    fam_preds = [{"type": "equals", "key": "FAMILY", "value": f} for f in families]
+    predicates.append(fam_preds[0] if len(fam_preds) == 1 else {"type": "or", "predicates": fam_preds})
+
+    predicates.append({"type": "equals", "key": "MEDIA_TYPE", "value": "StillImage"})
+
+    if basis_of_record:
+        predicates.append({"type": "equals", "key": "BASIS_OF_RECORD", "value": basis_of_record})
+
+    if continent:
+        predicates.append({"type": "equals", "key": "CONTINENT", "value": continent})
+
+    if countries:
+        cp = [{"type": "equals", "key": "COUNTRY", "value": c} for c in countries]
+        predicates.append(cp[0] if len(cp) == 1 else {"type": "or", "predicates": cp})
+
+    if exclude_countries:
+        for c in exclude_countries:
+            predicates.append({"type": "not", "predicate": {"type": "equals", "key": "COUNTRY", "value": c}})
+
+    predicate = predicates[0] if len(predicates) == 1 else {"type": "and", "predicates": predicates}
+    payload = json.dumps({"predicate": predicate}).encode()
+
+    cred = base64.b64encode(f"{username}:{password}".encode()).decode()
+    auth_headers = {**HEADERS, "Authorization": f"Basic {cred}", "Content-Type": "application/json"}
+
+    print(f"Submitting GBIF download request for: {', '.join(families)}")
+    req = urllib.request.Request(GBIF_DOWNLOAD_API, data=payload, headers=auth_headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            download_key = resp.read().decode().strip().strip('"')
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"GBIF download request failed ({e.code}): {e.read().decode()}") from e
+
+    print(f"  Download key: {download_key}")
+    print("  Polling for completion (GBIF typically takes 1–10 minutes)...")
+
+    status_url = GBIF_DOWNLOAD_INFO.format(key=download_key)
+    poll_interval = 20
+    while True:
+        time.sleep(poll_interval)
+        info = gbif_get(status_url)
+        status = info.get("status", "UNKNOWN")
+        size = info.get("size", 0)
+        size_str = f"  {size/1e6:.0f} MB" if size else ""
+        print(f"  Status: {status}{size_str}      ", end="\r", flush=True)
+        if status == "SUCCEEDED":
+            download_link = info["downloadLink"]
+            break
+        if status in ("FAILED", "KILLED", "CANCELLED"):
+            raise RuntimeError(f"GBIF download {download_key} ended with status {status}")
+        poll_interval = min(poll_interval * 1.5, 60)
+
+    print(f"\n  Downloading zip from {download_link}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    req = urllib.request.Request(download_link, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        total = int(resp.headers.get("Content-Length", 0) or 0)
+        downloaded = 0
+        with open(dest, "wb") as f:
+            while chunk := resp.read(1024 * 1024):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total:
+                    print(f"  {downloaded/1e6:.1f} / {total/1e6:.1f} MB", end="\r", flush=True)
+    print(f"\n  Saved: {dest}")
+    return dest
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -597,6 +691,11 @@ def main() -> None:
                        help="Plant family to query or filter (e.g. Ebenaceae)")
     group.add_argument("--genus",  metavar="GENUS",
                        help="Plant genus to query or filter (e.g. Diospyros)")
+    group.add_argument("--families", nargs="+", metavar="FAMILY",
+                       help="Two or more families for a combined GBIF bulk download. "
+                            "Requires GBIF_USER and GBIF_PASSWORD env vars. "
+                            "Downloads a single DwC-A zip covering all families at once. "
+                            "Use --dwca-out to control where the zip is saved.")
 
     parser.add_argument("--continent", metavar="CONTINENT", default=None,
                         help=f"GBIF continent code: {', '.join(sorted(VALID_CONTINENTS))}")
@@ -650,19 +749,24 @@ def main() -> None:
                              "previous run). Big speed-up for re-runs since failed "
                              "URLs cost up to ~90s each to retry. Omit (default) "
                              "to retry every failed row.")
+    parser.add_argument("--dwca-out", type=Path, default=None, metavar="ZIP",
+                        help="Where to save the downloaded DwC-A zip when using --families "
+                             "(default: ./<joined_names>.zip next to --specsin).")
 
     args = parser.parse_args()
 
-    if not args.dwca and not args.family and not args.genus and not args.from_specsin:
-        parser.error("Provide --from-specsin, --family, --genus, or --dwca.")
+    if not args.dwca and not args.family and not args.genus and not args.families and not args.from_specsin:
+        parser.error("Provide --from-specsin, --family, --families, --genus, or --dwca.")
 
     if args.continent and args.continent.upper() not in VALID_CONTINENTS:
         parser.error(f"Unknown continent '{args.continent}'. Valid: {', '.join(sorted(VALID_CONTINENTS))}")
 
     if args.from_specsin:
-        taxon     = args.from_specsin.stem
+        taxon = args.from_specsin.stem
+    elif args.families:
+        taxon = "_".join(safe_name(f) for f in args.families)
     else:
-        taxon     = args.family or args.genus or (args.dwca.stem if args.dwca else "download")
+        taxon = args.family or args.genus or (args.dwca.stem if args.dwca else "download")
     taxon_key = safe_name(taxon)
     out_dir   = args.output_dir or Path(f"{taxon_key}_images")
     specsin_path = args.specsin or Path(f"{taxon_key}_specsin.csv")
@@ -703,12 +807,33 @@ def main() -> None:
         else:
             for r in records:
                 r.pop("_hasfile_prev", None)
+    elif args.families:
+        gbif_user = os.environ.get("GBIF_USER", "").strip()
+        gbif_pass = os.environ.get("GBIF_PASSWORD", "").strip()
+        if not gbif_user or not gbif_pass:
+            parser.error("--families requires GBIF credentials. "
+                         "Set GBIF_USER and GBIF_PASSWORD environment variables.")
+        dwca_out = args.dwca_out or specsin_path.parent / f"{taxon_key}.zip"
+        if dwca_out.exists():
+            print(f"  Reusing existing DwC-A zip: {dwca_out}")
+        else:
+            dwca_out = request_gbif_download(
+                families=args.families,
+                continent=kw["continent"],
+                countries=kw["countries"],
+                exclude_countries=kw["exclude_countries"],
+                basis_of_record=kw["basis_of_record"],
+                username=gbif_user,
+                password=gbif_pass,
+                dest=dwca_out,
+            )
+        records = load_dwca(dwca_out, **kw)
     elif args.dwca:
         records = load_dwca(args.dwca, **kw)
     elif args.family or args.genus:
         records = search_occurrences(**kw)
     else:
-        parser.error("Provide --from-specsin, --dwca, --family, or --genus to specify "
+        parser.error("Provide --from-specsin, --dwca, --family, --families, or --genus to specify "
                       "which records to download.")
 
     if args.limit:

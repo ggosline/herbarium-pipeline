@@ -739,6 +739,25 @@ download() {
       --iiif-size "$IIIF" \
       --workers "$WORKERS" \
       "${EXTRA[@]}"
+  elif [ -n "${TAXON_FAMILIES:-}" ]; then
+    # Multiple families (e.g. split clade like old Olacaceae).
+    # Submits one GBIF bulk download job, waits for it, then downloads the zip.
+    # Requires GBIF_USER and GBIF_PASSWORD env vars (forwarded by orchestrator).
+    GEO=()
+    [ -n "${CONTINENT:-}" ]         && GEO+=(--continent "$CONTINENT")
+    [ -n "${EXCLUDE_COUNTRIES:-}" ] && GEO+=(--exclude-countries $EXCLUDE_COUNTRIES)
+    [ -n "${COUNTRIES:-}" ]         && GEO+=(--countries $COUNTRIES)
+    echo "Requesting GBIF bulk download for: $TAXON_FAMILIES"
+    # shellcheck disable=SC2086  # word-split on TAXON_FAMILIES is intentional
+    python -u "$REPO/download_gbif_images.py" \
+      --families $TAXON_FAMILIES \
+      --dwca-out "$DWCA" \
+      --output-dir "$IMG_RAW" \
+      --specsin "$SPECSIN" \
+      --iiif-size "$IIIF" \
+      --workers "$WORKERS" \
+      "${GEO[@]}" \
+      "${EXTRA[@]}"
   else
     echo "No DwC-A or specsin found — falling back to GBIF API (--family $TAXON_FAMILY)"
     python -u "$REPO/download_gbif_images.py" \

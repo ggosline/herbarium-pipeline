@@ -635,6 +635,11 @@ class CloudOrchestrator:
         session = await self._ensure_session(handle, on_log=on_log)
         self._state.current_step = step
         self._save_state()
+        # Auto-inject GBIF credentials for the download step so --families works on-pod.
+        if step == "download":
+            gbif = secrets.get_gbif_credentials()
+            if gbif:
+                env = {"GBIF_USER": gbif.username, "GBIF_PASSWORD": gbif.password, **(env or {})}
         env_prefix = ""
         if env:
             import shlex as _shlex

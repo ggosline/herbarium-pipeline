@@ -25,6 +25,7 @@ SERVICE_NAME = "herbarium-cloud"
 RUNPOD_KEY = "runpod"
 R2_KEY = "r2"
 WANDB_KEY = "wandb"
+GBIF_KEY = "gbif"
 
 
 # ── RunPod API key ────────────────────────────────────────────────────────
@@ -102,5 +103,36 @@ def set_r2_credentials(creds: R2Credentials) -> None:
 def delete_r2_credentials() -> None:
     try:
         keyring.delete_password(SERVICE_NAME, R2_KEY)
+    except keyring.errors.PasswordDeleteError:
+        pass
+
+
+# ── GBIF credentials ──────────────────────────────────────────────────────
+# Stored as a JSON blob so username and password travel together.
+
+@dataclass(frozen=True)
+class GBIFCredentials:
+    username: str
+    password: str
+
+
+def get_gbif_credentials() -> GBIFCredentials | None:
+    raw = keyring.get_password(SERVICE_NAME, GBIF_KEY)
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+        return GBIFCredentials(**d)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def set_gbif_credentials(creds: GBIFCredentials) -> None:
+    keyring.set_password(SERVICE_NAME, GBIF_KEY, json.dumps(asdict(creds)))
+
+
+def delete_gbif_credentials() -> None:
+    try:
+        keyring.delete_password(SERVICE_NAME, GBIF_KEY)
     except keyring.errors.PasswordDeleteError:
         pass

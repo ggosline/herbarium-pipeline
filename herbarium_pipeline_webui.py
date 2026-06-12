@@ -2794,6 +2794,55 @@ def _build_setup() -> None:
                       ).props("unelevated dense color=primary")
             ui.button("Forget", on_click=_forget_r2).props("flat dense")
 
+    # ── GBIF ────────────────────────────────────────────────────────────────
+    gbif_card, gbif_pill = _setup_card("grass", "GBIF",
+                                       "optional · needed for multi-family bulk downloads")
+    with gbif_card:
+        ui.label(
+            "Required when using --families (e.g. a split clade like old Olacaceae). "
+            "The pipeline submits a single bulk download job to GBIF on the pod, "
+            "which is far faster than paginating the search API for each family. "
+            "Register at gbif.org — the same account you use on the website."
+        ).classes("text-body2").style("color:#455a64")
+
+        gbif_user_inp = (ui.input(label="GBIF username")
+                         .classes("w-full mt-3").props("dense outlined"))
+        gbif_pass_inp = (ui.input(label="GBIF password")
+                         .classes("w-full").props("dense outlined type=password"))
+
+        def _refresh_gbif_pill() -> None:
+            creds = cloud_secrets.get_gbif_credentials()
+            if creds:
+                _set_pill(gbif_pill, f"✓ {creds.username}", "ok")
+            else:
+                _set_pill(gbif_pill, "not set", "warn")
+        _refresh_gbif_pill()
+
+        def _save_gbif() -> None:
+            u = (gbif_user_inp.value or "").strip()
+            p = (gbif_pass_inp.value or "").strip()
+            if not (u and p):
+                ui.notify("Enter both username and password.", type="warning"); return
+            try:
+                cloud_secrets.set_gbif_credentials(cloud_secrets.GBIFCredentials(
+                    username=u, password=p,
+                ))
+            except Exception as e:
+                ui.notify(f"Keyring save failed: {e}", type="negative"); return
+            gbif_pass_inp.value = ""
+            _refresh_gbif_pill()
+            ui.notify("GBIF credentials saved (forwarded to pod during download step).",
+                      type="positive")
+
+        def _forget_gbif() -> None:
+            cloud_secrets.delete_gbif_credentials()
+            _refresh_gbif_pill()
+            ui.notify("GBIF credentials removed.", type="info")
+
+        with ui.row().classes("gap-2 mt-2"):
+            ui.button("Save", on_click=_save_gbif).props("unelevated dense color=primary")
+            ui.button("Forget", on_click=_forget_gbif).props("flat dense")
+
 
 # ---------------------------------------------------------------------------
 # Cloud orchestration — module-scope state + helpers.
