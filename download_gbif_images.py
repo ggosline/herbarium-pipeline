@@ -44,6 +44,7 @@ except ImportError:
     tqdm = None
 
 GBIF_SEARCH_API    = "https://api.gbif.org/v1/occurrence/search"
+GBIF_SPECIES_MATCH = "https://api.gbif.org/v1/species/match"
 GBIF_DOWNLOAD_API  = "https://api.gbif.org/v1/occurrence/download/request"
 GBIF_DOWNLOAD_INFO = "https://api.gbif.org/v1/occurrence/download/{key}"
 HEADERS = {"User-Agent": "HerbariumImageDownloader/1.0 (research)"}
@@ -590,6 +591,24 @@ def save_specsin(path: Path, rows: dict[str, dict]) -> None:
 # GBIF asynchronous bulk download (for --families)
 # ---------------------------------------------------------------------------
 
+def gbif_taxon_key(name: str, rank: str = "FAMILY") -> str:
+    """Resolve a taxon name to its GBIF usageKey via the species/match API."""
+    url = (GBIF_SPECIES_MATCH
+           + "?" + urllib.parse.urlencode({"name": name, "rank": rank, "verbose": "false"}))
+    data = gbif_get(url)
+    if data.get("matchType") == "NONE" or not data.get("usageKey"):
+        raise ValueError(
+            f"GBIF could not match {rank} '{name}' "
+            f"(matchType={data.get('matchType')}, confidence={data.get('confidence')}). "
+            f"Check the spelling or try the GBIF website."
+        )
+    key = str(data["usageKey"])
+    confidence = data.get("confidence", "?")
+    matched = data.get("canonicalName") or data.get("scientificName") or name
+    print(f"  {name} → taxon key {key} ({matched}, confidence {confidence})")
+    return key
+
+
 def request_gbif_download(
     families: list[str],
     continent: str | None,
@@ -603,8 +622,9 @@ def request_gbif_download(
     """Submit a GBIF bulk download for multiple families, poll until ready, save zip to dest."""
     predicates: list[dict] = []
 
-    # Taxon: one family or OR of many
-    fam_preds = [{"type": "equals", "key": "FAMILY", "value": f} for f in families]
+    # Resolve each family name to a GBIF taxon key; download API requires numeric keys.
+    print(f"Resolving GBIF taxon keys for {len(families)} families...")
+    fam_preds = [{"type": "equals", "key": "TAXON_KEY", "value": gbif_taxon_key(f)} for f in families]
     predicates.append(fam_preds[0] if len(fam_preds) == 1 else {"type": "or", "predicates": fam_preds})
 
     predicates.append({"type": "equals", "key": "MEDIA_TYPE", "value": "StillImage"})
