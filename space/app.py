@@ -224,8 +224,13 @@ def _load_from_hub(repo: str) -> dict[str, Any]:
                  if k.startswith("backbone.")}
         gm_sd = {k[len("geo_mlp."):]: v for k, v in state.items()
                  if k.startswith("geo_mlp.")}
-        hd_sd = {k[len("head."):]: v for k, v in state.items()
-                 if k.startswith("head.")}
+        # TimmModelHierarchical names the primary head head_species regardless
+        # of label_level; fall back to bare head.* for non-hierarchical models.
+        hd_sd = {k[len("head_species."):]: v for k, v in state.items()
+                 if k.startswith("head_species.")}
+        if not hd_sd:
+            hd_sd = {k[len("head."):]: v for k, v in state.items()
+                     if k.startswith("head.")}
         bb_missing, bb_unexp = backbone.load_state_dict(bb_sd, strict=False)
         gm_missing, gm_unexp = geo_mlp.load_state_dict(gm_sd, strict=False)
         hd_missing, hd_unexp = head.load_state_dict(hd_sd, strict=False)
