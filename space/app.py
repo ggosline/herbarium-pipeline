@@ -321,14 +321,31 @@ def _model_info(model_choice: str) -> str:
     return f"**{model_choice}** — {e['description']}\n\nRepo: `{e['repo']}`"
 
 
+# Show the filter box only once the list gets long enough to be awkward.
+_PICKER_SEARCH_THRESHOLD = 6
+
+
 def _refresh_models():
-    """Re-scan the Hub and repopulate the dropdown. Lets a just-published
+    """Re-scan the Hub and repopulate the picker. Lets a just-published
     family appear without redeploying the Space."""
     global MODELS, DEFAULT_MODEL
     MODELS = discover_models()
     DEFAULT_MODEL = next(iter(MODELS))
-    return (gr.update(choices=list(MODELS.keys()), value=DEFAULT_MODEL),
-            _model_info(DEFAULT_MODEL))
+    return (gr.update(choices=list(MODELS), value=DEFAULT_MODEL),
+            _model_info(DEFAULT_MODEL),
+            gr.update(value="", visible=len(MODELS) > _PICKER_SEARCH_THRESHOLD))
+
+
+def _filter_models(query: str, current: str):
+    """Filter the model radio by a case-insensitive substring. The current
+    selection is always kept selectable so changing the filter never drops
+    it."""
+    q = (query or "").strip().lower()
+    keys = [k for k in MODELS if q in k.lower()] if q else list(MODELS)
+    if current in MODELS and current not in keys:
+        keys = [current, *keys]
+    value = current if current in keys else (keys[0] if keys else None)
+    return gr.update(choices=keys, value=value)
 
 
 # ---------------------------------------------------------------------------
@@ -336,17 +353,12 @@ def _refresh_models():
 # ---------------------------------------------------------------------------
 
 def _image_kwargs() -> dict:
-    """Camera-first image input. On a phone the 'upload' source opens the
-    OS camera (no mirroring); 'webcam' adds live capture on desktop. Disable
-    webcam mirroring so sheet labels aren't flipped — guarded so an older
-    Gradio without WebcamOptions still loads."""
-    kw = dict(type="pil", label="Specimen photo or scan",
-              sources=["upload", "webcam"])
-    try:
-        kw["webcam_options"] = gr.WebcamOptions(mirror=False)
-    except Exception:
-        pass
-    return kw
+    """Camera-first image input. Use only the 'upload' source: on a phone it
+    invokes the native camera app (rear lens, no selfie mirroring) plus the
+    photo library. The in-browser 'webcam' source defaults to the front
+    camera and mirrors the frame — wrong for photographing a sheet."""
+    return dict(type="pil", label="Specimen photo (tap to use your camera)",
+                sources=["upload"])
 
 
 with gr.Blocks(title="Herbarium ID") as demo:
@@ -358,13 +370,18 @@ with gr.Blocks(title="Herbarium ID") as demo:
     )
     with gr.Row():
         with gr.Column(scale=1):
+            search = gr.Textbox(
+                placeholder="Filter models…", show_label=False, container=False,
+                visible=len(MODELS) > _PICKER_SEARCH_THRESHOLD,
+            )
             with gr.Row():
                 # Radio, not Dropdown: a Gradio dropdown's popup panel is
                 # unreliable on mobile browsers (it would only ever show the
                 # selected option). Radio renders every model as an inline
-                # tappable item — no popup, works everywhere.
+                # tappable item — no popup, works everywhere. The filter box
+                # above keeps it manageable once there are many models.
                 model_dd = gr.Radio(
-                    choices=list(MODELS.keys()), value=DEFAULT_MODEL,
+                    choices=list(MODELS), value=DEFAULT_MODEL,
                     label="Model", interactive=True, scale=5,
                 )
                 refresh = gr.Button("⟳", scale=1, min_width=48)
@@ -384,7 +401,8 @@ with gr.Blocks(title="Herbarium ID") as demo:
             out = gr.Label(num_top_classes=TOPK, label="Top-5 predictions")
 
     model_dd.change(fn=_model_info, inputs=model_dd, outputs=info)
-    refresh.click(fn=_refresh_models, outputs=[model_dd, info])
+    search.change(fn=_filter_models, inputs=[search, model_dd], outputs=model_dd)
+    refresh.click(fn=_refresh_models, outputs=[model_dd, info, search])
     run.click(fn=identify, inputs=[img, model_dd, lat_in, lon_in], outputs=out)
 
 
