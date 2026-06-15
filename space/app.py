@@ -170,15 +170,20 @@ def _encode_coords(lat: float | None, lon: float | None) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 def _strip_lightning_prefix(sd: dict) -> dict:
-    """Remove Lightning + torch.compile wrapping. Training saves keys like
-    'model._orig_mod.backbone.cls_token' or 'model.head.weight'."""
+    """Remove Lightning + torch.compile prefixes, matching identify_herbarium.py.
+
+    TimmModel (non-geo) stores timm as self.model, so checkpoint keys are
+    model.model.* — the double prefix must be stripped before the single one.
+    TimmModelHierarchical uses self.backbone, giving model.backbone.* keys.
+    on_save_checkpoint normalises _orig_mod away but we keep the fallback.
+    """
     out: dict = {}
     for k, v in sd.items():
-        # Skip non-tensor metadata like *_labels_t / *_coords_t.
         if not isinstance(v, torch.Tensor):
             continue
         nk = k
-        for p in ("model._orig_mod.", "model.module.", "model."):
+        for p in ("model._orig_mod.model.", "model._orig_mod.",
+                  "model.model.",            "model."):
             if nk.startswith(p):
                 nk = nk[len(p):]
                 break
@@ -231,16 +236,20 @@ def _load_from_hub(repo: str) -> dict[str, Any]:
     else:
         model = timm.create_model(config["model_name"], pretrained=False,
                                   num_classes=num_classes)
-        # Backbone-then-head namespace: training stored as backbone.* + head.*.
-        # Try that first; fall back to direct apply.
-        bb_sd = {k[len("backbone."):]: v for k, v in state.items()
-                 if k.startswith("backbone.")}
-        if bb_sd:
-            adj: dict = dict(bb_sd)
+        # Hierarchical checkpoint (TimmModelHierarchical): after prefix strip,
+        # keys are backbone.* + head_species.* (+ optionally head_genus/family).
+        # Non-hierarchical (TimmModel): bare timm keys after stripping model.model.
+        if any(k.startswith("backbone.") for k in state):
+            remapped: dict = {}
             for k, v in state.items():
-                if k.startswith("head."):
-                    adj[k] = v
-            state = adj
+                if k.startswith("backbone."):
+                    remapped[k[len("backbone."):]] = v
+                elif k.startswith("head_species."):
+                    remapped["head." + k[len("head_species."):]] = v
+                elif k.startswith("head."):
+                    remapped[k] = v
+                # head_genus / head_family discarded
+            state = remapped
         missing, unexp = model.load_state_dict(state, strict=False)
         print(f"[load] plain: missing={len(missing)} unexp={len(unexp)}")
 
