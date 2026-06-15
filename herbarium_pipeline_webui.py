@@ -2740,6 +2740,49 @@ def _build_setup() -> None:
             ui.button("Save", on_click=_save_wb).props("unelevated dense color=primary")
             ui.button("Forget", on_click=_forget_wb).props("flat dense")
 
+    # ── Hugging Face ────────────────────────────────────────────────────
+    hf_card, hf_pill = _setup_card("smart_toy", "Hugging Face",
+                                   "optional · publish trained models to the Hub")
+    with hf_card:
+        ui.label(
+            "A write token lets the pod publish a trained family model to the "
+            "Hugging Face Hub (Cloud Tools → Publish to HF), where the "
+            "herbarium-id Space picks it up automatically. Create one at "
+            "huggingface.co/settings/tokens with the 'Write' role."
+        ).classes("text-body2").style("color:#455a64")
+
+        hf_inp = (ui.input(label="Write token", placeholder="hf_…")
+                  .classes("w-full mt-3").props("dense outlined type=password"))
+
+        def _refresh_hf_pill() -> None:
+            if cloud_secrets.get_hf_token():
+                _set_pill(hf_pill, "✓ saved", "ok")
+            else:
+                _set_pill(hf_pill, "not set", "warn")
+        _refresh_hf_pill()
+
+        def _save_hf() -> None:
+            v = (hf_inp.value or "").strip()
+            if not v:
+                ui.notify("Paste a token first.", type="warning"); return
+            try:
+                cloud_secrets.set_hf_token(v)
+            except Exception as e:
+                ui.notify(f"Keyring save failed: {e}", type="negative"); return
+            hf_inp.value = ""
+            _refresh_hf_pill()
+            ui.notify("Hugging Face token saved (pushed to pod at publish time).",
+                      type="positive")
+
+        def _forget_hf() -> None:
+            cloud_secrets.delete_hf_token()
+            _refresh_hf_pill()
+            ui.notify("Hugging Face token removed.", type="info")
+
+        with ui.row().classes("gap-2 mt-2"):
+            ui.button("Save", on_click=_save_hf).props("unelevated dense color=primary")
+            ui.button("Forget", on_click=_forget_hf).props("flat dense")
+
     # ── Cloudflare R2 ───────────────────────────────────────────────────
     r2_card, r2_pill = _setup_card("cloud_done", "Cloudflare R2",
                                    "optional · 50× faster pod setup + project archives")
@@ -3410,6 +3453,31 @@ async def _do_download_images() -> None:
     _cloud_info(f"Pulled images → {out}")
 
 
+async def _do_publish() -> None:
+    """Publish the pod's best checkpoint to the Hugging Face Hub via the
+    `publish` step. push_model.py auto-picks the accuracy-best checkpoint and
+    reads the embedded nameslist; we only supply the metadata."""
+    gs = app.storage.general
+    fam  = (gs.get("pub_family") or gs.get("main_proj") or "").strip()
+    user = (gs.get("pub_hfuser") or "").strip()
+    repo = (gs.get("pub_repo") or "").strip()
+    if not repo and not (user and fam):
+        _cloud_warn("Set a Hugging Face user + family, or an explicit repo, "
+                    "before publishing.")
+        return
+    if not cloud_secrets.get_hf_token():
+        _cloud_warn("Add a Hugging Face token first (⚙ Setup → Hugging Face).")
+        return
+    env = {
+        "FAMILY":    fam,
+        "HF_USER":   user,
+        "REGION":    (gs.get("pub_region") or "").strip(),
+        "HF_REPO":   repo,
+        "SELECT_BY": (gs.get("pub_select_by") or "").strip(),
+    }
+    await _do_step("publish", env=env)
+
+
 async def _do_terminate(*, keep_volume: bool, status_label, close_btn) -> None:
     orch = _cloud["orch"]; pod = _cloud["pod"]
     if not (orch and pod):
@@ -4035,6 +4103,54 @@ def _build_cloud_tools() -> None:
         ui.button("Restore to local", icon="download_for_offline",
                   on_click=lambda: _do_restore_local())\
             .props("unelevated dense color=primary").classes("mt-2")
+
+    # ── Publish to Hugging Face ──────────────────────────────────────────
+    with ui.card().classes("w-full mt-2").style("border-left:3px solid #ff8f00"):
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.icon("smart_toy").style("color:#ff8f00;font-size:20px")
+            ui.label("Publish to Hugging Face").classes("text-subtitle1 font-bold")\
+                .style("color:#e65100")
+        ui.label(
+            "Push this project's best checkpoint (highest validation accuracy) "
+            "to the Hugging Face Hub. It's tagged so the herbarium-id Space "
+            "discovers it automatically — no redeploy. Needs a write token "
+            "(⚙ Setup → Hugging Face)."
+        ).classes("text-body2 mt-1").style("color:#455a64;max-width:820px")
+
+        with ui.row().classes("w-full items-center gap-2 mt-1"):
+            ui.label("HF user:").classes("w-24 text-right shrink-0")
+            ui.input(value="", placeholder="e.g. ggosline").classes("w-48")\
+              .props("dense outlined").bind_value(gs, "pub_hfuser")\
+              .tooltip("Your Hugging Face username. Used to build the repo name "
+                       "when no explicit repo is given.")
+            ui.label("Family:").classes("w-20 text-right shrink-0")
+            ui.input(value="", placeholder="defaults to project").classes("w-48")\
+              .props("dense outlined").bind_value(gs, "pub_family")\
+              .tooltip("Family this model covers. Defaults to the current "
+                       "project name if left blank.")
+        with ui.row().classes("w-full items-center gap-2 mt-1"):
+            ui.label("Region:").classes("w-24 text-right shrink-0")
+            ui.input(value="", placeholder="optional, e.g. Africa").classes("w-48")\
+              .props("dense outlined").bind_value(gs, "pub_region")\
+              .tooltip("Optional geographic scope, folded into the repo name "
+                       "and model card.")
+            ui.label("Select:").classes("w-20 text-right shrink-0")
+            ui.select(["", "accuracy", "loss"], value="")\
+              .props("dense outlined").classes("w-32")\
+              .bind_value(gs, "pub_select_by")\
+              .tooltip("Which checkpoint to publish. Blank = accuracy-best "
+                       "(default); 'loss' = lowest valid_loss.")
+        with ui.row().classes("w-full items-center gap-2 mt-1"):
+            ui.label("Repo:").classes("w-24 text-right shrink-0")
+            ui.input(value="", placeholder="optional override, user/name")\
+              .classes("w-80").props("dense outlined").bind_value(gs, "pub_repo")\
+              .tooltip("Explicit HF repo id (overrides the user/family/region "
+                       "derivation), e.g. ggosline/herbarium-africa-ebenaceae-species.")
+        ui.button("Publish model to HF", icon="cloud_upload",
+                  on_click=lambda: _wrap_cloud(_do_publish))\
+            .props("unelevated dense color=primary").classes("mt-2")\
+            .tooltip("Runs the publish step on the pod: picks the best "
+                     "checkpoint and uploads it to the Hub.")
 
     # ── Maintenance ────────────────────────────────────────────────────────
     with ui.card().classes("w-full mt-2").style("border-left:3px solid #ffa726"):
@@ -4683,9 +4799,11 @@ def main_page():
         ui.notify(f"Paths set for {name}", type="positive")
 
 
+import os as _os_run
+
 ui.run(
     title="Herbarium Pipeline",
-    port=8765,
+    port=int(_os_run.environ.get("HERBARIUM_PORT", "8765")),
     reload=False,
     favicon="🌿",
     dark=False,

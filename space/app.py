@@ -18,6 +18,8 @@ that the training script used.
 from __future__ import annotations
 
 import json
+import os
+from collections import OrderedDict
 from typing import Any
 
 import gradio as gr
@@ -26,7 +28,7 @@ import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from huggingface_hub import hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download
 from PIL import Image
 from torchvision import transforms
 
@@ -52,8 +54,16 @@ def _gpu_decorator(*dargs, **dkwargs):
 
 
 # --- Model registry --------------------------------------------------------
-# Add new entries here as new models are published to the Hub.
-MODELS: dict[str, dict[str, str]] = {
+# Models are discovered on the Hub instead of being hardcoded: every repo
+# published by push_model.py carries the `herbarium-pipeline` tag and a
+# config.json, so a freshly-published family appears here automatically
+# (use the Refresh button — no Space redeploy needed).
+HF_AUTHOR = os.environ.get("HF_AUTHOR", "ggosline")
+PIPELINE_TAG = "herbarium-pipeline"
+
+# Used only if discovery returns nothing (offline / Hub hiccup) so the
+# Space never launches empty.
+FALLBACK_MODELS: dict[str, dict[str, str]] = {
     "Africa — Angiosperms (Magnoliopsida + Liliopsida), family rank": {
         "repo": "ggosline/herbarium-africa-angiosperms-family",
         "description": (
@@ -63,13 +73,61 @@ MODELS: dict[str, dict[str, str]] = {
         ),
     },
 }
-DEFAULT_MODEL = next(iter(MODELS))
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 TOPK = 5
 
-_loaded: dict[str, Any] = {}  # cache: repo -> {model, nameslist, config, geo_dim}
+# Bounded LRU of fully-built models. Family models are ~0.4–1.2 GB each, so
+# we keep only the few most-recently-used in memory and evict the rest.
+_MODEL_CACHE_MAX = int(os.environ.get("MODEL_CACHE_MAX", "3"))
+_loaded: "OrderedDict[str, Any]" = OrderedDict()  # repo -> {model, nameslist, config, geo_dim}
+
+
+def _describe(cfg: dict[str, Any]) -> str:
+    bits = []
+    if cfg.get("label_level"):
+        bits.append(f"{cfg['label_level']}-rank")
+    if cfg.get("num_classes"):
+        bits.append(f"{cfg['num_classes']} classes")
+    if cfg.get("val_accuracy") is not None:
+        bits.append(f"val_acc≈{cfg['val_accuracy']:.3f}")
+    elif cfg.get("valid_loss") is not None:
+        bits.append(f"valid_loss≈{cfg['valid_loss']:.3f}")
+    suffix = f" ({', '.join(bits)})" if bits else ""
+    return f"Backbone `{cfg.get('model_name', '?')}`{suffix}."
+
+
+def discover_models() -> dict[str, dict[str, Any]]:
+    """Scan the Hub for this project's published models.
+
+    Returns {display_name: {repo, description, **config}}. Falls back to
+    FALLBACK_MODELS when nothing is found so the UI is never empty.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        repos = list(HfApi().list_models(author=HF_AUTHOR, filter=PIPELINE_TAG))
+    except Exception as e:  # network / auth issues shouldn't crash the Space
+        print(f"[discover] list_models failed: {e}")
+        repos = []
+    for r in repos:
+        try:
+            with open(hf_hub_download(repo_id=r.id, filename="config.json")) as f:
+                cfg = json.load(f)
+        except Exception as e:
+            print(f"[discover] skipping {r.id}: no usable config.json ({e})")
+            continue
+        name = cfg.get("display_name") or r.id.split("/")[-1]
+        out[name] = {"repo": r.id, "description": _describe(cfg), **cfg}
+    if not out:
+        print("[discover] no models found on the Hub — using fallback registry")
+        return dict(FALLBACK_MODELS)
+    print(f"[discover] found {len(out)} model(s): {', '.join(out)}")
+    return dict(sorted(out.items()))
+
+
+MODELS: dict[str, dict[str, Any]] = discover_models()
+DEFAULT_MODEL = next(iter(MODELS))
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +188,7 @@ def _strip_lightning_prefix(sd: dict) -> dict:
 
 def _load_from_hub(repo: str) -> dict[str, Any]:
     if repo in _loaded:
+        _loaded.move_to_end(repo)  # mark most-recently-used
         return _loaded[repo]
     ckpt_path = hf_hub_download(repo_id=repo, filename="model.ckpt")
     names_path = hf_hub_download(repo_id=repo, filename="nameslist.json")
@@ -193,6 +252,10 @@ def _load_from_hub(repo: str) -> dict[str, Any]:
         "use_location": use_location,
         "geo_dim": geo_dim,
     }
+    _loaded.move_to_end(repo)
+    while len(_loaded) > _MODEL_CACHE_MAX:
+        evicted, _ = _loaded.popitem(last=False)
+        print(f"[cache] evicted {evicted} (LRU, max={_MODEL_CACHE_MAX})")
     return _loaded[repo]
 
 
@@ -234,7 +297,9 @@ def identify(image: Image.Image, model_choice: str,
              lat: float | None, lon: float | None) -> dict[str, float]:
     if image is None:
         return {}
-    entry = MODELS[model_choice]
+    entry = MODELS.get(model_choice)
+    if entry is None:
+        return {}
     repo = entry["repo"]
     bundle = _load_from_hub(repo)
     cfg = bundle["config"]
@@ -250,8 +315,20 @@ def identify(image: Image.Image, model_choice: str,
 
 
 def _model_info(model_choice: str) -> str:
-    e = MODELS[model_choice]
+    e = MODELS.get(model_choice)
+    if not e:
+        return "_No model selected._"
     return f"**{model_choice}** — {e['description']}\n\nRepo: `{e['repo']}`"
+
+
+def _refresh_models():
+    """Re-scan the Hub and repopulate the dropdown. Lets a just-published
+    family appear without redeploying the Space."""
+    global MODELS, DEFAULT_MODEL
+    MODELS = discover_models()
+    DEFAULT_MODEL = next(iter(MODELS))
+    return (gr.update(choices=list(MODELS.keys()), value=DEFAULT_MODEL),
+            _model_info(DEFAULT_MODEL))
 
 
 # ---------------------------------------------------------------------------
@@ -267,10 +344,12 @@ with gr.Blocks(title="Herbarium ID") as demo:
     )
     with gr.Row():
         with gr.Column(scale=1):
-            model_dd = gr.Dropdown(
-                choices=list(MODELS.keys()), value=DEFAULT_MODEL,
-                label="Model",
-            )
+            with gr.Row():
+                model_dd = gr.Dropdown(
+                    choices=list(MODELS.keys()), value=DEFAULT_MODEL,
+                    label="Model", scale=5,
+                )
+                refresh = gr.Button("⟳", scale=1, min_width=48)
             info = gr.Markdown(_model_info(DEFAULT_MODEL))
             img = gr.Image(type="pil", label="Specimen image")
             with gr.Row():
@@ -283,20 +362,22 @@ with gr.Blocks(title="Herbarium ID") as demo:
             out = gr.Label(num_top_classes=TOPK, label="Top-5 predictions")
 
     model_dd.change(fn=_model_info, inputs=model_dd, outputs=info)
+    refresh.click(fn=_refresh_models, outputs=[model_dd, info])
     run.click(fn=identify, inputs=[img, model_dd, lat_in, lon_in], outputs=out)
 
 
 # ---------------------------------------------------------------------------
-# Pre-load models at import — ZeroGPU's pickle-based arg passing makes
-# ferrying 1.2 GB per call infeasible; loading once at module level lets
-# the GPU subprocess use shared memory.
+# Pre-load only the default model at import. ZeroGPU's pickle-based arg
+# passing makes ferrying 1.2 GB per call infeasible, so the model must live
+# in the parent process cache (the GPU subprocess inherits it on fork).
+# We warm just the default — the rest load lazily on selection, bounded by
+# the LRU above so many published families don't exhaust memory.
 # ---------------------------------------------------------------------------
-for _entry in MODELS.values():
-    try:
-        _load_from_hub(_entry["repo"])
-        print(f"[startup] preloaded {_entry['repo']}")
-    except Exception as e:
-        print(f"[startup] preload of {_entry['repo']} failed: {e}")
+try:
+    _load_from_hub(MODELS[DEFAULT_MODEL]["repo"])
+    print(f"[startup] preloaded {MODELS[DEFAULT_MODEL]['repo']}")
+except Exception as e:
+    print(f"[startup] preload of default model failed: {e}")
 
 
 if __name__ == "__main__":

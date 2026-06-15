@@ -996,6 +996,38 @@ identify() {
   python -u "$REPO/identify_herbarium.py" "${args[@]}"
 }
 
+# ─── publish: push the best checkpoint to the Hugging Face Hub ─────────────
+# push_model.py points at the whole checkpoints dir, auto-picks the best by
+# valid_loss, and reads the embedded nameslist — so this just supplies the
+# metadata (family/region/repo) via env. The HF write token is read from
+# /workspace/.hf_token (pushed by the orchestrator) or $HF_TOKEN.
+publish() {
+  mirror_venv_local || echo "⚠ venv mirror skipped — imports will be slower."
+  activate
+  cd "$REPO"
+
+  if [ ! -f "$WS/.hf_token" ] && [ -z "${HF_TOKEN:-}" ]; then
+    echo "✗ no HF token at $WS/.hf_token and HF_TOKEN unset — set one in the Cloud tab."
+    return 1
+  fi
+
+  # Default the family to the project name when not given explicitly.
+  FAMILY="${FAMILY:-${PROJECT:-}}"
+
+  args=(--ckpt "$CKPT")
+  [ -n "${SELECT_BY:-}" ]    && args+=(--select-by    "$SELECT_BY")
+  [ -n "${HF_REPO:-}" ]      && args+=(--repo         "$HF_REPO")
+  [ -n "${HF_USER:-}" ]      && args+=(--hf-user      "$HF_USER")
+  [ -n "${FAMILY:-}" ]       && args+=(--family       "$FAMILY")
+  [ -n "${REGION:-}" ]       && args+=(--region       "$REGION")
+  [ -n "${LABEL_LEVEL:-}" ]  && args+=(--label-level  "$LABEL_LEVEL")
+  [ -n "${DISPLAY_NAME:-}" ] && args+=(--display-name "$DISPLAY_NAME")
+  [ -n "${IMAGE_SZ:-}" ]     && args+=(--image-sz     "$IMAGE_SZ")
+
+  echo "Publish: ckpt-dir=$CKPT family=${FAMILY:-?} repo=${HF_REPO:-<derived from family>}"
+  python -u "$REPO/push_model.py" "${args[@]}"
+}
+
 # ─── backup: full project archive to R2 ───────────────────────────────────
 # Pushes everything needed to delete the network volume and rebuild later
 # without re-downloading from GBIF: latest ckpt, nameslist, specsin, the
@@ -1007,14 +1039,30 @@ backup() {
   REMOTE="$R2_REMOTE/$PROJECT"
   echo "→ Archiving project '$PROJECT' to $REMOTE"
 
-  # 1. Latest checkpoint (irreplaceable)
-  CKPT_FILE=$(ls -t "$CKPT"/*.ckpt 2>/dev/null | head -1)
-  if [ -n "$CKPT_FILE" ]; then
-    echo "  ckpt: $(basename "$CKPT_FILE")"
-    rclone copy "$CKPT_FILE" "$REMOTE/checkpoints/" \
+  # 1. Checkpoints to archive: the most recent (irreplaceable) AND the best
+  #    by valid_loss. Often the same file, but pushing both means publishing
+  #    from R2 later (push_model.py) isn't stuck with whatever happened to be
+  #    latest. Dedupe so identical paths aren't uploaded twice.
+  LATEST_CKPT=$(ls -t "$CKPT"/*.ckpt 2>/dev/null | head -1)
+  BEST_CKPT=$(ls "$CKPT"/*valid_loss=*.ckpt 2>/dev/null \
+    | sed -E 's/.*valid_loss=([0-9.]+).*/\1 &/' | sort -n | head -1 | cut -d' ' -f2-)
+  # Accuracy-best — highest val_Accuracy. This is what `publish` selects by
+  # default, so R2 must carry it for a later publish-from-R2 to honour that.
+  BEST_ACC=$(ls "$CKPT"/*val_Accuracy=*.ckpt 2>/dev/null \
+    | sed -E 's/.*val_Accuracy=([0-9.]+).*/\1 &/' | sort -rn | head -1 | cut -d' ' -f2-)
+  copied=""
+  for f in "$LATEST_CKPT" "$BEST_CKPT" "$BEST_ACC"; do
+    [ -n "$f" ] || continue
+    case " $copied " in *" $f "*) continue ;; esac
+    copied="$copied $f"
+    echo "  ckpt: $(basename "$f")"
+    rclone copy "$f" "$REMOTE/checkpoints/" \
       --progress --transfers 4 --s3-chunk-size 64M
-  fi
-  # nameslist.json + any other small ckpt-side metadata
+  done
+  # nameslist.json lives in $DATA (not $CKPT); copy it explicitly so the R2
+  # archive is self-sufficient, plus any ckpt-side *.json metadata.
+  [ -f "$DATA/nameslist.json" ] && \
+    rclone copy "$DATA/nameslist.json" "$REMOTE/checkpoints/" --progress
   rclone copy "$CKPT/" "$REMOTE/checkpoints/" --include "*.json" --progress
 
   # 2. Per-project state
@@ -1120,13 +1168,14 @@ repair_cache() {
 # (the webui sources this file to call individual functions like start_watchdog,
 # and an unguarded ${1:?...} aborts the source with no positional args).
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-  case "${1:?usage: $0 [setup|download|prep|stage_images|train|identify|backup|restore|cache_pull|cache_push|cache_push_bg|venv_pull|venv_push|venv_push_bg|mirror_venv_local|repair_cache|start_watchdog]}" in
+  case "${1:?usage: $0 [setup|download|prep|stage_images|train|identify|publish|backup|restore|cache_pull|cache_push|cache_push_bg|venv_pull|venv_push|venv_push_bg|mirror_venv_local|repair_cache|start_watchdog]}" in
     setup)              setup ;;
     download)           download ;;
     prep)               prep ;;
     stage_images)       stage_images ;;
     train)              train ;;
     identify)           identify ;;
+    publish)            publish ;;
     backup)             backup ;;
     restore)            restore ;;
     cache_pull)         cache_pull ;;

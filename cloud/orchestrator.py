@@ -481,6 +481,13 @@ class CloudOrchestrator:
             for f in self._local_pipeline.glob(pat)
             if f.is_file()
         })
+        # space/push_model.py is standalone (no relative imports) but lives in
+        # a subdir the top-level glob misses. Push it flat so `publish` can run
+        # the user's current version, not whatever's on origin/main.
+        extra = self._local_pipeline / "space" / "push_model.py"
+        files = list(files)
+        if extra.is_file():
+            files.append(extra)
         on_log(f"Syncing {len(files)} files → {REMOTE_REPO}")
         for f in files:
             await session.sftp_put(f, f"{REMOTE_REPO}/{f.name}")
@@ -508,6 +515,62 @@ class CloudOrchestrator:
         await session.sftp_put_bytes(key.encode("utf-8"), "/workspace/.wandb_key")
         on_log("Pushed wandb key → /workspace/.wandb_key (chmod 600)")
         return True
+
+    async def push_hf_token(
+        self, handle: PodHandle, *, on_log: LogFn = print,
+    ) -> bool:
+        """Write the Hugging Face write token from the keyring to
+        ``/workspace/.hf_token`` (chmod 600). push_model.py reads it from
+        there for unattended pod-side publishing.
+
+        Returns True if pushed, False if no token is configured.
+        """
+        token = secrets.get_hf_token()
+        if not token:
+            on_log("No Hugging Face token in keyring — skipping push "
+                   "(set one in the Cloud tab to enable publishing to the Hub).")
+            return False
+        session = await self._ensure_session(handle, on_log=on_log)
+        await session.sftp_put_bytes(token.encode("utf-8"), "/workspace/.hf_token")
+        await session.exec_capture("chmod 600 /workspace/.hf_token")
+        on_log("Pushed HF token → /workspace/.hf_token (chmod 600)")
+        return True
+
+    async def publish_model(
+        self,
+        handle: PodHandle,
+        *,
+        family: str,
+        hf_user: str,
+        region: str = "",
+        label_level: str = "",
+        repo: str = "",
+        display_name: str = "",
+        select_by: str = "",
+        on_log: LogFn = print,
+    ) -> int:
+        """Publish the pod's best checkpoint to the Hugging Face Hub.
+
+        Runs the ``publish`` bootstrap step, which invokes push_model.py
+        against ``/workspace/data/checkpoints`` (auto-picks the best
+        checkpoint by accuracy and reads the embedded nameslist). The HF
+        token is staged on the pod by ``run_step`` itself. Either ``repo``
+        or (``hf_user`` + ``family``) must be set.
+        Returns the step exit code (0 = success).
+        """
+        if not secrets.get_hf_token():
+            on_log("No Hugging Face token in keyring — set one before publishing.")
+            return 1
+        env = {
+            "FAMILY": family,
+            "HF_USER": hf_user,
+            "REGION": region,
+            "LABEL_LEVEL": label_level,
+            "HF_REPO": repo,  # not REPO — pod_bootstrap uses REPO for the code dir
+            "DISPLAY_NAME": display_name,
+            "SELECT_BY": select_by,  # "" → push_model default (accuracy)
+        }
+        return await self.run_step(handle, "publish", env=env, on_log=on_log)
 
     async def push_r2_config(
         self, handle: PodHandle, *, on_log: LogFn = print,
@@ -631,7 +694,8 @@ class CloudOrchestrator:
         for the bash invocation so the bootstrap script's per-step overrides
         kick in. Returns the script's exit code (0 = success).
         """
-        valid = {"setup", "download", "prep", "train", "identify", "backup", "restore"}
+        valid = {"setup", "download", "prep", "train", "identify",
+                 "backup", "restore", "publish"}
         if step not in valid:
             raise ValueError(f"unknown step {step!r}; expected one of {sorted(valid)}")
 
@@ -643,6 +707,9 @@ class CloudOrchestrator:
             gbif = secrets.get_gbif_credentials()
             if gbif:
                 env = {"GBIF_USER": gbif.username, "GBIF_PASSWORD": gbif.password, **(env or {})}
+        # Publish needs the HF write token staged on the pod (sftp, like the wandb key).
+        if step == "publish":
+            await self.push_hf_token(handle, on_log=on_log)
         env_prefix = ""
         if env:
             import shlex as _shlex

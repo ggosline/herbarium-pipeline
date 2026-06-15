@@ -26,6 +26,7 @@ RUNPOD_KEY = "runpod"
 R2_KEY = "r2"
 WANDB_KEY = "wandb"
 GBIF_KEY = "gbif"
+HF_KEY = "huggingface"
 
 
 # ── RunPod API key ────────────────────────────────────────────────────────
@@ -62,6 +63,25 @@ def set_wandb_api_key(api_key: str) -> None:
 def delete_wandb_api_key() -> None:
     try:
         keyring.delete_password(SERVICE_NAME, WANDB_KEY)
+    except keyring.errors.PasswordDeleteError:
+        pass
+
+
+# ── Hugging Face write token (publish models to the Hub) ──────────────────
+
+def get_hf_token() -> str | None:
+    return keyring.get_password(SERVICE_NAME, HF_KEY)
+
+
+def set_hf_token(token: str) -> None:
+    if not token.strip():
+        raise ValueError("token is empty")
+    keyring.set_password(SERVICE_NAME, HF_KEY, token.strip())
+
+
+def delete_hf_token() -> None:
+    try:
+        keyring.delete_password(SERVICE_NAME, HF_KEY)
     except keyring.errors.PasswordDeleteError:
         pass
 
