@@ -352,6 +352,20 @@ def _filter_models(query: str, current: str):
 # UI
 # ---------------------------------------------------------------------------
 
+# Force mobile file inputs to open the rear camera directly instead of a
+# file/gallery chooser. Browsers read capture="environment" when the input
+# is tapped; the MutationObserver re-applies it to inputs Gradio creates
+# lazily (e.g. after clearing an image). Runs on page load via Blocks(js=).
+_CAPTURE_JS = """
+() => {
+  const apply = () => document.querySelectorAll('input[type=file]')
+      .forEach(el => el.setAttribute('capture', 'environment'));
+  apply();
+  new MutationObserver(apply).observe(document.body, {childList: true, subtree: true});
+}
+"""
+
+
 def _image_kwargs() -> dict:
     """Camera-first image input. Use only the 'upload' source: on a phone it
     invokes the native camera app (rear lens, no selfie mirroring) plus the
@@ -361,7 +375,7 @@ def _image_kwargs() -> dict:
                 sources=["upload"])
 
 
-with gr.Blocks(title="Herbarium ID") as demo:
+with gr.Blocks(title="Herbarium ID", js=_CAPTURE_JS) as demo:
     gr.Markdown("# Herbarium specimen identification")
     gr.Markdown(
         "Photograph a herbarium sheet with your phone (or upload an image) "
