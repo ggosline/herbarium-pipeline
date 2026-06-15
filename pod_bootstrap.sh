@@ -456,8 +456,11 @@ setup() {
 
   # 6e. Fix perms — some wheels ship binaries without execute bits
   # (triton/ptxas, wandb-core, etc.). Runs regardless of fast/slow path.
-  local site_packages="$UV_PROJECT_ENVIRONMENT/lib/python"*"/site-packages"
-  find "$site_packages" -type f -path '*/bin/*' -exec chmod +x {} + 2>/dev/null || true
+  # Note: do NOT try to glob to site-packages/ in a variable — bash skips
+  # pathname expansion in assignments, so find gets a literal "*" path and
+  # silently fails. Search the whole lib/ subtree instead.
+  find "$UV_PROJECT_ENVIRONMENT/lib" -type f -path '*/bin/*' \
+    -exec chmod +x {} + 2>/dev/null || true
 
   # 6f. Venv mirror moved to train() / identify() — those are the only steps
   # whose cold-import cost (torch, lightning, DALI ~30–60 s on MooseFS)
