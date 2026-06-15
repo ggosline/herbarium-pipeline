@@ -335,12 +335,26 @@ def _refresh_models():
 # UI
 # ---------------------------------------------------------------------------
 
+def _image_kwargs() -> dict:
+    """Camera-first image input. On a phone the 'upload' source opens the
+    OS camera (no mirroring); 'webcam' adds live capture on desktop. Disable
+    webcam mirroring so sheet labels aren't flipped — guarded so an older
+    Gradio without WebcamOptions still loads."""
+    kw = dict(type="pil", label="Specimen photo or scan",
+              sources=["upload", "webcam"])
+    try:
+        kw["webcam_options"] = gr.WebcamOptions(mirror=False)
+    except Exception:
+        pass
+    return kw
+
+
 with gr.Blocks(title="Herbarium ID") as demo:
     gr.Markdown("# Herbarium specimen identification")
     gr.Markdown(
-        "Upload a herbarium sheet image. The model returns the top-5 "
-        "predicted families with confidence scores. Latitude / longitude "
-        "are optional and only used by geo-aware models."
+        "Photograph a herbarium sheet with your phone (or upload an image) "
+        "and pick a model — it returns the top-5 predictions with confidence "
+        "scores. Tap ⟳ to refresh the model list."
     )
     with gr.Row():
         with gr.Column(scale=1):
@@ -351,12 +365,16 @@ with gr.Blocks(title="Herbarium ID") as demo:
                 )
                 refresh = gr.Button("⟳", scale=1, min_width=48)
             info = gr.Markdown(_model_info(DEFAULT_MODEL))
-            img = gr.Image(type="pil", label="Specimen image")
-            with gr.Row():
-                lat_in = gr.Number(label="Latitude (optional, °)", value=None,
-                                   minimum=-90, maximum=90)
-                lon_in = gr.Number(label="Longitude (optional, °)", value=None,
-                                   minimum=-180, maximum=180)
+            img = gr.Image(**_image_kwargs())
+            # Location is irrelevant for sheets shot inside the herbarium and
+            # only used by geo-aware models, so keep it out of the way.
+            with gr.Accordion("Location (optional — geo-aware models only)",
+                              open=False):
+                with gr.Row():
+                    lat_in = gr.Number(label="Latitude (°)", value=None,
+                                       minimum=-90, maximum=90)
+                    lon_in = gr.Number(label="Longitude (°)", value=None,
+                                       minimum=-180, maximum=180)
             run = gr.Button("Identify", variant="primary")
         with gr.Column(scale=1):
             out = gr.Label(num_top_classes=TOPK, label="Top-5 predictions")
