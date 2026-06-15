@@ -359,12 +359,13 @@ with gr.Blocks(title="Herbarium ID") as demo:
     with gr.Row():
         with gr.Column(scale=1):
             with gr.Row():
-                # filterable=False → a plain native-style select. The default
-                # filterable dropdown breaks on mobile: tapping it seeds the
-                # filter with the selected value, hiding every other option.
-                model_dd = gr.Dropdown(
+                # Radio, not Dropdown: a Gradio dropdown's popup panel is
+                # unreliable on mobile browsers (it would only ever show the
+                # selected option). Radio renders every model as an inline
+                # tappable item — no popup, works everywhere.
+                model_dd = gr.Radio(
                     choices=list(MODELS.keys()), value=DEFAULT_MODEL,
-                    label="Model", scale=5, filterable=False, interactive=True,
+                    label="Model", interactive=True, scale=5,
                 )
                 refresh = gr.Button("⟳", scale=1, min_width=48)
             info = gr.Markdown(_model_info(DEFAULT_MODEL))
