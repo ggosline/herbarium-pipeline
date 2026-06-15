@@ -745,7 +745,7 @@ def build_trainer(config: dict, output_dir: Path, logger, callbacks: list,
         accelerator="gpu",
         devices=num_gpus,
         strategy=strategy,
-        accumulate_grad_batches=config.get("accum", 2),
+        accumulate_grad_batches=max(1, config.get("accum", 2)),
         precision=config.get("precision", "bf16-mixed"),
         gradient_clip_val=config.get("gradient_clip_val", 1.0),
         callbacks=callbacks,
@@ -1143,7 +1143,7 @@ def parse_args():
     p.add_argument("--image-sz", type=int, default=DEFAULT_CONFIG["image_sz"])
     p.add_argument("--batch-size", type=int, default=DEFAULT_CONFIG["batch_size"])
     p.add_argument("--accum", type=int, default=DEFAULT_CONFIG["accum"],
-                   help="Gradient accumulation steps")
+                   help="Gradient accumulation steps (0 or 1 = no accumulation)")
     p.add_argument("--stage1-epochs", type=int, default=DEFAULT_CONFIG["stage1_epochs"])
     p.add_argument("--stage1-lr", type=float, default=DEFAULT_CONFIG["stage1_lr"])
     p.add_argument("--stage2-epochs", type=int, default=DEFAULT_CONFIG["stage2_epochs"])
