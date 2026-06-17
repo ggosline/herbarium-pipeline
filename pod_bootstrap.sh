@@ -231,7 +231,7 @@ venv_pull() {
   rm -rf /workspace/venv.new
   mkdir -p /workspace/venv.new
   # Stream R2 → (optional zstd -d) → tar -x. Single network pass.
-  if ! rclone cat "$remote" | $decompress | tar -xf - -C /workspace/venv.new; then
+  if ! rclone cat "$remote" | $decompress | tar -xf - --strip-components=1 -C /workspace/venv.new; then
     echo "⚠ Venv pull/extract failed — falling through to slow path"
     rm -rf /workspace/venv.new
     return 1
