@@ -467,8 +467,13 @@ setup() {
   # outweighs the 5+ min mirror itself. download / prep have minimal
   # imports and don't benefit, so we skip the mirror at setup time.
 
-  # 7. wandb login. Independent of which path built the venv — the binary
-  #    lives at $UV_PROJECT_ENVIRONMENT/bin/wandb either way.
+  # 7. wandb login. If the binary is missing from a stale R2 tarball, install
+  #    wandb in-place and re-push the venv so future pods get it.
+  if [ ! -x "$UV_PROJECT_ENVIRONMENT/bin/wandb" ]; then
+    echo "wandb binary missing from venv — installing and re-caching..."
+    uv pip install --python "$UV_PROJECT_ENVIRONMENT/bin/python" "wandb>=0.16"
+    venv_push_bg
+  fi
   if [ -f "$WS/.wandb_key" ]; then
     "$UV_PROJECT_ENVIRONMENT/bin/wandb" login "$(cat "$WS/.wandb_key")"
   fi
