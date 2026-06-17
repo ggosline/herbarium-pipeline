@@ -137,11 +137,20 @@ cache_push() {
   fi
 }
 
-# HF-only push: used after prep/train where only model weights change.
-# Skips the 25 GB wheel cache — wheels don't change after setup.
+# HF-only push: used after prep/train where model weights may have been
+# downloaded for the first time. Skips the 25 GB wheel cache.
+# Uses a byte-size stamp so the push is a no-op on every run after the
+# first — CLIP and DINOv3 weights don't change unless the model changes.
 hf_cache_push() {
   if ! command -v rclone >/dev/null; then
     echo "rclone not installed — skipping HF cache push"; return 0
+  fi
+  local stamp="$WS/.hf_cache_stamp"
+  local current_size
+  current_size=$(du -sb "$HF_HOME" 2>/dev/null | cut -f1)
+  if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$current_size" ]; then
+    echo "HF cache unchanged since last push — skipping"
+    return 0
   fi
   if ! _rclone_writable; then
     echo "Cache remote $CACHE_REMOTE not writable — skipping push"; return 0
@@ -151,7 +160,8 @@ hf_cache_push() {
   echo "→ Pushing HF model cache ($size) to $CACHE_REMOTE/huggingface/ (diff only)..."
   rclone copy "$HF_HOME/" "$CACHE_REMOTE/huggingface/" \
     "${RCLONE_CACHE_FLAGS[@]}" --stats-one-line 2>&1 | tail -3 \
-    && echo "✓ HF cache push done" || echo "⚠ HF cache push had errors" >&2
+    && { echo "✓ HF cache push done"; echo "$current_size" > "$stamp"; } \
+    || echo "⚠ HF cache push had errors" >&2
 }
 
 # ─── full-venv cache (R2) ─────────────────────────────────────────────────
