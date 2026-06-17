@@ -109,32 +109,49 @@ cache_pull() {
   echo "✓ Cache pull done ($(du -sh "$UV_CACHE_DIR" "$HF_HOME" 2>/dev/null | tr '\n' ' '))"
 }
 
+_rclone_writable() {
+  rclone lsd "$CACHE_REMOTE" >/dev/null 2>&1 \
+    || rclone mkdir "$CACHE_REMOTE" 2>/dev/null
+}
+
+# Full push: wheel cache + HF weights. Use after a lockfile bump to seed R2.
 cache_push() {
   if ! command -v rclone >/dev/null; then
     echo "rclone not installed — skipping cache push"; return 0
   fi
-  if ! rclone lsd "$CACHE_REMOTE" >/dev/null 2>&1 \
-       && ! rclone mkdir "$CACHE_REMOTE" 2>/dev/null; then
+  if ! _rclone_writable; then
     echo "Cache remote $CACHE_REMOTE not writable — skipping push"; return 0
   fi
-  # Show local sizes BEFORE push so a wheel-stripped cache (e.g. after
-  # `uv cache prune --ci`) is obvious in the log instead of silently
-  # uploading a tiny metadata-only tree to R2.
   echo "→ Pushing shared cache to $CACHE_REMOTE (diff only)..."
   echo "  local sizes:"
   du -sh "$UV_CACHE_DIR" "$HF_HOME" 2>/dev/null | sed 's/^/    /'
-
   local rc_uv=0 rc_hf=0
   rclone copy "$UV_CACHE_DIR/" "$CACHE_REMOTE/uv/" \
     "${RCLONE_CACHE_FLAGS[@]}" --stats-one-line 2>&1 | tail -3 || rc_uv=$?
   rclone copy "$HF_HOME/"      "$CACHE_REMOTE/huggingface/" \
     "${RCLONE_CACHE_FLAGS[@]}" --stats-one-line 2>&1 | tail -3 || rc_hf=$?
-
   if [ "$rc_uv" -ne 0 ] || [ "$rc_hf" -ne 0 ]; then
     echo "⚠ Cache push had errors (uv rc=$rc_uv, hf rc=$rc_hf)" >&2
   else
     echo "✓ Cache push done"
   fi
+}
+
+# HF-only push: used after prep/train where only model weights change.
+# Skips the 25 GB wheel cache — wheels don't change after setup.
+hf_cache_push() {
+  if ! command -v rclone >/dev/null; then
+    echo "rclone not installed — skipping HF cache push"; return 0
+  fi
+  if ! _rclone_writable; then
+    echo "Cache remote $CACHE_REMOTE not writable — skipping push"; return 0
+  fi
+  local size
+  size=$(du -sh "$HF_HOME" 2>/dev/null | cut -f1)
+  echo "→ Pushing HF model cache ($size) to $CACHE_REMOTE/huggingface/ (diff only)..."
+  rclone copy "$HF_HOME/" "$CACHE_REMOTE/huggingface/" \
+    "${RCLONE_CACHE_FLAGS[@]}" --stats-one-line 2>&1 | tail -3 \
+    && echo "✓ HF cache push done" || echo "⚠ HF cache push had errors" >&2
 }
 
 # ─── full-venv cache (R2) ─────────────────────────────────────────────────
@@ -829,10 +846,11 @@ prep() {
     --specsin "$SPECSIN" \
     --image-dir "$IMG_1024" --restore --rebuild-fnames
 
-  # Push caches only when new models were likely downloaded (CLIP filter).
-  # HSV and subsequent preps don't need this — set NO_CACHE_PUSH=1 to skip.
+  # Push HF weights (CLIP model) downloaded during CLIP filter.
+  # Skips the wheel cache — only model weights change here.
+  # HSV filter downloads nothing, so skip. NO_CACHE_PUSH=1 to disable.
   if [ "${NO_CACHE_PUSH:-0}" != "1" ] && [ "$FILTER_METHOD" != "hsv" ]; then
-    cache_push
+    hf_cache_push
   fi
 }
 
@@ -968,7 +986,7 @@ train() {
 
   # Push the timm/DINOv3 backbone weights (~1.2 GB) downloaded on first
   # train, so other projects skip the download on their first train.
-  cache_push
+  hf_cache_push
 }
 
 # ─── step 4: identify ─────────────────────────────────────────────────────
