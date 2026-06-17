@@ -236,6 +236,12 @@ venv_pull() {
     rm -rf /workspace/venv.new
     return 1
   fi
+  # Sanity-check before swapping — catches push/pull format mismatches early.
+  if [ ! -f /workspace/venv.new/bin/python ]; then
+    echo "⚠ Extracted venv missing bin/python — tarball corrupt or wrong format"
+    rm -rf /workspace/venv.new
+    return 1
+  fi
   # Atomic swap. If a previous venv exists, replace it.
   rm -rf /workspace/venv.old
   if [ -d /workspace/venv ]; then
@@ -350,6 +356,9 @@ cache_push_bg() {
 
 # ─── one-time per pod: env setup ──────────────────────────────────────────
 setup() {
+  # Guard against concurrent runs (e.g. two SSH sessions both triggering setup).
+  exec 9>/workspace/.setup.lock
+  flock -n 9 || { echo "Another setup is already running — skipping"; exit 0; }
   # 1. Clone / update code on the volume.
   #    When run by the cloud orchestrator the code is SFTP-pushed (no .git),
   #    so we only fast-forward an existing git checkout. A fresh manual
@@ -467,13 +476,7 @@ setup() {
   # outweighs the 5+ min mirror itself. download / prep have minimal
   # imports and don't benefit, so we skip the mirror at setup time.
 
-  # 7. wandb login. If the binary is missing from a stale R2 tarball, install
-  #    wandb in-place and re-push the venv so future pods get it.
-  if [ ! -x "$UV_PROJECT_ENVIRONMENT/bin/wandb" ]; then
-    echo "wandb binary missing from venv — installing and re-caching..."
-    "$UV_PROJECT_ENVIRONMENT/bin/python" -m pip install "wandb>=0.16"
-    venv_push_bg
-  fi
+  # 7. wandb login.
   if [ -f "$WS/.wandb_key" ]; then
     "$UV_PROJECT_ENVIRONMENT/bin/wandb" login "$(cat "$WS/.wandb_key")"
   fi
