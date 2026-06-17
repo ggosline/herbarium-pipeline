@@ -471,7 +471,7 @@ setup() {
   #    wandb in-place and re-push the venv so future pods get it.
   if [ ! -x "$UV_PROJECT_ENVIRONMENT/bin/wandb" ]; then
     echo "wandb binary missing from venv — installing and re-caching..."
-    uv pip install --python "$UV_PROJECT_ENVIRONMENT/bin/python" "wandb>=0.16"
+    uv pip install "wandb>=0.16"
     venv_push_bg
   fi
   if [ -f "$WS/.wandb_key" ]; then
