@@ -60,26 +60,20 @@ import sys
 import tempfile
 from pathlib import Path
 
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-
-# Reused so the split logic and model reconstruction can't drift from the
-# training / inference scripts. Importing train_herbarium pulls in DALI, hence
-# the "run in the training env" note above.
-from identify_herbarium import (
-    resolve_checkpoint, load_model, build_model_from_state, InferenceDataset,
-)
+# NB: torch / identify_herbarium / train_herbarium are imported lazily inside
+# the fitting path of main() so the --set-temperature heuristic (which needs
+# no data, no model, no GPU) runs with only huggingface_hub installed.
 
 
 # ---------------------------------------------------------------------------
 # Temperature fit + calibration metrics
 # ---------------------------------------------------------------------------
 
-def fit_temperature(logits: torch.Tensor, targets: torch.Tensor,
-                    max_iter: int = 100) -> float:
+def fit_temperature(logits, targets, max_iter: int = 100) -> float:
     """Minimise validation NLL over a single scalar T (parameterised as
     exp(log_T) so it stays positive). Returns the fitted temperature."""
+    import torch
+    import torch.nn as nn
     logits  = logits.double()
     targets = targets.long()
     log_T = torch.zeros(1, dtype=torch.double, requires_grad=True)
@@ -96,10 +90,11 @@ def fit_temperature(logits: torch.Tensor, targets: torch.Tensor,
     return float(log_T.detach().exp().item())
 
 
-def calibration_report(logits: torch.Tensor, targets: torch.Tensor,
-                       T: float, n_bins: int = 15) -> dict:
+def calibration_report(logits, targets, T: float, n_bins: int = 15) -> dict:
     """NLL, mean top-1 confidence, accuracy, and expected calibration error
     (ECE) at temperature T. Accuracy is T-invariant (argmax unchanged)."""
+    import torch
+    import torch.nn as nn
     with torch.no_grad():
         probs = torch.softmax(logits.double() / T, dim=1)
         conf, pred = probs.max(dim=1)
@@ -177,6 +172,13 @@ def patch_hub_temperature(repo: str, temperature: float, token: str | None) -> N
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    # Windows consoles default to cp1252 and crash on the arrows/checkmarks
+    # below; force UTF-8 so the script runs the same everywhere.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--checkpoint", type=Path,
@@ -223,6 +225,14 @@ def main() -> int:
 
     if not args.checkpoint or not args.sources:
         sys.exit("--checkpoint and --sources are required (unless --set-temperature).")
+
+    # Heavy deps only needed for fitting. Imported here so --set-temperature
+    # above stays torch/DALI-free. train_herbarium is imported further down.
+    import torch
+    from torch.utils.data import DataLoader
+    from identify_herbarium import (
+        resolve_checkpoint, load_model, build_model_from_state, InferenceDataset,
+    )
 
     # --- 1. Load checkpoint + its split hyper-parameters -------------------
     ckpt_path = resolve_checkpoint(args.checkpoint)
