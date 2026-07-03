@@ -4,7 +4,7 @@ This pipeline lets you build an AI model that can identify plant species from he
 
 The application has **two modes**, switchable from the toggle in the top-right of the window:
 
-- **☁ Cloud** *(default)* — orchestrates a rented GPU pod on RunPod from this UI. Recommended for everyone: training is faster on a 4090 than most local GPUs, costs a few US dollars per run, and needs no local GPU at all. Setup is one-time (see [cloud_setup.md](cloud_setup.md)).
+- **☁ Cloud** *(default)* — orchestrates a rented GPU pod on RunPod from this UI. Recommended for everyone: training is faster on a 4090 than most local GPUs, costs a few US dollars per run, and needs no local GPU at all. GPU compute becomes a disposable, ephemeral utility — the pod is provisioned on demand and auto-terminated, while your data and trained models persist on Cloudflare R2 and your local disk. Setup is one-time (see [cloud_setup.md](cloud_setup.md)).
 - **💻 Local** — runs the scripts on this machine. Requires an NVIDIA GPU with ≥20 GB VRAM for training the recommended ViT-Large model.
 
 This guide covers both modes. The five processing tabs (Download / Filter & Crop / Resize / Train / Identify) work the same way in either; what differs is *where* the work runs and which fields apply.
@@ -69,6 +69,8 @@ Click **Apply paths** and the application fills in sensible file paths for every
 ## Tab 1 — Download
 
 Downloads specimen images and metadata from [GBIF](https://www.gbif.org), the Global Biodiversity Information Facility.
+
+Think of it as a funnel: your inputs (taxon name, optional geographic filter, or a local DwC-A ZIP) feed a pool of parallel workers that fetch records and images, and out the bottom come two aligned outputs — a folder of JPEGs on disk and `specsin.csv`, one row per specimen.
 
 | Field | What to enter |
 |---|---|
@@ -195,7 +197,12 @@ Click **Run Training**.
 
 ## Tab 5 — Identify
 
-Runs the trained model over your images to sort unidentified specimens and flag possible mis-identifications.
+Runs the trained model over your images along two paths:
+
+- **Sorting the unknown** — specimens marked `indet=True` (no recorded species) are copied into `review/indets/<predicted species>/`, physically sorted by the model's top-1 prediction.
+- **Auditing the known** — specimens that already carry a label are checked against the model: where the top prediction disagrees with the recorded label (above the mismatch threshold), or confidence falls below the low-confidence threshold, the row is set `flagged=True` in `predictions.csv`.
+
+Every image gets a full top-5 row in `predictions.csv` either way.
 
 **Model section**
 

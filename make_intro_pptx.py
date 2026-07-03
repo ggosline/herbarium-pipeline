@@ -505,7 +505,7 @@ for i, (lbl, sub, col) in enumerate([
 txt(slide, "Key hyperparameters", Inches(0.4), ct + Inches(2.2),
     Inches(12), Inches(0.4), size=14, bold=True, color=TEAL_D)
 params = [
-    ("Model", "vit_large_patch16_dinov2\n(default)\nor efficientnet_b4 for speed"),
+    ("Model", "vit_large_patch16_dinov3\n(default)\nor efficientnet_b4 for speed"),
     ("Image size\n--image-sz", "640 px  (default)\n768 for highest accuracy\n512 for low VRAM"),
     ("Batch size", "4–8 on RTX 4090\nIncrease --grad-accum\nto compensate if reduced"),
     ("Stage 2 epochs", "15 (quick test)\n30 for production\n50 for large datasets"),
