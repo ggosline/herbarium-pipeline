@@ -330,6 +330,47 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
     return cleaned, model_name, num_classes, nameslist, geo_dim, label_level, temperature
 
 
+def build_model_from_state(state_dict: dict, model_name: str, num_classes: int,
+                           geo_dim: int) -> nn.Module:
+    """Reconstruct the inference model from a cleaned state_dict.
+
+    Mirrors the architecture in train_herbarium: a plain timm classifier, or a
+    backbone + geo_mlp + head geo model when geo_dim > 0. Returns an eval()
+    model on CPU. Shared by identify() and the calibration script so both
+    reconstruct weights identically.
+    """
+    if geo_dim:
+        backbone = timm.create_model(model_name, pretrained=False, num_classes=0)
+        feat_dim = backbone.num_features
+        geo_mlp = nn.Sequential(
+            nn.Linear(4, geo_dim), nn.GELU(), nn.Linear(geo_dim, geo_dim)
+        )
+        head = nn.Linear(feat_dim + geo_dim, num_classes)
+
+        backbone_sd = {k: v for k, v in state_dict.items()
+                       if not k.startswith(("geo_mlp.", "head."))}
+        geo_mlp_sd  = {k[len("geo_mlp."):]: v for k, v in state_dict.items()
+                       if k.startswith("geo_mlp.")}
+        head_sd     = {k[len("head."):]: v for k, v in state_dict.items()
+                       if k.startswith("head.")}
+
+        missing, _ = backbone.load_state_dict(backbone_sd, strict=False)
+        if missing:
+            print(f"  WARNING: backbone missing keys: {missing[:5]}")
+        geo_mlp.load_state_dict(geo_mlp_sd)
+        head.load_state_dict(head_sd)
+        model = _GeoModel(backbone, geo_mlp, head, geo_dim)
+        print(f"  Geo-capable model built (feat_dim={feat_dim}, geo_dim={geo_dim})")
+    else:
+        model = timm.create_model(model_name, pretrained=False, num_classes=num_classes)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if unexpected:
+            print(f"  Unexpected keys (ignored): {unexpected[:5]}")
+        if missing:
+            print(f"  WARNING: missing keys — weights not loaded for: {missing[:5]}")
+    return model.eval()
+
+
 # ---------------------------------------------------------------------------
 # Inference
 # ---------------------------------------------------------------------------
@@ -433,37 +474,7 @@ def identify(args):
 
     print(f"Building model: {model_name}  ({num_classes} classes)")
 
-    if geo_dim:
-        # Geo checkpoint: build backbone + geo_mlp + head separately so all
-        # weights load correctly and geo features can be used at inference.
-        backbone = timm.create_model(model_name, pretrained=False, num_classes=0)
-        feat_dim = backbone.num_features
-        geo_mlp = nn.Sequential(
-            nn.Linear(4, geo_dim), nn.GELU(), nn.Linear(geo_dim, geo_dim)
-        )
-        head = nn.Linear(feat_dim + geo_dim, num_classes)
-
-        backbone_sd = {k: v for k, v in state_dict.items()
-                       if not k.startswith(("geo_mlp.", "head."))}
-        geo_mlp_sd  = {k[len("geo_mlp."):]: v for k, v in state_dict.items()
-                       if k.startswith("geo_mlp.")}
-        head_sd     = {k[len("head."):]: v for k, v in state_dict.items()
-                       if k.startswith("head.")}
-
-        missing, _ = backbone.load_state_dict(backbone_sd, strict=False)
-        if missing:
-            print(f"  WARNING: backbone missing keys: {missing[:5]}")
-        geo_mlp.load_state_dict(geo_mlp_sd)
-        head.load_state_dict(head_sd)
-        base_model = _GeoModel(backbone, geo_mlp, head, geo_dim)
-        print(f"  Geo-capable model built (feat_dim={feat_dim}, geo_dim={geo_dim})")
-    else:
-        base_model = timm.create_model(model_name, pretrained=False, num_classes=num_classes)
-        missing, unexpected = base_model.load_state_dict(state_dict, strict=False)
-        if unexpected:
-            print(f"  Unexpected keys (ignored): {unexpected[:5]}")
-        if missing:
-            print(f"  WARNING: missing keys — weights not loaded for: {missing[:5]}")
+    base_model = build_model_from_state(state_dict, model_name, num_classes, geo_dim)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")

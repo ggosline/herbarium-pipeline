@@ -304,6 +304,15 @@ def _infer_on_gpu(repo: str, x: torch.Tensor,
             logits = model(x, g)
         else:
             logits = model(x)
+    # Temperature scaling (Guo et al. 2017): divide logits by a calibration
+    # temperature before softmax so confidences aren't pinned near 100%.
+    # T is per-model, stored in config.json; absent/invalid → 1.0 (unchanged).
+    try:
+        temperature = float(bundle["config"].get("temperature", 1.0)) or 1.0
+    except (TypeError, ValueError):
+        temperature = 1.0
+    if temperature != 1.0:
+        logits = logits / temperature
     return F.softmax(logits, dim=1).cpu()
 
 

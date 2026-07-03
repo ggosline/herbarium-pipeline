@@ -304,6 +304,15 @@ def main() -> int:
     print(f"   repo={repo}")
     print(f"   display_name={display_name}")
 
+    # Calibration temperature fitted at end of training (train_herbarium
+    # embeds it in the checkpoint). The Space applies softmax(logits / T);
+    # 1.0 for older checkpoints trained before calibration existed.
+    try:
+        temperature = round(float(ckpt.get("temperature", 1.0)) or 1.0, 4)
+    except (TypeError, ValueError):
+        temperature = 1.0
+    print(f"   temperature={temperature}")
+
     config = {
         "model_name":   model_name,
         "image_sz":     int(image_sz),
@@ -312,6 +321,7 @@ def main() -> int:
         "region":       args.region or "",
         "display_name": display_name,
         "num_classes":  len(nameslist),
+        "temperature":  temperature,
         "valid_loss":   round(metrics["valid_loss"], 4) if metrics.get("valid_loss") is not None else None,
         "val_accuracy": round(metrics["val_accuracy"], 4) if metrics.get("val_accuracy") is not None else None,
     }
