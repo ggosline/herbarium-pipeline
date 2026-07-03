@@ -228,6 +228,33 @@ Click **Run Identify**.
 
 ---
 
+## Publishing a model & identifying on a phone
+
+Once you have a trained checkpoint you can publish it to the [Hugging Face Hub](https://huggingface.co) so anyone — including you, from a phone in the field or the herbarium — can identify specimens through a web page, with no installation and no GPU.
+
+**How it works**
+
+- **Publish** — `space/push_model.py` slims the checkpoint (drops optimizer state, roughly a third of the size) and uploads three small files to a Hugging Face *model* repo: `model.ckpt`, `nameslist.json`, and a `config.json` (backbone name, image size, label rank, and a calibration temperature so confidences aren't over-stated). Example:
+
+  ```
+  python space/push_model.py \
+      --ckpt <project>/runs/checkpoints \
+      --family Ebenaceae --region Africa --label-level species \
+      --hf-user <your-hf-username>
+  ```
+
+  A one-time `huggingface-cli login` (or `HF_TOKEN`) with a write token is required.
+
+- **Discover** — every published repo is tagged `herbarium-pipeline`, so the public **herbarium-id** Space finds it automatically. No redeploy is needed — tap **⟳** in the Space to refresh the model list after publishing.
+
+- **Identify from a phone** — open the Space in any phone browser (**https://huggingface.co/spaces/ggosline/herbarium-id**), pick a model, tap the image box to photograph a herbarium sheet with the rear camera, and get the top-5 predictions with confidence in a second or two. For geo-aware models you can optionally enter latitude/longitude to sharpen the result.
+
+**Calibrated confidence:** the Space applies each model's `config.json` temperature (`softmax(logits / T)`) so the top prediction shows an honest probability instead of a near-100% value. New models get a fitted temperature automatically at publish time; existing models can be calibrated without retraining via `calibrate_temperature.py`.
+
+**Hosting note:** the Space itself runs on Hugging Face (free CPU tier is fine for occasional use; ZeroGPU is faster). The models can equally be served from other scale-to-zero platforms (RunPod Serverless, Google Cloud Run, Modal) since the weights live on the Hub and any host can pull them.
+
+---
+
 ## Review tab
 
 Loads a `predictions.csv` file and lets you browse predictions image by image. Filter by category (all, indets, flagged, mis-ID, high confidence) and sort by confidence or species name. You can correct individual determinations directly in the browser and save changes back to the CSV.

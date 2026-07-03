@@ -899,6 +899,77 @@ for i, s in enumerate(steps_f):
         size=12, color=DARK)
 
 
+# ── 17. Publish to Hugging Face & identify on a phone ─────────────────────
+slide, ct = header_slide("Publish & Identify on a Phone",
+    "Publish a trained model to the Hugging Face Hub — anyone identifies specimens from a phone browser, no install")
+
+# Flow: checkpoint → HF model repo → herbarium-id Space
+box(slide, "Trained\ncheckpoint\n.ckpt",
+    Inches(0.4), ct + Inches(0.25), Inches(2.5), Inches(1.05),
+    fill=TEAL_M, size=12, bold=True)
+arrow_h(slide, Inches(2.95), ct + Inches(0.77), Inches(1.35), color=TEAL_M,
+        label="push_model.py")
+box(slide, "Hugging Face Hub\nmodel repo",
+    Inches(4.4), ct + Inches(0.25), Inches(3.5), Inches(1.05),
+    fill=BLUE, size=12, bold=True, sub="model.ckpt · nameslist · config.json")
+arrow_h(slide, Inches(7.95), ct + Inches(0.77), Inches(1.35), color=BLUE,
+        label="auto-discovered")
+box(slide, "herbarium-id Space\nGradio · free CPU tier",
+    Inches(9.4), ct + Inches(0.25), Inches(3.5), Inches(1.05),
+    fill=TEAL_D, size=12, bold=True)
+
+# Left column — publishing
+txt(slide, "Publishing a model", Inches(0.4), ct + Inches(1.6),
+    Inches(6.0), Inches(0.4), size=14, bold=True, color=TEAL_D)
+bullets(slide, [
+    "push_model.py slims the checkpoint (drops optimizer, ~⅓ size) and uploads model.ckpt + nameslist.json + config.json",
+    "Repo tagged herbarium-pipeline → the Space discovers it automatically; tap ⟳ to refresh (no redeploy)",
+    "config.json carries image size, label rank, and a calibration temperature so confidence is honest, not ~100 %",
+    "One-time  huggingface-cli login  with a write token",
+], Inches(0.4), ct + Inches(2.05), Inches(6.1), Inches(2.6), size=12)
+
+rect(slide, Inches(0.4), ct + Inches(4.35), Inches(6.1), Inches(0.6), fill=DARK)
+txt(slide, "python space/push_model.py --ckpt … --family Ebenaceae --hf-user <you>",
+    Inches(0.55), ct + Inches(4.42), Inches(5.9), Inches(0.5),
+    size=10, color=TEAL_L)
+
+# Right column — on a phone (bullets + phone mockup)
+txt(slide, "On a phone", Inches(6.9), ct + Inches(1.6),
+    Inches(4.0), Inches(0.4), size=14, bold=True, color=TEAL_D)
+bullets(slide, [
+    "Open the Space URL in any phone browser — nothing to install",
+    "Pick a model, tap to photograph a sheet with the rear camera",
+    "Top-5 species / family + confidence in a second or two",
+    "Optional lat/lon sharpens geo-aware models",
+], Inches(6.9), ct + Inches(2.05), Inches(4.2), Inches(2.6), size=12)
+
+# Simple phone mockup on the far right
+ph_x, ph_y, ph_w, ph_h = Inches(11.4), ct + Inches(1.7), Inches(1.5), Inches(3.0)
+rrect(slide, ph_x, ph_y, ph_w, ph_h, fill=DARK)
+rect(slide, ph_x + Inches(0.1), ph_y + Inches(0.18), ph_w - Inches(0.2),
+     ph_h - Inches(0.36), fill=WHITE)
+rect(slide, ph_x + Inches(0.1), ph_y + Inches(0.18), ph_w - Inches(0.2),
+     Inches(0.32), fill=GREEN)
+txt(slide, "🌿 Herbarium ID", ph_x + Inches(0.12), ph_y + Inches(0.19),
+    ph_w - Inches(0.24), Inches(0.3), size=8, color=WHITE, align=PP_ALIGN.CENTER)
+rect(slide, ph_x + Inches(0.22), ph_y + Inches(0.62), ph_w - Inches(0.44),
+     Inches(0.95), fill=TEAL_BG, line_color=MGREY)
+txt(slide, "sheet\nphoto", ph_x + Inches(0.22), ph_y + Inches(0.88),
+    ph_w - Inches(0.44), Inches(0.5), size=8, color=GREY, align=PP_ALIGN.CENTER)
+for bi, frac in enumerate([0.9, 0.6, 0.4]):
+    by = ph_y + Inches(1.7 + bi * 0.32)
+    rect(slide, ph_x + Inches(0.22), by, (ph_w - Inches(0.44)) * frac,
+         Inches(0.2), fill=TEAL_M if bi == 0 else TEAL_L)
+
+# Bottom URL bar + published models
+rect(slide, Inches(0.4), H - Inches(1.15), Inches(12.53), Inches(0.55),
+     fill=TEAL_BG, line_color=TEAL_L)
+txt(slide, "Live now:  https://huggingface.co/spaces/ggosline/herbarium-id"
+    "     ·     models: africa-angiosperms-family · olacaceae-species · uvaria-species",
+    Inches(0.6), H - Inches(1.08), Inches(12.2), Inches(0.42),
+    size=12, bold=True, color=TEAL_D, align=PP_ALIGN.CENTER)
+
+
 # ── Save ──────────────────────────────────────────────────────────────────
 out = "herbarium_pipeline_intro.pptx"
 prs.save(out)
