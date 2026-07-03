@@ -429,20 +429,32 @@ class LitHerbarium(pl.LightningModule):
 
         self.train_metrics = _metrics(num_classes, "train_")
         self.valid_metrics = _metrics(num_classes, "val_")
-        self.criterion = nn.CrossEntropyLoss(weight=data.weights)
+        # Label smoothing caps the target probability below 1.0 so the network
+        # never learns to drive the correct logit to +inf — the main cause of
+        # over-confident (near-100%) softmax outputs. 0.0 = classic behaviour.
+        self.label_smoothing = float(config.get("label_smoothing", 0.0))
+        self.criterion = nn.CrossEntropyLoss(weight=data.weights,
+                                             label_smoothing=self.label_smoothing)
+
+        # Post-hoc temperature scaling (Guo et al. 2017): filled in after
+        # training by fit_temperature() and embedded in every checkpoint.
+        # _cal_* accumulate the most recent validation epoch's logits/targets.
+        self.temperature = 1.0
+        self._cal_logits: list = []
+        self._cal_targets: list = []
 
         if self.hierarchical:
             # Register lookup tensors as buffers so they move to GPU automatically
             if data.species_to_genus is not None and data.num_genus >= 2:
                 self.register_buffer("species_to_genus", data.species_to_genus)
-                self.criterion_genus = nn.CrossEntropyLoss()
+                self.criterion_genus = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
                 self.train_metrics_genus = _metrics(data.num_genus, "train_genus_")
                 self.valid_metrics_genus = _metrics(data.num_genus, "val_genus_")
             else:
                 self.species_to_genus = None
             if data.species_to_family is not None and data.num_family >= 2:
                 self.register_buffer("species_to_family", data.species_to_family)
-                self.criterion_family = nn.CrossEntropyLoss()
+                self.criterion_family = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
                 self.train_metrics_family = _metrics(data.num_family, "train_family_")
                 self.valid_metrics_family = _metrics(data.num_family, "val_family_")
             else:
@@ -452,6 +464,10 @@ class LitHerbarium(pl.LightningModule):
         checkpoint["nameslist"] = self._nameslist_payload
         checkpoint["use_location"] = self.use_location
         checkpoint["geo_dim"] = self.config.get("geo_dim", 0)
+        # 1.0 while training; patched to the fitted value after the run so
+        # checkpoints written mid-training also get the temperature (see the
+        # post-training embed loop in train()).
+        checkpoint["temperature"] = getattr(self, "temperature", 1.0)
 
     def on_load_checkpoint(self, checkpoint):
         sd = checkpoint["state_dict"]
@@ -498,7 +514,8 @@ class LitHerbarium(pl.LightningModule):
                     pass
                 delattr(self, attr)
 
-        self.criterion = nn.CrossEntropyLoss(weight=self.data.weights.to(self.device))
+        self.criterion = nn.CrossEntropyLoss(weight=self.data.weights.to(self.device),
+                                             label_smoothing=self.label_smoothing)
         cfg   = self.config
         sz    = cfg["image_sz"]
         batch = cfg["batch_size"]
@@ -584,6 +601,10 @@ class LitHerbarium(pl.LightningModule):
         opt = self.optimizers()
         if opt is not None:
             opt.zero_grad(set_to_none=True)
+        # Start fresh so _cal_* holds only this (most recent) epoch's logits,
+        # used to fit the calibration temperature after training.
+        self._cal_logits = []
+        self._cal_targets = []
 
     def on_train_epoch_end(self):
         self.log_dict(self.train_metrics.compute(), prog_bar=True, logger=True, sync_dist=True)
@@ -674,7 +695,50 @@ class LitHerbarium(pl.LightningModule):
                 getattr(self, "valid_metrics_family", None))
         else:
             self.valid_metrics.update(outputs, target)
+        # Stash species logits + targets (CPU) to fit the temperature later.
+        species_logits = outputs["species"] if isinstance(outputs, dict) else outputs
+        self._cal_logits.append(species_logits.detach().float().cpu())
+        self._cal_targets.append(target.detach().cpu())
         self.log("valid_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+
+    def fit_temperature(self, max_iter: int = 100) -> float:
+        """Fit a single softmax temperature on the last validation epoch's logits
+        (temperature scaling, Guo et al. 2017).
+
+        Minimises validation NLL over a scalar T, applied as softmax(logits / T).
+        T > 1 means the raw model was over-confident and probabilities get
+        softened; the argmax (and therefore accuracy) is unchanged. Returns 1.0
+        if no validation logits were collected. Runs on whatever logits this
+        rank saw — a subset under DDP, which is plenty for a single scalar.
+        """
+        if not self._cal_logits:
+            return 1.0
+        logits  = torch.cat(self._cal_logits).double()
+        targets = torch.cat(self._cal_targets).long()
+        if logits.numel() == 0:
+            return 1.0
+
+        log_T = torch.zeros(1, dtype=torch.double, requires_grad=True)  # T = exp(log_T) > 0
+        nll   = nn.CrossEntropyLoss()
+        opt   = torch.optim.LBFGS([log_T], lr=0.05, max_iter=max_iter)
+
+        def closure():
+            opt.zero_grad()
+            loss = nll(logits / log_T.exp(), targets)
+            loss.backward()
+            return loss
+
+        try:
+            opt.step(closure)
+            T = float(log_T.detach().exp().item())
+        except Exception as exc:
+            print(f"  Temperature fit failed ({exc}); falling back to T=1.0")
+            return 1.0
+        # Guard against degenerate fits; keep within a sane range.
+        if not (0.05 < T < 100.0):
+            print(f"  Temperature fit out of range (T={T:.3f}); falling back to T=1.0")
+            return 1.0
+        return T
 
 
 # ---------------------------------------------------------------------------
@@ -1057,6 +1121,40 @@ def train(config: dict):
     best_ckpt = (checkpoint_cb.best_model_path if checkpoint_cb
                  else str(output_dir / "checkpoints" / "last.ckpt"))
 
+    # ── Calibration: fit softmax temperature and embed it in the checkpoints ──
+    # Raw cross-entropy makes the network over-confident (top-1 ≈ 100%);
+    # temperature scaling divides logits by a single T fitted on validation so
+    # the reported probabilities are honest. Argmax/accuracy are unchanged.
+    # Only rank 0 fits and rewrites files (avoids DDP write races).
+    if last_trainer is None or last_trainer.is_global_zero:
+        temperature = lit.fit_temperature()
+        lit.temperature = temperature
+        print(f"\n  Calibration temp   : {temperature:.3f}  (identify uses softmax(logits / T))")
+
+        # Patch the checkpoints written during training so identify picks up the
+        # temperature automatically (they were saved with the placeholder 1.0).
+        ckpt_paths: set[str] = set()
+        for cb in (checkpoint_cb, acc_ckpt_cb):
+            if cb is not None and getattr(cb, "best_model_path", ""):
+                ckpt_paths.add(cb.best_model_path)
+        last_ck = output_dir / "checkpoints" / "last.ckpt"
+        if last_ck.exists():
+            ckpt_paths.add(str(last_ck))
+        for p in ckpt_paths:
+            try:
+                cd = torch.load(p, map_location="cpu", weights_only=False)
+                cd["temperature"] = temperature
+                torch.save(cd, p)
+            except Exception as exc:
+                print(f"  WARNING: could not embed temperature into {p}: {exc}")
+
+        # Also drop a small sidecar next to the nameslist for quick reference.
+        try:
+            (output_dir / "temperature.json").write_text(
+                json.dumps({"temperature": temperature}, indent=2))
+        except Exception as exc:
+            print(f"  WARNING: could not write temperature.json: {exc}")
+
     # Pull the last-epoch metrics off the trainer that actually ran most
     # recently. callback_metrics is populated as logs flow through the
     # Lightning logger, so it has whatever the last validation epoch saw.
@@ -1108,7 +1206,7 @@ DEFAULT_CONFIG = dict(
     seed=42,
     train_val_split=0.2,
     sparse_threshold=5,
-    model_name="vit_largeimage staging is done_patch16_dinov3.lvd1689m",
+    model_name="vit_large_patch16_dinov3.lvd1689m",
     pretrained=True,
     compile_model=True,
     image_sz=640,
@@ -1117,6 +1215,7 @@ DEFAULT_CONFIG = dict(
     stage2_lr=0.0001,
     stage2_epochs=20,
     min_lr=1e-6,
+    label_smoothing=0.1,
     batch_size=12,
     accum=1,
     cooldown_epochs=0,
@@ -1157,6 +1256,10 @@ def parse_args():
     p.add_argument("--cooldown-lr", type=float, default=DEFAULT_CONFIG["cooldown_lr"])
     p.add_argument("--cooldown-accum", type=int, default=DEFAULT_CONFIG["cooldown_accum"])
     p.add_argument("--min-lr", type=float, default=DEFAULT_CONFIG["min_lr"])
+    p.add_argument("--label-smoothing", type=float, default=DEFAULT_CONFIG["label_smoothing"],
+                   help="Cross-entropy label smoothing (default 0.1). Caps the target below 1.0 "
+                        "so the model doesn't become over-confident; 0.0 = classic behaviour. "
+                        "Also improves calibration and robustness to noisy labels.")
     p.add_argument("--num-gpus", type=int, default=DEFAULT_CONFIG["num_gpus"])
     p.add_argument("--num-workers", type=int, default=DEFAULT_CONFIG["num_workers"])
     p.add_argument("--seed", type=int, default=DEFAULT_CONFIG["seed"])
@@ -1234,6 +1337,7 @@ if __name__ == "__main__":
         cooldown_lr=args.cooldown_lr,
         cooldown_accum=args.cooldown_accum,
         min_lr=args.min_lr,
+        label_smoothing=args.label_smoothing,
         num_gpus=args.num_gpus,
         num_workers=args.num_workers,
         seed=args.seed,

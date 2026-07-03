@@ -228,10 +228,13 @@ def resolve_checkpoint(path: Path) -> Path:
 def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
     """Load a TimmModel from a Lightning checkpoint.
 
-    Returns (state_dict, model_name, num_classes, nameslist, geo_dim).
+    Returns (state_dict, model_name, num_classes, nameslist, geo_dim,
+    label_level, temperature).
     nameslist may be updated from the checkpoint if embedded there.
     geo_dim > 0 indicates the checkpoint uses a geo MLP; state_dict will
     contain geo_mlp.* keys in addition to backbone internals and head.*.
+    temperature is the fitted softmax calibration temperature (Guo et al.
+    2017); 1.0 for older checkpoints that were never calibrated.
     """
     num_classes = len(nameslist)
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -315,7 +318,16 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
     if label_level not in ("species", "genus", "family"):
         label_level = "species"
 
-    return cleaned, model_name, num_classes, nameslist, geo_dim, label_level
+    # Softmax calibration temperature fitted at the end of training.
+    # Absent on older checkpoints → 1.0 (no rescaling, original behaviour).
+    try:
+        temperature = float(ckpt.get("temperature", 1.0)) or 1.0
+    except (TypeError, ValueError):
+        temperature = 1.0
+    if temperature != 1.0:
+        print(f"  Calibration temperature: {temperature:.3f}")
+
+    return cleaned, model_name, num_classes, nameslist, geo_dim, label_level, temperature
 
 
 # ---------------------------------------------------------------------------
@@ -331,11 +343,15 @@ def run_inference(
     device: torch.device,
     top_k: int = 5,
     geo_coords: torch.Tensor | None = None,
+    temperature: float = 1.0,
 ) -> tuple[list[list[int]], list[list[float]]]:
     """Return (top_k_indices, top_k_probs) for each path.
 
     geo_coords: optional float32 Tensor [N, 4] aligned with paths.
     Passed to the model when provided (geo-capable checkpoints).
+    temperature: divides the logits before softmax (temperature scaling,
+    Guo et al. 2017). T>1 softens over-confident predictions; T=1 is a
+    no-op. Does not change the ranking, only the reported probabilities.
     """
     ds = InferenceDataset(paths, image_sz, geo_coords)
     loader = DataLoader(ds, batch_size=batch_size, num_workers=4,
@@ -349,6 +365,8 @@ def run_inference(
             logits = model(batch_tensors, batch_geo.to(device))
         else:
             logits = model(batch_tensors)
+        if temperature != 1.0:
+            logits = logits / temperature
         probs  = torch.softmax(logits, dim=1)
         k = min(top_k, probs.shape[1])
         topk_probs, topk_preds = torch.topk(probs, k=k, dim=1)
@@ -392,10 +410,18 @@ def identify(args):
         print(f"Loaded {len(nameslist)} class names from {args.nameslist}")
 
     # Load model weights (may update nameslist + num_classes from embedded data)
-    state_dict, ckpt_model_name, num_classes, nameslist, geo_dim, label_level = load_model(
+    state_dict, ckpt_model_name, num_classes, nameslist, geo_dim, label_level, ckpt_temperature = load_model(
         checkpoint_path, nameslist, args.image_sz
     )
     print(f"  Model rank: {label_level}")
+
+    # CLI --temperature overrides the value fitted at training time; otherwise
+    # use the checkpoint's (1.0 for uncalibrated checkpoints).
+    temperature = args.temperature if args.temperature is not None else ckpt_temperature
+    if temperature <= 0:
+        temperature = 1.0
+    if temperature != 1.0:
+        print(f"  Applying softmax temperature: {temperature:.3f}")
     if not nameslist:
         print("ERROR: no nameslist found. Pass --nameslist or use a checkpoint from a recent run.")
         sys.exit(1)
@@ -548,7 +574,8 @@ def identify(args):
         indet_paths = [Path(p) for p in df_indet["abs_path"]]
         topk_preds, topk_probs = run_inference(base_model, indet_paths, args.image_sz,
                                                args.batch_size, device,
-                                               geo_coords=_geo_for(df_indet))
+                                               geo_coords=_geo_for(df_indet),
+                                               temperature=temperature)
         topk_preds, topk_probs = geo_rerank(topk_preds, topk_probs, df_indet,
                                              geo_index, args.geo_weight, args.geo_sigma)
         for row, preds_k, probs_k in zip(df_indet.itertuples(), topk_preds, topk_probs):
@@ -581,7 +608,8 @@ def identify(args):
         ident_paths = [Path(p) for p in df_ident["abs_path"]]
         topk_preds, topk_probs = run_inference(base_model, ident_paths, args.image_sz,
                                                args.batch_size, device,
-                                               geo_coords=_geo_for(df_ident))
+                                               geo_coords=_geo_for(df_ident),
+                                               temperature=temperature)
         topk_preds, topk_probs = geo_rerank(topk_preds, topk_probs, df_ident,
                                              geo_index, args.geo_weight, args.geo_sigma)
         flagged_count = 0
@@ -663,6 +691,11 @@ def parse_args():
     p.add_argument("--low-conf-threshold", type=float, default=0.0,
                    help="Flag identified images below this confidence regardless of label "
                         "(0=disabled, e.g. 0.3 flags anything the model is unsure about)")
+    p.add_argument("--temperature", type=float, default=None,
+                   help="Override softmax temperature for calibration (divides logits before "
+                        "softmax). Default: use the value fitted during training and stored in "
+                        "the checkpoint (1.0 if none). >1 softens over-confident predictions; "
+                        "try 2-4 on an uncalibrated checkpoint to spread probability into the top-5.")
     p.add_argument("--geo-weight", type=float, default=0.0,
                    help="Weight for geographic reranking (0=off, 0.3 is a good starting point). "
                         "Blends model probability with a kernel density score from training "

@@ -307,7 +307,7 @@ def _qi_infer(ckpt_path: str, image_path: str,
 
     cache = _quick_id_cache
     if cache.get("ckpt") != ckpt_path:
-        state_dict, model_name, num_classes, nameslist, geo_dim, _label_level = load_model(
+        state_dict, model_name, num_classes, nameslist, geo_dim, _label_level, temperature = load_model(
             Path(ckpt_path), [], 640)
         if not model_name:
             model_name = model_name_hint.strip()
@@ -338,13 +338,14 @@ def _qi_infer(ckpt_path: str, image_path: str,
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.eval().to(device)
         cache.update(ckpt=ckpt_path, model=model, nameslist=nameslist,
-                     geo_dim=geo_dim, device=device)
+                     geo_dim=geo_dim, device=device, temperature=temperature)
         print(f"[Quick ID] Model loaded: {model_name}, {num_classes} classes, device={device}")
 
-    model     = cache["model"]
-    nameslist = cache["nameslist"]
-    geo_dim   = cache["geo_dim"]
-    device    = cache["device"]
+    model       = cache["model"]
+    nameslist   = cache["nameslist"]
+    geo_dim     = cache["geo_dim"]
+    device      = cache["device"]
+    temperature = cache.get("temperature", 1.0) or 1.0
 
     geo_coords = None
     try:
@@ -365,6 +366,8 @@ def _qi_infer(ckpt_path: str, image_path: str,
                 logits = model(imgs, geo.to(device))
             else:
                 logits = model(imgs)
+            if temperature != 1.0:
+                logits = logits / temperature
             probs  = torch.softmax(logits, dim=1)[0]
             top5   = torch.topk(probs, k=min(5, len(probs)))
             return [(nameslist[i], float(p))
