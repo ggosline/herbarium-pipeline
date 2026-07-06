@@ -230,17 +230,27 @@ venv_cache_key() {
 }
 
 venv_pull() {
-  # 0. Local short-circuit: if the volume already has a working venv,
-  #    use it regardless of cache-key match. The key only changes when
-  #    pyproject.toml/uv.lock change — code-only changes don't invalidate
-  #    the venv, and re-pulling from R2 is pure overhead (and destructive
-  #    when the R2 tarball is corrupt).
+  # 0. Local short-circuit: reuse the on-volume venv only when its stamped
+  #    cache key EXACTLY matches what this pod needs. The key is lockfile+hw
+  #    only, so code-only changes don't change it — a matching venv is safe to
+  #    reuse without re-pulling. But a mismatch must NOT be reused: a venv
+  #    built on a different pod can carry a CUDA-major-specific DALI wheel
+  #    (nvidia-dali-cudaXY0) that the current driver can't run. The old code
+  #    reused "regardless of key" and re-stamped it, which silently ran a
+  #    cuda130-DALI venv on a CUDA-12.8 driver → cudaErrorInsufficientDriver
+  #    (35). On mismatch we now drop the stale venv and re-pull the correct one.
   local key
   key=$(venv_cache_key)
   if [ -f /workspace/venv/bin/python ]; then
-    echo "✓ /workspace/venv exists — stamping cache key and skipping pull"
-    echo "$key" > /workspace/venv/.cache_key
-    return 0
+    local have=""
+    [ -f /workspace/venv/.cache_key ] && have=$(cat /workspace/venv/.cache_key 2>/dev/null)
+    if [ "$have" = "$key" ]; then
+      echo "✓ /workspace/venv matches $key — skipping pull"
+      return 0
+    fi
+    echo "⚠ /workspace/venv has key '${have:-none}' but this pod needs '$key' "
+    echo "  (may carry a CUDA/DALI build the driver can't run) — replacing it."
+    rm -rf /workspace/venv
   fi
   if ! command -v rclone >/dev/null; then
     echo "rclone not installed yet — skipping venv pull"
