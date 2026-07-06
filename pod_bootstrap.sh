@@ -824,6 +824,42 @@ activate() {
   mkdir -p "$PYTHONPYCACHEPREFIX" 2>/dev/null || true
 }
 
+# Fail fast (with a plain-English message) when the active venv's DALI build
+# needs a newer CUDA driver than this pod has. DALI wheels are CUDA-major
+# specific (nvidia-dali-cudaN0): a cudaN build runs on any driver whose max
+# CUDA >= N, and fails with the cryptic cudaErrorInsufficientDriver (35) deep
+# inside DALI pipeline construction when N > the driver's CUDA major. Because
+# the venv is shared across pods via the network volume, a venv built on a
+# CUDA-13 host can land on a CUDA-12 host — this catches that up front.
+# Call after activate(). Returns non-zero on a hard mismatch.
+_check_cuda_compat() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+  local drv_cuda drv_major
+  drv_cuda=$(nvidia-smi 2>/dev/null | grep -oP 'CUDA Version:\s*\K[0-9]+\.[0-9]+' | head -1)
+  drv_major=${drv_cuda%%.*}
+  case "$drv_major" in ''|*[!0-9]*) return 0 ;; esac        # unparseable → skip
+  local site dali_info dali_num dali_major
+  site=$(ls -d "$LOCAL_VENV"/lib/python*/site-packages 2>/dev/null | head -1)
+  [ -d "$site" ] || site=$(ls -d /workspace/venv/lib/python*/site-packages 2>/dev/null | head -1)
+  [ -d "$site" ] || return 0
+  dali_info=$(ls -d "$site"/nvidia_dali_cuda*.dist-info 2>/dev/null | head -1)
+  [ -n "$dali_info" ] || { echo "  (no nvidia-dali in venv — skipping DALI/driver check)"; return 0; }
+  dali_num=$(basename "$dali_info" | grep -oP 'cuda\K[0-9]+' | head -1)
+  case "$dali_num" in ''|*[!0-9]*) return 0 ;; esac
+  dali_major=${dali_num%0}                                  # 130 → 13, 120 → 12
+  if [ "$dali_major" -gt "$drv_major" ]; then
+    echo "✗ CUDA mismatch: this venv has nvidia-dali-cuda${dali_num} (needs a CUDA"
+    echo "  ${dali_major}.x driver) but the pod's driver supports only CUDA ${drv_cuda}."
+    echo "  DALI pipeline construction would fail with cudaErrorInsufficientDriver (35)."
+    echo "  Fix on the pod, then retry:"
+    echo "    rm -rf /workspace/venv /root/venv && bash $REPO/pod_bootstrap.sh setup"
+    echo "  (re-pulls the cuda120 venv, which runs on any CUDA-12+ driver)."
+    return 1
+  fi
+  echo "  CUDA compat OK: nvidia-dali-cuda${dali_num} on driver CUDA ${drv_cuda}."
+  return 0
+}
+
 # ─── step 1: download (runs fine on a CPU pod) ────────────────────────────
 download() {
   activate
@@ -1019,6 +1055,7 @@ train() {
   # the first run is a sub-second cache_key check.
   mirror_venv_local || echo "⚠ venv mirror skipped — imports will be slower."
   activate
+  _check_cuda_compat || exit 3
   cd "$REPO"
 
   MODEL="${MODEL:-vit_large_patch16_dinov3.lvd1689m}"
@@ -1109,6 +1146,7 @@ identify() {
   # from the venv mirror. Cached after first run.
   mirror_venv_local || echo "⚠ venv mirror skipped — imports will be slower."
   activate
+  _check_cuda_compat || exit 3
   # Pick the most recent .ckpt unless caller passed CKPT_FILE explicitly.
   : "${CKPT_FILE:=$(ls -t "$CKPT"/*.ckpt | head -1)}"
   # Tunables — override via env (the webui's Identify-tab Run button ships
