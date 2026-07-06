@@ -151,6 +151,13 @@ GPU_BY_PURPOSE: dict[str, list[str]] = {
         "NVIDIA H100 PCIe",               # 80 GB — overkill but fine if free
         "NVIDIA H100 NVL",                # 94 GB — H100 variant
         "NVIDIA H100 80GB HBM3",          # 80 GB — SXM H100 variant
+        # Blackwell (sm_120), 96 GB — huge, but brand-new: the cuda120 DALI in
+        # the shared venv may lack native Blackwell kernels and rely on PTX JIT.
+        # Kept above the 4090 (prefer 96 GB over 24 GB) but below every
+        # known-cuda120-safe card. If DALI throws an arch error here, reorder
+        # below the 4090 or give Blackwell pods a pod-local cuda130 DALI.
+        "NVIDIA RTX PRO 6000 Blackwell Server Edition",       # 96 GB
+        "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",  # 96 GB
         "NVIDIA GeForce RTX 4090",        # 24 GB — cheap last resort
     ],
 }
