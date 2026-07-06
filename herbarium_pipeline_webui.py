@@ -3312,6 +3312,20 @@ async def _do_provision(purpose: str | None = None) -> None:
     gs = app.storage.general
     pur = purpose or (gs.get("cloud_purpose") or "light")
     gpu = (gs.get("cloud_gpu_override") or "").strip() or None
+    # A global GPU override (Cloud Tools) otherwise replaces the whole purpose
+    # fallback list — including on a light→train upgrade, which would then
+    # "upgrade" the pod straight back onto a light-tier card and defeat the
+    # point. When provisioning a train pod, drop an override that's a light
+    # GPU; a deliberate train-GPU override still stands.
+    if gpu and pur == "train":
+        from cloud.orchestrator import GPU_BY_PURPOSE as _GBP
+        if gpu in _GBP.get("light", []):
+            _cloud_warn(
+                f"Ignoring GPU override '{gpu}' for the train pod — it's a "
+                f"light-tier card, so honouring it would cancel the upgrade. "
+                f"Using the train GPU list. Clear the override in Cloud Tools, "
+                f"or set it to a train GPU to force a specific one.")
+            gpu = None
     dc = (gs.get("cloud_datacenter") or "").strip() or DEFAULT_DATACENTER
     try:
         vol_gb = int(gs.get("cloud_volume_gb") or DEFAULT_VOLUME_GB)
