@@ -165,15 +165,17 @@ hf_cache_push() {
 }
 
 # ─── full-venv cache (R2) ─────────────────────────────────────────────────
-# The assembled venv is project-independent: same lockfile + same Python +
-# same CUDA major → identical bits. We tar it once and pull it directly on
-# fresh pods so `uv sync --frozen` doesn't have to re-link wheels into a
-# venv (~1 min per pod) and DALI doesn't have to be re-installed (~30 s).
+# The assembled venv is project-independent: same lockfile → identical bits.
+# We tar it once and pull it directly on fresh pods so `uv sync --frozen`
+# doesn't have to re-link wheels into a venv (~1 min per pod) and DALI doesn't
+# have to be re-installed (~30 s).
 #
-# Cache key components (any change → different key, fresh build, fresh push):
-#   - Python major.minor (from $UV_PROJECT_ENVIRONMENT/bin/python or system)
-#   - CUDA major (so a cuda12 venv isn't pulled onto a cuda13 pod)
-#   - sha256 of pyproject.toml + uv.lock
+# Cache key = venv-<hw>-<lockhash> (see venv_cache_key for the full rationale):
+#   - hw: "cuda120" for any GPU pod, "cpu" otherwise. NOT the driver's CUDA
+#     version — torch is cu12x and DALI is pinned to cuda120, so a GPU venv is
+#     driver-version-independent.
+#   - lockhash: CRLF-normalised sha256 of pyproject.toml + uv.lock *contents*
+#     (path-independent), covering Python version via requires-python.
 #
 # Stored at $CACHE_REMOTE/venvs/<key>.tar (uncompressed — wheels are already
 # binary, gzip would burn CPU for ~5% saving). Stream with rclone cat / rcat
@@ -181,12 +183,20 @@ hf_cache_push() {
 
 venv_cache_key() {
   # Cache key components:
-  #   - cuda_major: DALI is installed outside the lock (wheel name varies
-  #     per CUDA major). A cuda12 venv has cuda12 DALI bytes; a cuda13 pod
-  #     can't use them.
-  #   - lock_hash: hashes pyproject.toml + uv.lock. requires-python is in
-  #     pyproject.toml, so the python version dimension is implicitly
-  #     covered — change requires-python and the key changes.
+  #   - hw: "cuda120" for any GPU pod, "cpu" otherwise. We deliberately do
+  #     NOT stamp the driver's CUDA version. torch is pinned to a cu12x build
+  #     in the lock, and DALI is pinned to the cuda120 wheel (which runs on
+  #     ANY CUDA-12+ driver via backward compatibility) — so the venv is
+  #     identical regardless of whether the pod's driver reports CUDA 12, 13,
+  #     … Stamping nvidia-smi's version fragmented the cache and forced a full
+  #     rebuild on every driver bump. The only hardware axis that changes the
+  #     venv bytes is GPU (has DALI) vs CPU (no DALI).
+  #   - lock_hash: hashes pyproject.toml + uv.lock *contents*, with CRLF
+  #     stripped so a Windows (CRLF) and a Linux (LF) checkout of the same
+  #     lockfile produce the same key — and NOT via `sha256sum <path>`, whose
+  #     output embeds the file path ($REPO) and so changed the key if the repo
+  #     ever moved. requires-python lives in pyproject.toml, so the Python
+  #     version dimension is implicitly covered.
   #
   # We deliberately do NOT stamp `python3 --version` because uv may install
   # its own python (when system python is too old) which differs from
@@ -199,21 +209,23 @@ venv_cache_key() {
     echo "$VENV_CACHE_KEY"
     return
   fi
-  local cuda_major="${CUDA_MAJOR:-}"
-  if [ -z "$cuda_major" ]; then
-    if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
-      cuda_major=$(nvidia-smi | grep -oP 'CUDA Version:\s*\K[0-9]+' | head -1)
+  # GPU vs CPU is the only hardware dimension that matters (see above).
+  local hw="cuda120"
+  local cm="${CUDA_MAJOR:-}"
+  if [ -z "$cm" ]; then
+    if ! { command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; }; then
+      cm="cpu"
     fi
-    : "${cuda_major:=cpu}"
   fi
+  [ "$cm" = "cpu" ] && hw="cpu"
   local lock_hash
   if [ -f "$REPO/uv.lock" ] && [ -f "$REPO/pyproject.toml" ]; then
-    lock_hash=$(sha256sum "$REPO/pyproject.toml" "$REPO/uv.lock" \
+    lock_hash=$(cat "$REPO/pyproject.toml" "$REPO/uv.lock" | tr -d '\r' \
                   | sha256sum | cut -c1-12)
   else
     lock_hash="nolock"
   fi
-  VENV_CACHE_KEY="venv-cuda${cuda_major}-${lock_hash}"
+  VENV_CACHE_KEY="venv-${hw}-${lock_hash}"
   export VENV_CACHE_KEY
   echo "$VENV_CACHE_KEY"
 }
@@ -337,15 +349,26 @@ venv_push() {
     suffix="tar.zst"
   fi
   local remote="$CACHE_REMOTE/venvs/${key}.${suffix}"
+  local remote_tmp="${remote}.uploading"
   local size
   size=$(du -sh /workspace/venv 2>/dev/null | cut -f1)
   echo "→ Pushing /workspace/venv ($size on disk, $compressor compression) → $remote..."
-  # Stream tar → zstd → R2. rclone rcat reads stdin; multipart-tuned for throughput.
-  if tar -cf - -C /workspace venv | $compressor | rclone rcat "$remote" \
-       "${RCLONE_VENV_FLAGS[@]}" 2>&1 | tail -5; then
+  # Stream tar → zstd → R2, but to a temporary object first, then atomically
+  # move it onto the real key. rcat writes straight to its destination, so an
+  # interrupted push (pod reaped, watchdog, network blip) would otherwise
+  # leave the *real* key truncated — poisoning every future fast path and
+  # forcing the slow wheel-rebuild (exactly the 10-min corruption we hit).
+  # A dead push now leaves only an orphan .uploading object, which the next
+  # push overwrites; the real key only ever appears fully-formed.
+  # pipefail makes the pipeline's status reflect rcat (not the trailing tail),
+  # so the move only runs when the upload genuinely completed.
+  if tar -cf - -C /workspace venv | $compressor | rclone rcat "$remote_tmp" \
+       "${RCLONE_VENV_FLAGS[@]}" 2>&1 | tail -5 \
+     && rclone moveto "$remote_tmp" "$remote" 2>&1 | tail -2; then
     echo "✓ Venv push done"
   else
-    echo "⚠ Venv push had errors — non-fatal" >&2
+    echo "⚠ Venv push had errors — non-fatal (real cache key untouched)" >&2
+    rclone deletefile "$remote_tmp" 2>/dev/null || true
   fi
 }
 
@@ -428,15 +451,16 @@ setup() {
     export PATH="$HOME/.local/bin:$PATH"
   fi
 
-  # 5. CUDA major detection. Needed for the venv cache key (so a cuda12 tar
-  #    isn't pulled onto a cuda13 pod) AND for the DALI install in the slow
-  #    path. nvidia-smi reports what the host driver supports — what DALI
-  #    needs to match — whereas nvcc would report the container toolkit.
+  # 5. GPU-vs-CPU detection. CUDA_MAJOR only distinguishes a GPU pod ("12",
+  #    or any number → GPU venv with DALI) from a CPU pod ("cpu" → no DALI);
+  #    the specific driver CUDA version no longer feeds the cache key (torch
+  #    is cu12x, DALI is pinned to cuda120 — see venv_cache_key). We still log
+  #    the driver-reported version for diagnostics.
   if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
     CUDA_VER=$(nvidia-smi | grep -oP 'CUDA Version:\s*\K[0-9]+\.[0-9]+' | head -1)
     CUDA_MAJOR=${CUDA_VER%%.*}
     : "${CUDA_MAJOR:=12}"   # fallback if header format ever changes
-    echo "Detected CUDA $CUDA_VER (driver-supported)"
+    echo "Detected CUDA $CUDA_VER (driver-supported) → GPU venv (DALI cuda120)"
   else
     CUDA_MAJOR="cpu"
     echo "No GPU detected — using CPU venv key. Training will not work here."
@@ -459,16 +483,18 @@ setup() {
     #     cache can take an hour on a slow PyPI path.
     uv sync --frozen
 
-    # 6c. DALI — installed outside the lock because the wheel name depends
-    #     on the pod's CUDA version.
+    # 6c. DALI — installed outside the lock (it's not in pyproject.toml).
+    #     Pinned to the cuda120 wheel regardless of the pod's driver: torch is
+    #     already a cu12x build, and cuda120 DALI runs on ANY CUDA-12+ driver
+    #     (backward compatibility). Pinning keeps ONE canonical GPU venv that
+    #     every pod reuses, instead of one venv per driver CUDA version — the
+    #     over-fragmentation that used to force needless slow-path rebuilds.
     if [ "$CUDA_MAJOR" != "cpu" ]; then
-      echo "Installing nvidia-dali-cuda${CUDA_MAJOR}0..."
+      echo "Installing nvidia-dali-cuda120..."
       DALI_ARGS=(--python "$UV_PROJECT_ENVIRONMENT/bin/python" \
                  --extra-index-url https://developer.download.nvidia.com/compute/redist \
                  --only-binary=:all:)
-      uv pip install "${DALI_ARGS[@]}" "nvidia-dali-cuda${CUDA_MAJOR}0" \
-        || { echo "DALI cuda${CUDA_MAJOR}0 wheel unavailable; falling back to cuda120"; \
-             uv pip install "${DALI_ARGS[@]}" nvidia-dali-cuda120; }
+      uv pip install "${DALI_ARGS[@]}" nvidia-dali-cuda120
     else
       echo "Skipping DALI install on CPU pod."
     fi
