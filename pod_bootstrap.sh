@@ -693,6 +693,43 @@ _mirror_uv_python() {
   echo "$dst"
 }
 
+# Populate $1 (a fresh /root/venv.new) by streaming the venv tarball straight
+# from R2 to local NVMe, decompressing + untarring in one pass. This bypasses
+# the per-file rsync off MooseFS — reading 30k+ small site-packages files over
+# MFS runs ~25 MB/s (metadata-bound), whereas the 3.6 GB compressed R2 object
+# is one sequential stream. Returns 0 on success; any miss/error → 1 so the
+# caller falls back to the rsync path. Post-processing (shebang/interpreter
+# rewrite in mirror_venv_local) is identical either way — the tarball carries
+# the same /workspace-relative paths the volume venv has.
+_local_venv_from_r2() {
+  local dst_new=$1
+  command -v rclone >/dev/null || return 1
+  local key; key=$(venv_cache_key)
+  local remote_zst="$CACHE_REMOTE/venvs/${key}.tar.zst"
+  local remote_tar="$CACHE_REMOTE/venvs/${key}.tar"
+  local remote="" decompress=""
+  if rclone lsf "$remote_zst" >/dev/null 2>&1; then
+    command -v zstd >/dev/null || return 1
+    remote="$remote_zst"; decompress="zstd -d -T0"
+  elif rclone lsf "$remote_tar" >/dev/null 2>&1; then
+    remote="$remote_tar"; decompress="cat"
+  else
+    return 1
+  fi
+  echo "→ Fetching local venv from R2 $remote (skips MooseFS rsync)..."
+  rm -rf "$dst_new"; mkdir -p "$dst_new"
+  if ! rclone cat "$remote" | $decompress | tar -xf - --strip-components=1 -C "$dst_new"; then
+    echo "  ⚠ R2 venv fetch failed — falling back to MooseFS rsync"
+    rm -rf "$dst_new"; return 1
+  fi
+  if [ ! -f "$dst_new/bin/activate" ]; then
+    echo "  ⚠ R2 venv incomplete (no bin/activate) — falling back to rsync"
+    rm -rf "$dst_new"; return 1
+  fi
+  echo "  ✓ Local venv extracted from R2"
+  return 0
+}
+
 mirror_venv_local() {
   _ensure_rsync
   local src=/workspace/venv
@@ -713,9 +750,13 @@ mirror_venv_local() {
   local size
   size=$(du -sh "$src" 2>/dev/null | cut -f1)
   echo "→ Mirroring venv $src → $dst ($size)..."
-  rm -rf "$dst.new"
-  mkdir -p "$dst.new"
-  _rsync_piped "$src/" "$dst.new/"
+  # Fast path: stream the compressed venv from R2 straight to local NVMe.
+  # Fall back to the per-file MooseFS rsync only if R2 is missing/unusable.
+  if ! _local_venv_from_r2 "$dst.new"; then
+    rm -rf "$dst.new"
+    mkdir -p "$dst.new"
+    _rsync_piped "$src/" "$dst.new/"
+  fi
   # uv writes absolute shebangs into bin/ entry-point scripts. Rewrite so
   # `wandb` etc. invoke the local python and import from local site-packages.
   find "$dst.new/bin" -maxdepth 1 -type f \
