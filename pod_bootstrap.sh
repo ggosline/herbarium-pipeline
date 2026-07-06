@@ -25,7 +25,6 @@ CKPT=$DATA/checkpoints
 SPECSIN=$DATA/specsin.csv
 DWCA=$DATA/gbif.zip               # set to "" to use API (--family) instead
 
-TAXON_FAMILY="Rubiaceae"          # used only when DWCA is empty
 WANDB_PROJECT="herbarium"
 R2_REMOTE="r2:herbarium-backup"
 REPO_URL="https://github.com/ggosline/herbarium-pipeline.git"
@@ -836,15 +835,33 @@ download() {
       --workers "$WORKERS" \
       "${GEO[@]}" \
       "${EXTRA[@]}"
-  else
-    echo "No DwC-A or specsin found — falling back to GBIF API (--family $TAXON_FAMILY)"
+  elif [ -n "${TAXON:-}" ]; then
+    # Single taxon from the Download tab's rank + name box.
+    #   RANK ∈ family | genus | order   (defaults to family)
+    # family/genus query the live GBIF occurrence API; order resolves the
+    # order's taxon key and pulls a bulk DwC-A (needs GBIF creds, forwarded
+    # by the orchestrator). The download script writes order DwC-As to a
+    # taxon-named zip next to the specsin, so re-runs of the same order reuse
+    # it without clobbering an uploaded gbif.zip.
+    RANK="${RANK:-family}"
+    GEO=()
+    [ -n "${CONTINENT:-}" ]         && GEO+=(--continent "$CONTINENT")
+    [ -n "${EXCLUDE_COUNTRIES:-}" ] && GEO+=(--exclude-countries $EXCLUDE_COUNTRIES)
+    [ -n "${COUNTRIES:-}" ]         && GEO+=(--countries $COUNTRIES)
+    echo "GBIF download for $RANK: $TAXON"
+    # shellcheck disable=SC2086  # word-split on country lists is intentional
     python -u "$REPO/download_gbif_images.py" \
-      --family "$TAXON_FAMILY" \
+      --"$RANK" "$TAXON" \
       --output-dir "$IMG_RAW" \
       --specsin "$SPECSIN" \
       --iiif-size "$IIIF" \
       --workers "$WORKERS" \
+      "${GEO[@]}" \
       "${EXTRA[@]}"
+  else
+    echo "ERROR: nothing to download. Set a taxon (rank + name) or a families" >&2
+    echo "list in the Download tab, upload a DwC-A, or provide a specsin." >&2
+    exit 2
   fi
 }
 

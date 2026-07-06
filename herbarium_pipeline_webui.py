@@ -3218,7 +3218,13 @@ def _env_from_gs(mapping: dict[str, object], *, drop_zero: bool = True) -> dict[
 
 
 def _cloud_env_download() -> dict[str, str]:
+    # RANK + TAXON drive a single-taxon download (family / genus / order) from
+    # the rank radio + name box. TAXON_FAMILIES (the "Families (multi)" field)
+    # takes precedence on the pod when set — matching the UI note that the
+    # families list overrides the taxon name.
     return _env_from_gs({
+        "RANK":              "dl_rank",
+        "TAXON":             "dl_taxon",
         "TAXON_FAMILIES":    "dl_families",
         "CONTINENT":         "dl_continent",
         "EXCLUDE_COUNTRIES": "dl_exc",
