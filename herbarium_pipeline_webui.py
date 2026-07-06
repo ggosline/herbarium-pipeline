@@ -3341,6 +3341,13 @@ async def _do_provision(purpose: str | None = None) -> None:
     _cloud["purpose"] = pur
     await orch.sync_code(pod, on_log=_cloud_log)
     _refresh_cloud_status()
+    # Provision only creates + preps the pod; it does NOT run setup/training.
+    # Say so explicitly — otherwise the log ends silently after the last sync
+    # line and reads like a hang.
+    _cloud_log(
+        f"✓ Pod ready ({pur}, ${pod.cost_per_hr:.2f}/hr). Provision only sets up "
+        f"the pod — click Run Training, a pipeline step, or Run Full Pipeline "
+        f"to continue.")
 
 
 async def _do_attach() -> None:
