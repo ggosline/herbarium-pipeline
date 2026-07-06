@@ -2570,6 +2570,22 @@ def _build_setup() -> None:
         "Full step-by-step guide: cloud_setup.md."
     ).classes("text-body2").style("color:#455a64;max-width:820px")
 
+    # ── Execution mode (advanced) ────────────────────────────────────────
+    # The pipeline runs on a RunPod GPU pod by default. Local mode runs the
+    # scripts as subprocesses on this machine and needs a ~20 GB CUDA GPU for
+    # training — rarely used, so it's tucked away here rather than in the
+    # header where it confused new users.
+    with ui.expansion("Execution mode (advanced)", icon="tune")\
+            .classes("w-full").style("max-width:820px"):
+        ui.label(
+            "Cloud (default) orchestrates a RunPod GPU pod from this UI — "
+            "no local GPU needed. Local runs each step as a subprocess on "
+            "this machine and needs an NVIDIA GPU with ~20 GB VRAM to train."
+        ).classes("text-caption text-grey-7 mb-1")
+        (ui.toggle({"cloud": "☁ Cloud", "local": "💻 Local"})
+            .props("dense color=teal toggle-color=teal-9")
+            .bind_value(app.storage.general, "main_mode"))
+
     # ── Local environment ───────────────────────────────────────────────
     env_card, env_pill = _setup_card("computer", "Local environment")
     with env_card:
@@ -3649,8 +3665,9 @@ def _confirm_train_upgrade(then_run: callable) -> None:
         ui.label("Switch to a train pod?").classes("text-h6")
         ui.label(
             "Training needs a beefier GPU. We'll terminate the current "
-            "light pod (volume + downloaded images preserved) and "
-            "provision an A100 (80 GB)."
+            "light pod (volume + downloaded images preserved) and provision a "
+            "train pod — first free of RTX A6000 / 6000 Ada / L40S / A100 / "
+            "H100 / 4090."
         ).classes("text-body2 mt-1").style("max-width:520px")
         dont_ask = ui.checkbox("Don't ask again — auto-upgrade for future trainings",
                                value=False)
@@ -3745,7 +3762,7 @@ def _build_pod_strip() -> None:
         ui.space()
 
         ui.label("Purpose:").classes("text-caption").style("color:#b2dfdb")
-        ui.select({"light": "light (L4)", "train": "train (A100)"},
+        ui.select({"light": "light (L4)", "train": "train (A6000+)"},
                   value=gs.get("cloud_purpose") or "light")\
             .props("dense outlined dark options-dense")\
             .classes("w-44").bind_value(gs, "cloud_purpose")
@@ -3760,10 +3777,20 @@ def _build_pod_strip() -> None:
             if override:
                 return f"GPU: {override} (override)"
             purp = gs.get("cloud_purpose") or "light"
-            return f"GPU: {_GPU_BY_PURPOSE.get(purp, '?')} (auto)"
+            gpus = _GPU_BY_PURPOSE.get(purp) or []
+            if not gpus:
+                return "GPU: ? (auto)"
+            first = gpus[0].replace("NVIDIA ", "")
+            extra = f" +{len(gpus) - 1} fallback" if len(gpus) > 1 else ""
+            return f"GPU: {first}{extra} (auto)"
         gpu_lbl = ui.label(_gpu_label_text())\
             .classes("text-caption font-mono")\
             .style("color:#b2dfdb;border-left:2px solid #4db6ac;padding-left:6px")
+        gpu_lbl.tooltip(
+            "Provision offers RunPod this GPU plus fallbacks, in order; it "
+            "places on the first one that's free — so a busy top card no "
+            "longer fails the launch. For a fresh project it also tries other "
+            "datacenters. Set a specific GPU in Cloud Tools to override.")
         def _refresh_gpu_lbl() -> None:
             gpu_lbl.set_text(_gpu_label_text())
         # Re-render on either control change. NiceGUI propagates gs changes
@@ -3784,18 +3811,30 @@ def _build_pod_strip() -> None:
         ui.button("Provision", icon="cloud_upload",
                   on_click=lambda: _wrap_cloud(_do_provision))\
             .props("dense color=teal-3 unelevated")\
-            .tooltip("Create or reuse a pod for this project, sync code, "
-                     "push wandb / R2 keys.")
-        with ui.row().classes("items-center gap-1"):
-            pod_id_inp = ui.input(value="", placeholder="Pod ID")\
-                .props("dense outlined dark").classes("w-52")\
+            .tooltip("Auto-provision a pod: offers RunPod the GPU fallback "
+                     "list (first free one wins), creates/reuses the volume, "
+                     "syncs code, pushes wandb / R2 keys. If every card is "
+                     "busy, use 'existing pod' on the right instead.")
+        # Manual pod path — a first-class equal to Provision. When every GPU
+        # in the fallback list is busy you make a pod in the RunPod console
+        # and paste its ID here; everything downstream is identical.
+        with ui.row().classes("items-center gap-1")\
+                .style("border-left:2px solid #4db6ac;padding-left:8px"):
+            ui.label("or existing pod:").classes("text-caption")\
+                .style("color:#b2dfdb")
+            pod_id_inp = ui.input(value="", placeholder="paste Pod ID")\
+                .props("dense outlined dark").classes("w-44")\
                 .style("font-size:11px; color:#e0f2f1")\
-                .bind_value(gs, "cloud_attach_pod_id")
+                .bind_value(gs, "cloud_attach_pod_id")\
+                .tooltip("Made a pod yourself in the RunPod console? Paste its "
+                         "ID (the code in the console URL / pod card). Attach "
+                         "connects, syncs code and starts the idle watchdog — "
+                         "then Download / Prep / Train work exactly as with an "
+                         "auto-provisioned pod.")
             ui.button("Attach", icon="link",
                       on_click=lambda: _wrap_cloud(_do_attach))\
-                .props("dense flat color=teal-2")\
-                .tooltip("Connect to an existing pod by its RunPod ID "
-                         "(from the console URL or pod list).")
+                .props("dense color=teal-2 unelevated")\
+                .tooltip("Connect to the pod whose ID is in the box.")
         ui.button("Upload DwC-A", icon="archive",
                   on_click=lambda: _wrap_cloud_aux(_do_upload_dwca))\
             .props("dense flat color=teal-2")\
@@ -4561,15 +4600,20 @@ def main_page():
             with ui.row().classes("w-full items-center justify-between"):
                 ui.label("Herbarium Classification Pipeline").classes("text-h6 font-bold")
                 with ui.row().classes("items-center gap-4"):
-                    # Mode toggle — sticky in app.storage.general["main_mode"], default cloud.
+                    # Cloud is the one mode a new user sees. The Local/Cloud
+                    # switch now lives in ⚙ Setup → Advanced (local training is
+                    # rarely used); default cloud on first launch.
                     if "main_mode" not in app.storage.general:
                         app.storage.general["main_mode"] = "cloud"
-                    (ui.toggle({"cloud": "☁ Cloud", "local": "💻 Local"})
-                        .props("dense color=teal-2 toggle-color=teal-9")
-                        .bind_value(app.storage.general, "main_mode")
-                        .tooltip("Cloud: orchestrate a RunPod GPU pod from this UI. "
-                                 "Local: run scripts on this machine (needs CUDA GPU "
-                                 "for training)."))
+                    # A small badge shows Local mode when it's active, so a
+                    # power user who flipped it isn't left guessing.
+                    (ui.label("💻 Local mode")
+                        .classes("text-caption")
+                        .style("color:#b2dfdb;border:1px solid #4db6ac;"
+                               "border-radius:4px;padding:1px 6px")
+                        .bind_visibility_from(
+                            app.storage.general, "main_mode",
+                            lambda v: (v or "cloud") == "local"))
                     _status = ui.label("Ready").classes("text-body2")
                     _stop_btn = (ui.button("Stop", icon="stop", on_click=_stop_process)
                                  .props("flat color=white")

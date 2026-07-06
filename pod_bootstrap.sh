@@ -261,12 +261,22 @@ venv_pull() {
   if ! rclone cat "$remote" | $decompress | tar -xf - --strip-components=1 -C /workspace/venv.new; then
     echo "⚠ Venv pull/extract failed — falling through to slow path"
     rm -rf /workspace/venv.new
+    # The object is corrupt (truncated/interrupted upload). Delete it now so
+    # the next pod doesn't trip on the same poison — this run's later
+    # venv_push re-creates a good one at the same key, but if this pod dies
+    # before that push, the bad object would otherwise linger.
+    echo "  removing corrupt cache object $remote"
+    rclone deletefile "$remote" 2>/dev/null \
+      || echo "  (couldn't delete $remote — remove it manually if it persists)"
     return 1
   fi
   # Sanity-check before swapping — catches push/pull format mismatches early.
   if [ ! -f /workspace/venv.new/bin/python ]; then
     echo "⚠ Extracted venv missing bin/python — tarball corrupt or wrong format"
     rm -rf /workspace/venv.new
+    echo "  removing corrupt cache object $remote"
+    rclone deletefile "$remote" 2>/dev/null \
+      || echo "  (couldn't delete $remote — remove it manually if it persists)"
     return 1
   fi
   # Atomic swap. If a previous venv exists, replace it.

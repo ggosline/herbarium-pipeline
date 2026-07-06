@@ -110,11 +110,49 @@ DEFAULT_DATACENTER = "EUR-IS-1"
 DEFAULT_VOLUME_GB = 80
 DEFAULT_CONTAINER_DISK_GB = 40
 
-# Light tier handles download / prep / identify on a cheap reliable GPU.
-# Train tier is what the user actually picks for the long run.
-GPU_BY_PURPOSE: dict[str, str] = {
-    "light": "NVIDIA L4",
-    "train": "NVIDIA A100-SXM4-80GB",
+# When a fresh project has no network volume yet, provisioning may place the
+# pod (and its new volume) in whichever of these datacenters actually has a
+# GPU free — tried in order after the requested/default DC. A volume can't
+# move between DCs, so once a project has data this list is *not* used: the
+# volume's DC wins (see provision()).
+DEFAULT_DATACENTERS: list[str] = [
+    "EUR-IS-1", "EUR-IS-2", "EU-RO-1", "EU-SE-1", "EU-NL-1",
+    "US-KS-2", "US-CA-2", "CA-MTL-1",
+]
+
+# GPU preference, in priority order, per purpose. create_pod accepts the whole
+# list and RunPod places the pod on the *first available* one — so a busy
+# top-choice GPU no longer means a failed provision. RunPod honours list order,
+# so these are ranked by *preference* (reliable + good value first), NOT raw
+# power: a free A6000 beats waiting on a contested A100. The chosen GPU + its
+# $/hr is logged at provision time.
+#
+# Light tier handles download / prep / identify — any cheap reliable card.
+# Train tier needs ≥24 GB VRAM. Default config (ViT-Large @ 640px, batch 4,
+# gradient checkpointing on) fits comfortably in 24 GB, so 48 GB cards are
+# roomy. The 48 GB RTX A6000 has trained well in practice and is usually far
+# easier to get than an A100 — hence it leads. A100/H100 (80 GB) stay in the
+# list as fallbacks for when they happen to be free; the 24 GB 4090 is the
+# cheap last resort.
+GPU_BY_PURPOSE: dict[str, list[str]] = {
+    "light": [
+        "NVIDIA L4",
+        "NVIDIA RTX A4000",
+        "NVIDIA RTX A5000",
+        "NVIDIA GeForce RTX 4090",
+    ],
+    "train": [
+        "NVIDIA RTX A6000",               # 48 GB — proven, usually available
+        "NVIDIA RTX 6000 Ada Generation", # 48 GB — Ada sibling of the A6000
+        "NVIDIA L40S",                    # 48 GB — Ada datacenter card
+        "NVIDIA L40",                     # 48 GB — non-S variant, more supply
+        "NVIDIA A100 80GB PCIe",          # 80 GB — fallback when free
+        "NVIDIA A100-SXM4-80GB",          # 80 GB — the old default; contested
+        "NVIDIA H100 PCIe",               # 80 GB — overkill but fine if free
+        "NVIDIA H100 NVL",                # 94 GB — H100 variant
+        "NVIDIA H100 80GB HBM3",          # 80 GB — SXM H100 variant
+        "NVIDIA GeForce RTX 4090",        # 24 GB — cheap last resort
+    ],
 }
 
 # Pod-side layout, mirrored in pod_bootstrap.sh.
@@ -326,6 +364,23 @@ class CloudOrchestrator:
 
     # ── public API ────────────────────────────────────────────────────────
 
+    def _gpu_candidates(
+        self, purpose: str, gpu_type: str | None,
+    ) -> list[str]:
+        """Return the ordered list of GPU type ids to offer RunPod.
+
+        An explicit ``gpu_type`` override wins (single-element list). Otherwise
+        the purpose's whole preference list is returned so RunPod can place on
+        the first available card.
+        """
+        if gpu_type:
+            return [gpu_type]
+        val = GPU_BY_PURPOSE.get(purpose)
+        if not val:
+            raise ValueError(
+                f"unknown purpose {purpose!r}; pass gpu_type explicitly")
+        return list(val)
+
     async def provision(
         self,
         *,
@@ -335,6 +390,7 @@ class CloudOrchestrator:
         volume_gb: int = DEFAULT_VOLUME_GB,
         container_disk_gb: int = DEFAULT_CONTAINER_DISK_GB,
         data_center_id: str | None = None,
+        allow_other_datacenters: bool = True,
         on_log: LogFn = print,
     ) -> PodHandle:
         """Get a running pod for this project.
@@ -342,6 +398,15 @@ class CloudOrchestrator:
         Reuses the existing pod if state.json points at one that's still
         ``RUNNING`` with an SSH endpoint. Otherwise creates a fresh pod
         attached to the project's network volume.
+
+        GPU selection offers RunPod the whole ``GPU_BY_PURPOSE[purpose]``
+        preference list (unless ``gpu_type`` overrides it); RunPod places on
+        the first available card. For a brand-new project with no volume yet,
+        and ``allow_other_datacenters=True``, provisioning also tries the
+        datacenters in ``DEFAULT_DATACENTERS`` until one has a GPU free —
+        the volume is created in whichever DC wins. Once a project has a
+        volume, its DC is fixed (volumes can't migrate) and only the GPU
+        list is used to dodge a busy card.
         """
         # 1) Try to reuse an existing pod.
         if self._state.pod_id:
@@ -363,28 +428,40 @@ class CloudOrchestrator:
             self._save_state()
 
         # 2) Provision a fresh pod.
-        gpu = gpu_type or GPU_BY_PURPOSE.get(purpose)
-        if not gpu:
-            raise ValueError(f"unknown purpose {purpose!r}; pass gpu_type explicitly")
-        dc = data_center_id or self._state.data_center_id or DEFAULT_DATACENTER
-        # _ensure_volume may override `dc` if a saved volume lives in a
-        # different region (network volumes can't move; the volume's DC
-        # wins so we don't silently destroy data on a GPU-only override).
-        volume_id, dc = await self._ensure_volume(
-            size_gb=volume_gb, data_center_id=dc, on_log=on_log,
-        )
+        gpus = self._gpu_candidates(purpose, gpu_type)
+        on_log(f"GPU preference (first available wins): {', '.join(gpus)}")
+        requested_dc = (data_center_id or self._state.data_center_id
+                        or DEFAULT_DATACENTER)
 
-        on_log(f"Creating {gpu} pod in {dc}...")
-        pod = await self._rp().create_pod(
-            name=f"herb-{self._project}-{purpose}",
-            image_name=image,
-            gpu_type_ids=[gpu],
-            container_disk_gb=container_disk_gb,
-            volume_mount_path="/workspace",
-            network_volume_id=volume_id,
-            data_center_ids=[dc],
-            ports=("22/tcp",),
-        )
+        if self._state.volume_id:
+            # Existing project — the volume pins the DC (volumes can't move).
+            # _ensure_volume may override `requested_dc` to the volume's real
+            # region so we don't silently destroy data on a GPU-only override.
+            volume_id, dc = await self._ensure_volume(
+                size_gb=volume_gb, data_center_id=requested_dc, on_log=on_log,
+            )
+            pod = await self._create_pod_in_dc(
+                gpus=gpus, dc=dc, volume_id=volume_id, purpose=purpose,
+                image=image, container_disk_gb=container_disk_gb, on_log=on_log,
+            )
+            if pod is None:
+                raise RuntimeError(
+                    f"None of the {len(gpus)} candidate GPUs were available in "
+                    f"{dc} (where this project's volume lives — it can't move "
+                    f"to another region). Options: wait and retry, widen the "
+                    f"GPU list, or create a pod in the RunPod console and paste "
+                    f"its Pod ID into Attach."
+                )
+        else:
+            # Fresh project — no data yet, so we can chase a free GPU across
+            # datacenters and create the volume wherever one lands.
+            dc_list = [requested_dc]
+            if allow_other_datacenters:
+                dc_list += [d for d in DEFAULT_DATACENTERS if d != requested_dc]
+            pod, volume_id, dc = await self._provision_fresh(
+                gpus=gpus, dc_list=dc_list, volume_gb=volume_gb, purpose=purpose,
+                image=image, container_disk_gb=container_disk_gb, on_log=on_log,
+            )
         on_log(f"  pod {pod.id} created (${pod.cost_per_hr}/hr), waiting for SSH...")
         # Persist the pod_id NOW, before any wait that might fail. If
         # wait_until_ready times out we still know which pod is paid-for so
@@ -408,6 +485,100 @@ class CloudOrchestrator:
         handle = self._handle_from_pod(ready)
         await self._ensure_session(handle, on_log=on_log)
         return handle
+
+    async def _create_pod_in_dc(
+        self,
+        *,
+        gpus: list[str],
+        dc: str,
+        volume_id: str | None,
+        purpose: str,
+        image: str,
+        container_disk_gb: int,
+        on_log: LogFn,
+    ) -> PodInfo | None:
+        """Try to create a pod in one datacenter, offering the whole GPU list.
+
+        RunPod places on the first available card. Returns the ``PodInfo`` on
+        success, or ``None`` when the API reports no capacity (so the caller
+        can try another DC or surface a clear message). A malformed request
+        (e.g. a bad GPU id) still raises — those are the user's to fix.
+        """
+        on_log(f"Requesting a {purpose} pod in {dc} "
+               f"(trying {len(gpus)} GPU option(s))…")
+        try:
+            return await self._rp().create_pod(
+                name=f"herb-{self._project}-{purpose}",
+                image_name=image,
+                gpu_type_ids=gpus,
+                container_disk_gb=container_disk_gb,
+                volume_mount_path="/workspace",
+                network_volume_id=volume_id,
+                data_center_ids=[dc],
+                ports=("22/tcp",),
+            )
+        except RunPodAPIError as e:
+            # 4xx here is overwhelmingly "no instances available" for the
+            # requested GPU/DC combo. Treat as a soft miss; the caller decides
+            # whether to try elsewhere. (Bad-GPU-id is caught earlier in
+            # create_pod and raised as ValueError, not RunPodAPIError.)
+            on_log(f"  ⚠ no capacity in {dc} (HTTP {e.status})")
+            return None
+
+    async def _provision_fresh(
+        self,
+        *,
+        gpus: list[str],
+        dc_list: list[str],
+        volume_gb: int,
+        purpose: str,
+        image: str,
+        container_disk_gb: int,
+        on_log: LogFn,
+    ) -> tuple[PodInfo, str, str]:
+        """Create the project's first volume + pod, chasing a free GPU across
+        ``dc_list``. Returns ``(pod, volume_id, data_center_id)``.
+
+        For each DC: create a volume there, try the pod; on capacity miss,
+        delete the just-created volume and move on. The volume is only kept
+        for the DC that yields a running pod, so we never orphan storage.
+        """
+        for dc in dc_list:
+            try:
+                on_log(f"Creating network volume ({volume_gb} GB, {dc})…")
+                vol = await self._rp().create_volume(
+                    name=f"herb-{self._project}",
+                    size_gb=volume_gb,
+                    data_center_id=dc,
+                )
+            except RunPodAPIError as e:
+                on_log(f"  ⚠ can't create a volume in {dc} (HTTP {e.status}) — "
+                       f"skipping this DC")
+                continue
+            pod = await self._create_pod_in_dc(
+                gpus=gpus, dc=vol.data_center_id, volume_id=vol.id,
+                purpose=purpose, image=image,
+                container_disk_gb=container_disk_gb, on_log=on_log,
+            )
+            if pod is not None:
+                self._state.volume_id = vol.id
+                self._state.data_center_id = vol.data_center_id
+                self._save_state()
+                return pod, vol.id, vol.data_center_id
+            # No GPU here — don't leave an empty volume lying around.
+            on_log(f"  cleaning up unused volume in {dc}…")
+            try:
+                await self._rp().delete_volume(vol.id)
+            except RunPodAPIError:
+                on_log(f"  (couldn't delete volume {vol.id} — remove it "
+                       f"manually if it lingers)")
+        raise RuntimeError(
+            f"No {purpose} GPU was available in any datacenter tried "
+            f"({', '.join(dc_list)}). The whole preference list "
+            f"({', '.join(gpus)}) is busy right now. Options: wait a few "
+            f"minutes and retry, or create a pod in the RunPod console and "
+            f"paste its Pod ID into Attach."
+        )
 
     async def attach(self, pod_id: str, *, on_log: LogFn = print) -> PodHandle:
         """Connect to a manually-created pod by its RunPod ID.
