@@ -65,9 +65,16 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # zstd layers instead of the default gzip: zstd decompresses much
+          # faster, so the pod's image-extract phase (a chunk of the ~7.5 min
+          # cold start) shrinks. force-compression recompresses the base layers
+          # too (they arrive gzip'd) to maximise the win. RISK: RunPod's
+          # containerd must accept the zstd layer media type — modern ones do,
+          # but this is exactly what the branch pod-test validates before it
+          # ever reaches :latest. `outputs` replaces `push: true`.
+          outputs: type=image,push=true,compression=zstd,force-compression=true
           # GitHub Actions layer cache — makes rebuilds after a small lock bump
           # reuse the apt/uv base layers instead of rebuilding from scratch.
           cache-from: type=gha
