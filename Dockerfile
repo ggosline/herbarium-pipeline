@@ -82,14 +82,17 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive \
     HERBARIUM_PREBAKED_VENV=/opt/venv
 
-# Runtime-only system packages: git (code pull), rclone + zstd + rsync (R2 /
-# mirror fallback path), unzip (rclone installer), openssh-server (RunPod
-# connects via direct SSH to port 22 — the CUDA base has no sshd, so we wire it
-# ourselves in /start.sh below). No uv / build tools — the venv is complete;
-# if the fast path is ever missed, pod_bootstrap.sh installs uv itself.
+# Runtime system packages: git (code pull), rclone + zstd + rsync (R2 / mirror
+# fallback path), unzip (rclone installer), openssh-server (RunPod connects via
+# direct SSH to port 22 — the CUDA base has no sshd, so we wire it in /start.sh
+# below), build-essential (a C compiler for Triton — train_herbarium.py runs
+# torch.compile on single-GPU and TorchInductor JITs Triton kernels with gcc at
+# runtime; the CUDA -runtime base ships no compiler, unlike the old runpod base).
+# No uv here — the venv is complete; if the fast path is ever missed,
+# pod_bootstrap.sh installs uv itself.
 RUN apt-get update -qq \
     && apt-get install -y --no-install-recommends \
-        curl ca-certificates git zstd rsync unzip openssh-server \
+        curl ca-certificates git zstd rsync unzip openssh-server build-essential \
     && curl -fsSL https://rclone.org/install.sh | bash \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd \
