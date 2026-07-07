@@ -38,7 +38,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # does NOT, so we install and wire it ourselves; see /start.sh below).
 RUN apt-get update -qq \
     && apt-get install -y --no-install-recommends \
-        curl ca-certificates git zstd rsync openssh-server \
+        curl ca-certificates git zstd rsync unzip openssh-server \
     && curl -fsSL https://rclone.org/install.sh | bash \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd \
