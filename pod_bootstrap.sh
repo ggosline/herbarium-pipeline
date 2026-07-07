@@ -592,9 +592,18 @@ setup() {
   # outweighs the 5+ min mirror itself. download / prep have minimal
   # imports and don't benefit, so we skip the mirror at setup time.
 
-  # 7. wandb login.
+  # 7. wandb login. Resolve the venv that's actually active: the prebaked image
+  #    puts it at /opt/venv, the slow path at $UV_PROJECT_ENVIRONMENT
+  #    (/workspace/venv). Guard on the binary existing so a missing wandb never
+  #    aborts setup under `set -e` (which is what killed the train: rc 127).
   if [ -f "$WS/.wandb_key" ]; then
-    "$UV_PROJECT_ENVIRONMENT/bin/wandb" login "$(cat "$WS/.wandb_key")"
+    local venv_base
+    venv_base="$(prebaked_venv)"; venv_base="${venv_base:-$UV_PROJECT_ENVIRONMENT}"
+    if [ -x "$venv_base/bin/wandb" ]; then
+      "$venv_base/bin/wandb" login "$(cat "$WS/.wandb_key")"
+    else
+      echo "wandb not found in $venv_base/bin — skipping wandb login (non-fatal)."
+    fi
   fi
 
   # 8. Make the cache + venv env vars sticky for interactive SSH sessions,
