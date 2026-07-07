@@ -25,6 +25,7 @@ from cloud import secrets as cloud_secrets
 from cloud.orchestrator import (
     CloudOrchestrator,
     DEFAULT_DATACENTER,
+    DEFAULT_IMAGE,
     DEFAULT_VOLUME_GB,
     GPU_BY_PURPOSE,
     PodHandle,
@@ -3387,6 +3388,30 @@ async def _do_attach() -> None:
     _refresh_cloud_status()
 
 
+async def _copy_pod_image() -> None:
+    """Copy the prebaked image string for pasting into the RunPod console."""
+    await ui.clipboard.write(DEFAULT_IMAGE)
+    ui.notify("Pod image copied to clipboard", type="positive")
+
+
+async def _do_save_template() -> None:
+    """Create (or reuse) a RunPod template pinned to the prebaked image, so a
+    hand-allocated pod can select it from the console's template dropdown."""
+    orch = _ensure_orch()
+    if orch is None:
+        return
+    try:
+        t = await orch.ensure_pod_template(on_log=_cloud_log)
+    except Exception as e:
+        _cloud_warn(f"Save template failed: {e}")
+        return
+    ui.notify(
+        f"RunPod template '{t.get('name')}' ready (id {t.get('id')}). "
+        f"Pick it when you deploy a pod by hand.",
+        type="positive",
+    )
+
+
 async def _do_upload_dwca() -> None:
     orch = _cloud["orch"]; pod = _cloud["pod"]
     if not (orch and pod):
@@ -3862,6 +3887,26 @@ def _build_pod_strip() -> None:
                       on_click=lambda: _wrap_cloud(_do_attach))\
                 .props("dense color=teal-2 unelevated")\
                 .tooltip("Connect to the pod whose ID is in the box.")
+        # Prebaked-image helpers for the manual path — show the exact image to
+        # select in the console, one-click copy it, and optionally save a RunPod
+        # template pinned to it so future hand-allocated pods pick it in one tap.
+        with ui.row().classes("items-center gap-1")\
+                .style("border-left:2px solid #4db6ac;padding-left:8px"):
+            ui.label("pod image:").classes("text-caption")\
+                .style("color:#b2dfdb")
+            ui.label(DEFAULT_IMAGE).classes("text-caption")\
+                .style("color:#e0f2f1;font-family:monospace;font-size:11px")\
+                .tooltip("Set this as the container image when you create a pod "
+                         "by hand in the RunPod console — it's the prebaked env "
+                         "so setup is near-instant. (Auto-provision uses it too.)")
+            ui.button(icon="content_copy", on_click=_copy_pod_image)\
+                .props("dense flat round size=sm color=teal-2")\
+                .tooltip("Copy the image string to paste into the console.")
+            ui.button("Save template", icon="bookmark_add",
+                      on_click=lambda: _wrap_cloud_aux(_do_save_template))\
+                .props("dense flat color=teal-2")\
+                .tooltip("Create a RunPod template pinned to this image so manual "
+                         "allocation can pick it from the template dropdown.")
         ui.button("Upload DwC-A", icon="archive",
                   on_click=lambda: _wrap_cloud_aux(_do_upload_dwca))\
             .props("dense flat color=teal-2")\

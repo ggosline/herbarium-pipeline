@@ -32,6 +32,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import paramiko
 
@@ -95,17 +96,20 @@ def _select_ckpts(
 
 # ── defaults ─────────────────────────────────────────────────────────────
 
-# RunPod's own pytorch image on Docker Hub. Pulls are fast (RunPod hosts
-# cache it aggressively — it's their most popular base) and crucially it
-# ships sshd preconfigured for RunPod's SSH-over-public-IP flow.
+# Prebaked pipeline image (see /Dockerfile + .github/workflows/build-image.yml).
+# Bakes torch + nvidia-dali-cuda120 + all locked deps into /opt/venv, so a fresh
+# pod skips the whole venv-assembly cold start (pod_bootstrap.sh detects the
+# baked venv and no-ops setup). It also carries its own sshd (the nvidia/cuda
+# base has none — the image's /start.sh wires RunPod's PUBLIC_KEY flow).
 #
-# Trade-off: Docker Hub anonymous pulls are rate-limited (~100 / 6h per
-# host IP). When RunPod's host IP gets unlucky you can hit
-# "toomanyrequests" at create_pod time. If that becomes chronic, the
-# durable fix is wiring containerRegistryAuthId through create_pod —
-# but that adds a third credential for naive users so we accept the
-# rare failure for now.
-DEFAULT_IMAGE = "runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04"
+# GHCR anonymous pulls are NOT subject to Docker Hub's ~100/6h rate limit, so
+# this also retires the "toomanyrequests at create_pod" failure mode the old
+# Docker Hub base occasionally hit. The GHCR package must be public (one-time
+# toggle after the first CI build) for RunPod to pull it without a token.
+#
+# Pin to a specific :sha-<short> tag instead of :latest when you need a pod to
+# match an exact build while debugging.
+DEFAULT_IMAGE = "ghcr.io/ggosline/herbarium-pipeline:latest"
 DEFAULT_DATACENTER = "EUR-IS-1"
 DEFAULT_VOLUME_GB = 80
 DEFAULT_CONTAINER_DISK_GB = 40
@@ -644,6 +648,47 @@ class CloudOrchestrator:
             self._state.data_center_id = None
         self._save_state()
         return handle
+
+    async def ensure_pod_template(
+        self,
+        *,
+        name: str = "herbarium-prebaked",
+        image: str = DEFAULT_IMAGE,
+        container_disk_gb: int = DEFAULT_CONTAINER_DISK_GB,
+        on_log: LogFn = print,
+    ) -> dict[str, Any]:
+        """Idempotently create a RunPod template pinned to the prebaked image.
+
+        Ergonomic helper for the manual-allocation path: when every GPU in the
+        fallback list is busy and you make a pod in the console by hand, picking
+        this saved template selects the prebaked image (and /workspace mount,
+        port 22) in one click — no GHCR string to paste. Safe to call repeatedly;
+        if a template with ``name`` already exists it's returned as-is rather
+        than duplicated.
+        """
+        rp = self._rp()
+        try:
+            existing = await rp.list_templates()
+        except RunPodAPIError as e:
+            on_log(f"  ⚠ couldn't list templates (HTTP {e.status}) — trying create anyway")
+            existing = []
+        for t in existing:
+            if t.get("name") == name:
+                on_log(f"Template '{name}' already exists (id {t.get('id')}) — reusing.")
+                return t
+        on_log(f"Creating RunPod template '{name}' → {image}")
+        t = await rp.create_template(
+            name=name,
+            image_name=image,
+            container_disk_gb=container_disk_gb,
+            readme=(
+                "Herbarium pipeline prebaked env. Select this when allocating a "
+                "pod by hand, then attach a network volume mounted at /workspace."
+            ),
+        )
+        on_log(f"✓ Template created (id {t.get('id')}). It'll appear in the "
+               f"console's template picker when you deploy a pod.")
+        return t
 
     async def sync_code(self, handle: PodHandle, *, on_log: LogFn = print) -> None:
         """Push local pipeline scripts to ``/workspace/Pipeline`` on the pod.
