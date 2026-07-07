@@ -335,3 +335,42 @@ class RunPodClient:
 
     async def delete_volume(self, volume_id: str) -> None:
         await self._request("DELETE", f"/networkvolumes/{volume_id}")
+
+    # ── Pod templates ─────────────────────────────────────────────────────
+    # A template is a saved (image + disk + ports + mount) preset. Its value
+    # here is purely ergonomic: when every GPU in the fallback list is busy and
+    # the user has to allocate a pod by hand in the console, selecting a saved
+    # template pins the prebaked image in one click instead of pasting the GHCR
+    # string every time. Pod creation still attaches the network volume.
+
+    async def list_templates(self) -> list[dict[str, Any]]:
+        data = await self._request("GET", "/templates")
+        return list(data or [])
+
+    async def create_template(
+        self,
+        *,
+        name: str,
+        image_name: str,
+        container_disk_gb: int = 40,
+        volume_mount_path: str = "/workspace",
+        ports: Iterable[str] = ("22/tcp",),
+        readme: str = "",
+    ) -> dict[str, Any]:
+        """Create a pod template pinned to ``image_name``.
+
+        Returns the created template's raw JSON (includes its ``id``). The
+        network volume is intentionally NOT part of the template — it's chosen
+        per-pod at allocation time so one template serves every project.
+        """
+        body: dict[str, Any] = {
+            "name": name,
+            "imageName": image_name,
+            "containerDiskInGb": container_disk_gb,
+            "volumeMountPath": volume_mount_path,
+            "ports": list(ports),
+        }
+        if readme:
+            body["readme"] = readme
+        data = await self._request("POST", "/templates", json=body)
+        return dict(data or {})

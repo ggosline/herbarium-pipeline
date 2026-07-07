@@ -229,6 +229,42 @@ venv_cache_key() {
   echo "$VENV_CACHE_KEY"
 }
 
+# ─── prebaked image detection ─────────────────────────────────────────────
+# On the prebaked Docker image (see /Dockerfile) the fully assembled venv is
+# already at $HERBARIUM_PREBAKED_VENV (/opt/venv) — on the container's LOCAL
+# NVMe, deliberately NOT under /workspace (the network-volume mount would
+# shadow it). Its .cache_key was stamped at build time with the same
+# venv-<hw>-<lockhash> key venv_cache_key() computes here.
+#
+# Echoes the baked venv path when it exists AND its key matches this repo's
+# current lockfile; empty otherwise. A mismatch means the image predates a
+# lockfile bump (CI hasn't rebuilt yet) — we ignore the baked venv and let the
+# caller fall through to the R2/uv slow path. This is what makes the fast path
+# work identically on an auto-provisioned pod and on a pod you allocated by
+# hand in the console: it keys purely off what's on disk, not how the pod was
+# created. Memoised so the double sha256 (via venv_cache_key) runs once.
+prebaked_venv() {
+  if [ -n "${PREBAKED_VENV_CHECKED:-}" ]; then
+    echo "${PREBAKED_VENV:-}"; return
+  fi
+  PREBAKED_VENV=""
+  local baked="${HERBARIUM_PREBAKED_VENV:-/opt/venv}"
+  if [ -x "$baked/bin/python" ] && [ -f "$baked/.cache_key" ]; then
+    local want have
+    want=$(venv_cache_key)
+    have=$(cat "$baked/.cache_key" 2>/dev/null)
+    if [ "$want" = "$have" ]; then
+      PREBAKED_VENV="$baked"
+    else
+      echo "⚠ prebaked venv key '$have' != needed '$want' — image predates a" >&2
+      echo "  lockfile bump (CI not rebuilt yet?); using slow path instead." >&2
+    fi
+  fi
+  PREBAKED_VENV_CHECKED=1
+  export PREBAKED_VENV PREBAKED_VENV_CHECKED
+  echo "$PREBAKED_VENV"
+}
+
 venv_pull() {
   # 0. Local short-circuit: reuse the on-volume venv only when its stamped
   #    cache key EXACTLY matches what this pod needs. The key is lockfile+hw
@@ -478,9 +514,17 @@ setup() {
 
   cd "$REPO"
 
-  # 6. Try the venv R2 fast path. On a hit we skip cache_pull / uv sync /
-  #    DALI install entirely — the assembled venv is what we want.
-  if venv_pull; then
+  # 6. Fastest path — prebaked image. The venv is baked into the container at
+  #    /opt/venv; nothing to pull, sync, or install. Falls through to the R2
+  #    pull if the image is stale (key mismatch) or this isn't a prebaked pod.
+  local baked
+  baked=$(prebaked_venv)
+  if [ -n "$baked" ]; then
+    echo "✓ Prebaked image venv at $baked (key $(cat "$baked/.cache_key"))."
+    echo "  Skipping R2 pull / uv sync / DALI install entirely."
+  # 6′. Next-fastest — pull the assembled venv tarball from R2. On a hit we skip
+  #    cache_pull / uv sync / DALI install — the assembled venv is what we want.
+  elif venv_pull; then
     echo "Setup fast path complete — venv pulled from R2."
   else
     # ── Slow path: build the venv from wheels. ──
@@ -741,6 +785,12 @@ _local_venv_from_r2() {
 }
 
 mirror_venv_local() {
+  # Prebaked image: the venv is already at /opt/venv on local NVMe — the whole
+  # reason this mirror exists (escaping slow MooseFS imports) doesn't apply.
+  if [ -n "$(prebaked_venv)" ]; then
+    echo "Prebaked venv on local NVMe — no MooseFS mirror needed."
+    return 0
+  fi
   _ensure_rsync
   local src=/workspace/venv
   local dst="$LOCAL_VENV"
@@ -812,8 +862,13 @@ mirror_venv_local() {
 }
 
 activate() {
-  # Prefer local-NVMe mirror; fall back to network venv if no mirror exists.
-  if [ -d "$LOCAL_VENV/bin" ]; then
+  # Preference order: prebaked image venv (/opt/venv, already local NVMe) →
+  # local-NVMe mirror of the network venv → network venv itself.
+  local baked
+  baked=$(prebaked_venv)
+  if [ -n "$baked" ]; then
+    source "$baked/bin/activate"
+  elif [ -d "$LOCAL_VENV/bin" ]; then
     source "$LOCAL_VENV/bin/activate"
   else
     source /workspace/venv/bin/activate
@@ -833,6 +888,13 @@ activate() {
 # CUDA-13 host can land on a CUDA-12 host — this catches that up front.
 # Call after activate(). Returns non-zero on a hard mismatch.
 _check_cuda_compat() {
+  # Prebaked image ships nvidia-dali-cuda120, which runs on ANY CUDA-12+ driver
+  # (backward compat) — the mismatch this guard catches (a venv built for a
+  # newer CUDA than the driver) can't happen when the venv is pinned at build.
+  if [ -n "$(prebaked_venv)" ]; then
+    echo "  Prebaked cuda120 venv — CUDA/DALI driver compat guaranteed at build."
+    return 0
+  fi
   command -v nvidia-smi >/dev/null 2>&1 || return 0
   local drv_cuda drv_major
   drv_cuda=$(nvidia-smi 2>/dev/null | grep -oP 'CUDA Version:\s*\K[0-9]+\.[0-9]+' | head -1)
