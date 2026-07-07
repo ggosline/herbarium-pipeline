@@ -606,6 +606,12 @@ setup() {
     fi
   fi
 
+  # Resolve the venv that's actually active — the prebaked image's /opt/venv or
+  # the slow path's /workspace/venv — so the interactive env + final message
+  # point an SSH-in user at a venv that really exists.
+  local active_venv
+  active_venv="$(prebaked_venv)"; active_venv="${active_venv:-/workspace/venv}"
+
   # 8. Make the cache + venv env vars sticky for interactive SSH sessions,
   #     so manually running `uv sync` / `uv pip install` from a shell
   #     hits the volume cache (15 GB) instead of the empty default at
@@ -615,7 +621,6 @@ setup() {
 
 # herbarium-pipeline env — written by pod_bootstrap.sh setup
 export UV_CACHE_DIR=/workspace/.cache/uv
-export UV_PROJECT_ENVIRONMENT=/workspace/venv
 export UV_PYTHON_INSTALL_DIR=/workspace/.uv-python
 export HF_HOME=/workspace/.cache/huggingface
 export RCLONE_CONFIG=/workspace/.config/rclone/rclone.conf
@@ -623,12 +628,15 @@ export PATH="$HOME/.local/bin:$PATH"
 # Send .pyc writes to tmpfs — saves repeated MFS round-trips on every import.
 export PYTHONPYCACHEPREFIX=/dev/shm/pycache
 BASHRC
+    # Written after the quoted heredoc so the resolved path (prebaked vs slow)
+    # is interpolated rather than the literal /workspace/venv.
+    echo "export UV_PROJECT_ENVIRONMENT=$active_venv" >> /root/.bashrc
     echo "Added herbarium env exports to /root/.bashrc"
   fi
 
   start_watchdog
 
-  echo "Setup complete. Activate with: source /workspace/venv/bin/activate"
+  echo "Setup complete. Activate with: source $active_venv/bin/activate"
 }
 
 # Background watchdog that polls $ACTIVITY_FILE and self-terminates the pod
