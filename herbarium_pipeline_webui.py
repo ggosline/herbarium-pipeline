@@ -94,6 +94,16 @@ def _apply_filter_spec(spec: dict, df) -> "pd.Series":
     def _col(name: str):
         return df[name].astype(str).str.strip() if name in df.columns else None
 
+    def _has_label(name: str):
+        """True where df[name] is a real label. Must use notna(): astype(str)
+        leaves float NaN (not the string "nan") for missing cells, so a
+        `.ne("nan")` guard silently lets label-less indets through."""
+        if name not in df.columns:
+            return _pd.Series(False, index=df.index)
+        raw = df[name]
+        s = raw.astype(str).str.strip().str.lower()
+        return raw.notna() & ~s.isin(("", "nan", "none", "<na>", "na", "null"))
+
     if t == "all":
         return _pd.Series(True, index=df.index)
 
@@ -166,7 +176,7 @@ def _apply_filter_spec(spec: dict, df) -> "pd.Series":
     if t == "top5_none_correct":
         true = _col("true_species")
         if true is not None:
-            mask = true.ne("") & true.ne("nan")
+            mask = _has_label("true_species")
             for k in range(1, 6):
                 c = f"top{k}_name"
                 if c in df.columns:
@@ -177,7 +187,7 @@ def _apply_filter_spec(spec: dict, df) -> "pd.Series":
         sp = _sp_col()
         true = _col("true_species")
         if sp is not None and true is not None:
-            return true.ne("") & true.ne("nan") & (true != sp)
+            return _has_label("true_species") & (true != sp)
 
     if t == "compound":
         logic  = spec.get("logic", "and")
@@ -1942,18 +1952,25 @@ def _build_review() -> tuple:
         elif filt == "flagged":
             mask = df["flagged"].astype(str).str.lower().isin(("true", "1"))
         elif filt == "misid":
+            # "Has a real ground-truth label." MUST use notna(), not string
+            # matching: `astype(str).str.strip()` leaves float NaN (not the
+            # string "nan") for missing cells, so the old `.ne("nan")` guard
+            # let every indet (no true species) leak in as "misidentified".
+            def _has_label(series):
+                s = series.astype(str).str.strip().str.lower()
+                return series.notna() & ~s.isin(("", "nan", "none", "<na>", "na", "null"))
             if level == "family" and "pred_family" in df.columns and "true_family" in df.columns:
                 pred = df["pred_family"].astype(str).str.strip()
                 true = df["true_family"].astype(str).str.strip()
-                mask = true.ne("") & true.ne("nan") & true.ne(pred)
+                mask = _has_label(df["true_family"]) & true.ne(pred)
             elif level == "genus" and "true_species" in df.columns:
                 pred_g = df[sp_col].astype(str).str.split().str[0]
                 true_g = df["true_species"].astype(str).str.split().str[0]
-                mask   = true_g.ne("") & true_g.ne("nan") & true_g.ne(pred_g)
+                mask   = _has_label(df["true_species"]) & true_g.ne(pred_g)
             else:
                 if "true_species" in df.columns:
                     true_str = df["true_species"].astype(str).str.strip()
-                    mask = (true_str.ne("") & true_str.ne("nan") &
+                    mask = (_has_label(df["true_species"]) &
                             true_str.ne(df[sp_col].astype(str).str.strip()))
                 else:
                     mask = _pd.Series(False, index=df.index)
