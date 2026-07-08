@@ -2376,25 +2376,30 @@ def _build_confusion() -> "ui.input":
             ui.notify("No identified specimens after filtering.", type="info")
             return
 
-        # Full crosstab
-        ct = _pd.crosstab(df[true_col], df[pred_col])
+        # Full crosstab; kept so the top-N view can pull any (true, pred) cell.
+        full_ct = _pd.crosstab(df[true_col], df[pred_col])
 
-        # Most-confused restriction.
-        # Y-axis: top N true species by off-diagonal error rate.
-        # X-axis: top N predicted species by total count in those rows (different set/order).
+        # Pick which classes to display, then render a SQUARE matrix that uses
+        # ONE ordered class list for BOTH axes — so each class sits at the same
+        # position on each axis and true==pred always lands on the main diagonal.
+        # (The axes used to be built from different sets in different orders, so
+        # the diagonal was scattered and unreadable.)
         n = int(top_n_inp.value or 0)
         if n > 0:
-            off = ct.copy().astype(float)
-            for sp in ct.index:
-                if sp in ct.columns:
+            off = full_ct.copy().astype(float)
+            for sp in full_ct.index:
+                if sp in full_ct.columns:
                     off.loc[sp, sp] = 0.0
-            error_rate = (off.sum(axis=1) / ct.sum(axis=1)).sort_values(ascending=False)
+            error_rate = (off.sum(axis=1) / full_ct.sum(axis=1)).sort_values(ascending=False)
             top_true = list(error_rate.head(n).index)
-            ct = ct.loc[[s for s in top_true if s in ct.index]]
-            # Predicted axis: most commonly predicted species for these rows
-            col_counts = ct.sum(axis=0).sort_values(ascending=False)
-            top_pred = list(col_counts.head(n).index)
-            ct = ct[top_pred]
+            # Also include the classes those confused specimens were predicted
+            # AS, so the off-diagonal destinations stay visible.
+            dest = full_ct.loc[top_true].sum(axis=0).sort_values(ascending=False)
+            classes = top_true + [c for c in dest.index if c not in top_true][:n]
+        else:
+            classes = sorted(set(full_ct.index) | set(full_ct.columns))
+
+        ct = full_ct.reindex(index=classes, columns=classes, fill_value=0)
 
         # Normalise rows to recall (fraction of true class)
         if norm_chk.value:
