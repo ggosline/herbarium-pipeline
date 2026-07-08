@@ -330,6 +330,35 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
     return cleaned, model_name, num_classes, nameslist, geo_dim, label_level, temperature
 
 
+def _ckpt_embed_dim(state_dict: dict) -> int | None:
+    """Backbone embedding dim recorded in the checkpoint, or None if unknown.
+
+    Read from a transformer LayerNorm (shape == embed_dim). Lets us catch a
+    wrong --model before load_state_dict throws a wall of shape mismatches.
+    """
+    for key in ("norm.weight", "blocks.0.norm1.weight",
+                "backbone.norm.weight", "backbone.blocks.0.norm1.weight"):
+        t = state_dict.get(key)
+        if t is not None and t.ndim == 1:
+            return int(t.shape[0])
+    return None
+
+
+def _check_arch(state_dict: dict, model_name: str, feat_dim: int) -> None:
+    """Fail fast with a readable message when --model disagrees with the
+    checkpoint's actual backbone (e.g. vit_base checkpoint, vit_large --model)."""
+    ckpt_dim = _ckpt_embed_dim(state_dict)
+    if ckpt_dim is not None and ckpt_dim != feat_dim:
+        raise SystemExit(
+            f"ERROR: architecture mismatch — the checkpoint's backbone embed "
+            f"dim is {ckpt_dim}, but --model '{model_name}' has {feat_dim}. "
+            f"This checkpoint was trained with a different backbone (e.g. a "
+            f"vit_base checkpoint can't load into vit_large). Pass the --model "
+            f"that matches this checkpoint, or point --checkpoint at one built "
+            f"with '{model_name}'."
+        )
+
+
 def build_model_from_state(state_dict: dict, model_name: str, num_classes: int,
                            geo_dim: int) -> nn.Module:
     """Reconstruct the inference model from a cleaned state_dict.
@@ -342,6 +371,7 @@ def build_model_from_state(state_dict: dict, model_name: str, num_classes: int,
     if geo_dim:
         backbone = timm.create_model(model_name, pretrained=False, num_classes=0)
         feat_dim = backbone.num_features
+        _check_arch(state_dict, model_name, feat_dim)
         geo_mlp = nn.Sequential(
             nn.Linear(4, geo_dim), nn.GELU(), nn.Linear(geo_dim, geo_dim)
         )
@@ -363,6 +393,7 @@ def build_model_from_state(state_dict: dict, model_name: str, num_classes: int,
         print(f"  Geo-capable model built (feat_dim={feat_dim}, geo_dim={geo_dim})")
     else:
         model = timm.create_model(model_name, pretrained=False, num_classes=num_classes)
+        _check_arch(state_dict, model_name, model.num_features)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if unexpected:
             print(f"  Unexpected keys (ignored): {unexpected[:5]}")
