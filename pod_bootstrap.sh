@@ -1226,8 +1226,25 @@ identify() {
   mirror_venv_local || echo "⚠ venv mirror skipped — imports will be slower."
   activate
   _check_cuda_compat || exit 3
-  # Pick the most recent .ckpt unless caller passed CKPT_FILE explicitly.
-  : "${CKPT_FILE:=$(ls -t "$CKPT"/*.ckpt | head -1)}"
+  # Pick the checkpoint unless the caller passed CKPT_FILE explicitly. Prefer
+  # the best-accuracy checkpoint (highest val_Accuracy in the filename), then
+  # best valid_loss (lowest), then last.ckpt, then newest by mtime. Picking by
+  # mtime alone is unsafe in a REUSED workspace: `last.ckpt` is overwritten in
+  # place by every run — including one with a different backbone — so it can
+  # mismatch $MODEL and blow up on load. The metric-named checkpoints carry
+  # their own arch and survive reruns (this matches what `publish` selects).
+  if [ -z "${CKPT_FILE:-}" ]; then
+    CKPT_FILE=$(ls "$CKPT"/*val_Accuracy=*.ckpt 2>/dev/null \
+      | sed -E 's/.*val_Accuracy=([0-9]+\.[0-9]+).*/\1 &/' | sort -rn | head -1 | cut -d' ' -f2-)
+    [ -z "$CKPT_FILE" ] && CKPT_FILE=$(ls "$CKPT"/*valid_loss=*.ckpt 2>/dev/null \
+      | sed -E 's/.*valid_loss=([0-9]+\.[0-9]+).*/\1 &/' | sort -n | head -1 | cut -d' ' -f2-)
+    [ -z "$CKPT_FILE" ] && [ -f "$CKPT/last.ckpt" ] && CKPT_FILE="$CKPT/last.ckpt"
+    [ -z "$CKPT_FILE" ] && CKPT_FILE=$(ls -t "$CKPT"/*.ckpt 2>/dev/null | head -1)
+  fi
+  if [ -z "${CKPT_FILE:-}" ]; then
+    echo "✗ no checkpoint found in $CKPT" >&2; return 1
+  fi
+  echo "Selected checkpoint: $CKPT_FILE"
   # Tunables — override via env (the webui's Identify-tab Run button ships
   # these from the matching gs[...] keys).
   : "${MODEL:=vit_large_patch16_dinov3.lvd1689m}"
