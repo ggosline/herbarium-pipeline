@@ -104,10 +104,16 @@ def search_occurrences(
     params: dict = {"mediaType": "StillImage", "limit": PAGE_SIZE, "offset": 0}
     if basis_of_record:
         params["basisOfRecord"] = basis_of_record
-    if family:
-        params["family"] = family
+    # GBIF's occurrence-search API has NO `family`/`genus` name parameter —
+    # passing them is silently ignored, so the query degenerates to "every
+    # occurrence" and paging balloons to the 100k offset cap. Resolve the name
+    # to a numeric taxonKey (which matches the taxon AND all its descendants)
+    # and filter on that instead. Genus is more specific, so it wins if both
+    # are given.
     if genus:
-        params["genus"] = genus
+        params["taxonKey"] = gbif_taxon_key(genus, "GENUS")
+    elif family:
+        params["taxonKey"] = gbif_taxon_key(family, "FAMILY")
     if continent:
         params["continent"] = continent
 
