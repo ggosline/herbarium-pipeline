@@ -229,8 +229,10 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
     """Load a TimmModel from a Lightning checkpoint.
 
     Returns (state_dict, model_name, num_classes, nameslist, geo_dim,
-    label_level, temperature).
+    label_level, temperature, excluded).
     nameslist may be updated from the checkpoint if embedded there.
+    excluded is {"rank": str, "taxa": {name: n_images}} — taxa the training
+    run dropped as too sparse (empty for older checkpoints).
     geo_dim > 0 indicates the checkpoint uses a geo MLP; state_dict will
     contain geo_mlp.* keys in addition to backbone internals and head.*.
     temperature is the fitted softmax calibration temperature (Guo et al.
@@ -248,6 +250,9 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
             nameslist = embedded
         num_classes = len(nameslist)
         print(f"  Nameslist loaded from checkpoint ({num_classes} classes)")
+    # Taxa the training run dropped as too sparse — embedded by on_save_checkpoint.
+    # Older checkpoints won't have it; default to an empty payload.
+    excluded = ckpt.get("excluded_species") or {"rank": "species", "taxa": {}}
     state_dict = ckpt["state_dict"]
 
     # Strip Lightning / torch.compile prefixes.
@@ -327,7 +332,7 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
     if temperature != 1.0:
         print(f"  Calibration temperature: {temperature:.3f}")
 
-    return cleaned, model_name, num_classes, nameslist, geo_dim, label_level, temperature
+    return cleaned, model_name, num_classes, nameslist, geo_dim, label_level, temperature, excluded
 
 
 def build_model_from_state(state_dict: dict, model_name: str, num_classes: int,
@@ -451,10 +456,29 @@ def identify(args):
         print(f"Loaded {len(nameslist)} class names from {args.nameslist}")
 
     # Load model weights (may update nameslist + num_classes from embedded data)
-    state_dict, ckpt_model_name, num_classes, nameslist, geo_dim, label_level, ckpt_temperature = load_model(
+    state_dict, ckpt_model_name, num_classes, nameslist, geo_dim, label_level, ckpt_temperature, excluded = load_model(
         checkpoint_path, nameslist, args.image_sz
     )
     print(f"  Model rank: {label_level}")
+
+    # Tell the end user which taxa the model can't predict (dropped as too
+    # sparse at train time). Write a sidecar into the review dir so the webui /
+    # Space can show it, and print a short banner here.
+    excluded_taxa = (excluded or {}).get("taxa", {})
+    if excluded_taxa:
+        excl_rank = (excluded or {}).get("rank", "species")
+        out_json = output_dir / "excluded_species.json"
+        out_json.write_text(json.dumps(excluded, indent=2))
+        # Human-readable CSV alongside predictions.csv (rarest first).
+        excl_rows = sorted(excluded_taxa.items(), key=lambda kv: kv[1])
+        pd.DataFrame(excl_rows, columns=[excl_rank, "n_images"]).to_csv(
+            output_dir / "excluded_species.csv", index=False)
+        preview = ", ".join(n for n, _ in excl_rows[:10])
+        print(f"\n  NOTE: {len(excluded_taxa)} {excl_rank} had too few images to "
+              f"train and are NOT in this model — specimens of these will be "
+              f"mis-assigned to the nearest trained class.")
+        print(f"        {preview}{' …' if len(excluded_taxa) > 10 else ''}")
+        print(f"        Full list → {out_json.name} / excluded_species.csv\n")
 
     # CLI --temperature overrides the value fitted at training time; otherwise
     # use the checkpoint's (1.0 for uncalibrated checkpoints).
