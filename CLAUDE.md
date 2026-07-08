@@ -19,7 +19,7 @@ The application exposes a browser-based web UI built with NiceGUI that lets user
 2. **Filter & Crop** (`filter_and_crop_herbarium.py`) — removes non-herbarium images (field photos, slides) via CLIP zero-shot classification or HSV heuristics; crops dark scanner borders.
 3. **Resize** (`resize_images.py`) — scales images to a target max dimension (1024 px default) using GPU-accelerated NVIDIA DALI or PIL fallback.
 4. **Train** (`train_herbarium.py`) — PyTorch/Lightning multi-stage fine-tuning on a pretrained vision model (ViT-Large, EfficientNet, etc.). Supports hierarchical multi-head training (species/genus/family), geographic feature fusion, resume-from-checkpoint, and WandB logging. Produces checkpoints and a nameslist.json.
-5. **Identify** (`identify_herbarium.py`) — runs inference on new images, saves a predictions.csv with top-5 predictions per image, flags mismatches with recorded labels, sorts unidentified specimens by prediction.
+5. **Identify** (`identify_herbarium.py`) — runs inference on new images, saves a predictions.csv with top-5 predictions per image, flags mismatches with recorded labels, sorts unidentified specimens by prediction. Also writes `excluded_species.json`/`.csv` listing species dropped from training as too sparse (the model can't predict them). Auto-selects the best checkpoint by metric (see below).
 
 ### Code Organization
 
@@ -58,9 +58,11 @@ Updated incrementally during Download (new rows), Filter (hasfile, rejected flag
     live/                          # Field photos of living plants
   runs/
     nameslist.json                 # Species list from training
+    excluded_species.json          # Taxa dropped as too sparse (also embedded in each ckpt)
     checkpoints/
-      last.ckpt                    # Most recent checkpoint
-      epoch=XX-valid_loss=X.ckpt   # Best stage-2 checkpoint
+      last.ckpt                    # Most recent checkpoint (overwritten every run)
+      epoch=XX-valid_loss=X.ckpt   # Best stage-2 checkpoint (lowest val loss)
+      acc-epoch=XX-val_Accuracy=X.ckpt  # Best by val accuracy (what identify/publish pick)
       cd-epoch=XX-...              # Cool-down best (if used)
     logs/                          # Training metrics (CSV or WandB)
   review/
@@ -83,6 +85,8 @@ Updated incrementally during Download (new rows), Filter (hasfile, rejected flag
 **Checkpointing and resume** — Each checkpoint embeds the nameslist and all config; resuming from a checkpoint auto-skips Stage 1.
 
 **Cloud pod upgrade** — Light L4 pods (cheap, fast for download/prep) auto-provision to RTX 4090 (expensive, needed for training) on demand. The network volume and all data persist.
+
+**Prebaked pod image** — Pods boot from a Docker image built by GitHub Actions (`.github/workflows/build-image.yml`) and published to GHCR (`ghcr.io/ggosline/herbarium-pipeline:latest`, set by `DEFAULT_IMAGE` in `cloud/orchestrator.py`; override per session with `HERBARIUM_POD_IMAGE`). It bakes the full env (torch, DALI, locked deps) into `/opt/venv`, so `pod_bootstrap.sh setup` is near-instant and skips `uv sync`. The image uses zstd layers on a slim (non-cuDNN) CUDA base — torch ships its own cuDNN. Nobody builds Docker locally; the workflow rebuilds only when `pyproject.toml`/`uv.lock`/`Dockerfile`/the workflow change. The R2 wheel/venv cache remains only as a fallback for non-prebaked pods.
 
 ## Running the Application
 
@@ -200,7 +204,7 @@ To debug a single pipeline stage, run its script with `--help` and test with a s
 3. Metrics are computed via `torchmetrics.MetricCollection` (accuracy, precision, recall, F1).
 
 **Inspect predictions**:
-1. `predictions.csv` is written by `identify_herbarium.py` with columns: path, true_label, top_pred, top_confidence, pred_2, conf_2, ..., flagged, mismatch.
+1. `predictions.csv` is written by `identify_herbarium.py`. Key columns: `true_species`/`true_genus`/`true_family` (recorded labels, blank for indets), `pred_species`/`pred_genus`/`pred_family` with `confidence` (top-1), `indet`, `flagged`, `sparse`, and `top1_name`…`top5_name` each with matching `top{k}_prob`/`top{k}_genus`/`top{k}_family`.
 2. The Review tab lets you browse and correct predictions interactively; changes save back to the CSV.
 3. The Analysis tab loads the CSV and plots confusion matrices, per-species accuracy, top confusions.
 
@@ -228,7 +232,7 @@ No linting or formatting tools are currently configured in the repository. For c
 
 **Pod stuck provisioning**: Check the RunPod console for pod status. If it's RUNNING but SSH times out, the image may not have sshd; use the default base image.
 
-**uv sync extremely slow**: PyPI's CDN can be slow from certain RunPod datacenters. This is a first-time cost; the warm R2 cache (disabled by default, enabled in `cloud_setup.md`) avoids it on subsequent pods.
+**uv sync extremely slow**: Only relevant on the fallback path. Cloud pods boot from a prebaked image (see below) whose venv is baked at `/opt/venv`, so `setup` skips `uv sync` entirely. If a pod is *not* started from the prebaked image, it falls back to pulling a venv tarball from R2, or as a last resort `uv sync` from PyPI wheels — which can be slow from certain datacenters.
 
 **NCCL errors in multi-GPU mode**: If using hierarchical multi-head training without NVLink, set `NCCL_P2P_DISABLE=1` to avoid peer-to-peer comms. The DDP strategy automatically detects and enables `find_unused_parameters=True` when hierarchical mode is on.
 
