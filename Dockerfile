@@ -76,7 +76,13 @@ RUN lock_hash="$(cat pyproject.toml uv.lock | tr -d '\r' | sha256sum | cut -c1-1
     && echo "baked venv cache key: $(cat /opt/venv/.cache_key)"
 
 # ── final ──────────────────────────────────────────────────────────────────
-FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+# Plain -runtime (NOT -cudnn-runtime): torch ships its own cuDNN in the venv
+# (nvidia-cudnn-cu12) and loads that, and DALI doesn't use cuDNN at all — so the
+# base's cuDNN (~1–1.5 GB) is dead weight. -runtime still provides the CUDA
+# runtime libs (libcudart, cublas, …) DALI links against. The builder stage
+# keeps -cudnn-runtime but it never ships (multi-stage), so only this line
+# affects the pull size.
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive \
