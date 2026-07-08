@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import re
 import time
 from collections.abc import Callable
@@ -108,8 +109,12 @@ def _select_ckpts(
 # toggle after the first CI build) for RunPod to pull it without a token.
 #
 # Pin to a specific :sha-<short> tag instead of :latest when you need a pod to
-# match an exact build while debugging.
-DEFAULT_IMAGE = "ghcr.io/ggosline/herbarium-pipeline:latest"
+# match an exact build while debugging. HERBARIUM_POD_IMAGE overrides it for a
+# session (e.g. testing a branch build like :zstd-layers) without a code edit;
+# unset it to fall back to :latest.
+DEFAULT_IMAGE = os.environ.get(
+    "HERBARIUM_POD_IMAGE", "ghcr.io/ggosline/herbarium-pipeline:latest"
+)
 DEFAULT_DATACENTER = "EUR-IS-1"
 DEFAULT_VOLUME_GB = 80
 DEFAULT_CONTAINER_DISK_GB = 40
