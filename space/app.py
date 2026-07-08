@@ -265,6 +265,8 @@ def _load_from_hub(repo: str) -> dict[str, Any]:
         "config": config,
         "use_location": use_location,
         "geo_dim": geo_dim,
+        # Taxa dropped as too sparse at train time — embedded in the checkpoint.
+        "excluded": ckpt.get("excluded_species") or {},
     }
     _loaded.move_to_end(repo)
     while len(_loaded) > _MODEL_CACHE_MAX:
@@ -316,13 +318,27 @@ def _infer_on_gpu(repo: str, x: torch.Tensor,
     return F.softmax(logits, dim=1).cpu()
 
 
+def _excluded_md(excluded: dict) -> str:
+    """One-line notice of taxa the model can't predict (dropped as too sparse)."""
+    taxa = (excluded or {}).get("taxa", {}) or {}
+    if not taxa:
+        return ""
+    rank = (excluded or {}).get("rank", "species")
+    names = sorted(taxa, key=lambda n: taxa[n])   # rarest first
+    shown = ", ".join(f"*{n}*" for n in names[:15])
+    more  = f" +{len(names) - 15} more" if len(names) > 15 else ""
+    return (f"⚠️ **{len(taxa)} {rank} are not in this model** — too few training "
+            f"images, so specimens of these get forced to the nearest trained "
+            f"class:\n\n{shown}{more}")
+
+
 def identify(image: Image.Image, model_choice: str,
-             lat: float | None, lon: float | None) -> dict[str, float]:
+             lat: float | None, lon: float | None) -> tuple[dict[str, float], str]:
     if image is None:
-        return {}
+        return {}, ""
     entry = MODELS.get(model_choice)
     if entry is None:
-        return {}
+        return {}, ""
     repo = entry["repo"]
     bundle = _load_from_hub(repo)
     cfg = bundle["config"]
@@ -333,8 +349,9 @@ def identify(image: Image.Image, model_choice: str,
     probs = _infer_on_gpu(repo, x, geo).squeeze(0)
     topk = torch.topk(probs, k=min(TOPK, probs.numel()))
     nameslist = bundle["nameslist"]
-    return {nameslist[i]: float(p) for i, p in zip(topk.indices.tolist(),
+    preds = {nameslist[i]: float(p) for i, p in zip(topk.indices.tolist(),
                                                     topk.values.tolist())}
+    return preds, _excluded_md(bundle.get("excluded") or {})
 
 
 def _model_info(model_choice: str) -> str:
@@ -436,11 +453,13 @@ with gr.Blocks(title="Herbarium ID", js=_CAPTURE_JS) as demo:
             run = gr.Button("Identify", variant="primary")
         with gr.Column(scale=1):
             out = gr.Label(num_top_classes=TOPK, label="Top-5 predictions")
+            excluded_note = gr.Markdown("")
 
     model_dd.change(fn=_model_info, inputs=model_dd, outputs=info)
     search.change(fn=_filter_models, inputs=[search, model_dd], outputs=model_dd)
     refresh.click(fn=_refresh_models, outputs=[model_dd, info, search])
-    run.click(fn=identify, inputs=[img, model_dd, lat_in, lon_in], outputs=out)
+    run.click(fn=identify, inputs=[img, model_dd, lat_in, lon_in],
+              outputs=[out, excluded_note])
 
 
 # ---------------------------------------------------------------------------

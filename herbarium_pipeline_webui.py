@@ -308,7 +308,7 @@ def _qi_infer(ckpt_path: str, image_path: str,
 
     cache = _quick_id_cache
     if cache.get("ckpt") != ckpt_path:
-        state_dict, model_name, num_classes, nameslist, geo_dim, _label_level, temperature = load_model(
+        state_dict, model_name, num_classes, nameslist, geo_dim, _label_level, temperature, _excluded = load_model(
             Path(ckpt_path), [], 640)
         if not model_name:
             model_name = model_name_hint.strip()
@@ -1700,6 +1700,31 @@ def _build_review() -> tuple:
             load_btn = (ui.button("Load", icon="upload_file")
                         .props("color=primary unelevated"))
     summary_lbl = ui.label("").classes("text-caption text-grey-7 mt-1")
+    # Notice: taxa the model can't predict (dropped as too sparse at train time).
+    # identify writes excluded_species.json next to predictions.csv.
+    excluded_lbl = (ui.label("").classes("text-caption text-orange-9 mt-1")
+                    .style("white-space:normal;line-height:1.3"))
+    excluded_lbl.set_visibility(False)
+
+    def _show_excluded(review_dir: Path) -> None:
+        f = review_dir / "excluded_species.json"
+        try:
+            data = json.loads(f.read_text()) if f.is_file() else {}
+            taxa = data.get("taxa", {}) or {}
+            rank = data.get("rank", "species")
+        except Exception:
+            taxa, rank = {}, "species"
+        if not taxa:
+            excluded_lbl.set_visibility(False)
+            return
+        names = sorted(taxa, key=lambda n: taxa[n])   # rarest first
+        shown = ", ".join(f"{n} ({taxa[n]})" for n in names[:12])
+        more  = f"  +{len(names) - 12} more" if len(names) > 12 else ""
+        excluded_lbl.set_text(
+            f"⚠ {len(taxa)} {rank} not in this model — too few images to train, "
+            f"so their specimens are forced to the nearest trained class: "
+            f"{shown}{more}")
+        excluded_lbl.set_visibility(True)
 
     _section("Filter & Sort")
     with ui.row().classes("w-full items-center gap-4 flex-wrap"):
@@ -2026,6 +2051,7 @@ def _build_review() -> tuple:
             n_flag  = df["flagged"].astype(str).str.lower().isin(("true", "1")).sum()
             summary_lbl.set_text(
                 f"Loaded {n_total:,} total  ·  {n_indet:,} indets  ·  {n_flag:,} flagged")
+            _show_excluded(Path(path).parent)
             _apply_filter()
             ui.notify(f"Loaded {n_total:,} predictions", type="positive")
         except Exception as exc:

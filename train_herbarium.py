@@ -140,11 +140,20 @@ class HerbariumData:
                 f"Cannot apply sparse filter: column '{rank_col}' not in specsin "
                 f"(available: {list(combined.columns)})")
         rank_counts = combined[rank_col].value_counts()
+        # Taxa that have images but fewer than the threshold get dropped here:
+        # the model never sees enough of them to learn them, so it can't predict
+        # them and will force their specimens into some other class. Record
+        # name → image count so the identify step can tell the end user which
+        # taxa the model omits. Sorted by count (rarest first) for a readable list.
+        dropped = rank_counts[rank_counts < sparse_threshold].sort_values()
+        self.excluded_rank = rank_col
+        self.excluded_species = {str(n): int(c) for n, c in dropped.items()}
         combined = combined[combined[rank_col].isin(
             rank_counts[rank_counts >= sparse_threshold].index
         )].copy()
         print(f"  Sparse filter @ {rank_col} (≥{sparse_threshold}): "
-              f"{len(combined):,} rows, {combined[rank_col].nunique():,} classes")
+              f"{len(combined):,} rows, {combined[rank_col].nunique():,} classes "
+              f"({len(self.excluded_species)} taxa dropped as too sparse)")
 
         # Cap images per species (applied before split so stratification still works)
         if max_per_species and max_per_species > 0:
@@ -415,6 +424,13 @@ class LitHerbarium(pl.LightningModule):
         else:
             self._nameslist_payload = data.nameslist
 
+        # Taxa dropped by the sparse filter — embedded in every checkpoint so the
+        # "not in this model" list travels with the weights (e.g. to the HF Space).
+        self._excluded_payload = {
+            "rank": getattr(data, "excluded_rank", "species"),
+            "taxa": getattr(data, "excluded_species", {}),
+        }
+
         num_classes = data.num_classes
 
         def _metrics(n, prefix):
@@ -462,6 +478,7 @@ class LitHerbarium(pl.LightningModule):
 
     def on_save_checkpoint(self, checkpoint):
         checkpoint["nameslist"] = self._nameslist_payload
+        checkpoint["excluded_species"] = self._excluded_payload
         checkpoint["use_location"] = self.use_location
         checkpoint["geo_dim"] = self.config.get("geo_dim", 0)
         # 1.0 while training; patched to the fitted value after the run so
@@ -863,6 +880,18 @@ def train(config: dict):
         nameslist_data = data.nameslist
     nameslist_path.write_text(json.dumps(nameslist_data, indent=2))
     print(f"Saved nameslist ({data.num_classes} classes) → {nameslist_path}")
+
+    # Sidecar: taxa present in the data but dropped by the sparse filter. Lets
+    # the identify step / UI tell the end user which species the model can't
+    # predict (same info is embedded in each checkpoint too).
+    excluded_path = output_dir / "excluded_species.json"
+    excluded_path.write_text(json.dumps({
+        "rank": getattr(data, "excluded_rank", "species"),
+        "threshold": config.get("sparse_threshold", 5),
+        "taxa": getattr(data, "excluded_species", {}),
+    }, indent=2))
+    print(f"Saved excluded list ({len(getattr(data, 'excluded_species', {}))} "
+          f"taxa below threshold) → {excluded_path}")
 
     # Build model
     print(f"Building model: {config['model_name']}")
