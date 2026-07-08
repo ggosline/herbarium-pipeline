@@ -8,7 +8,7 @@ You will create accounts at three services. None of them require a credit card t
 |---|---|---|
 | **RunPod** | Pay-per-minute GPU (~$0.30–$1/hr) | The GPU that runs training |
 | **WandB** *(optional)* | Free for academic use | Live training graphs in your browser |
-| **Cloudflare R2** | 10 GB free, then ~$0.015/GB/month | Persistent storage for project archives + a shared cache that makes every fresh pod ~50× faster to set up |
+| **Cloudflare R2** | 10 GB free, then ~$0.015/GB/month | Persistent storage for project archives + a shared cache for the pretrained model weights |
 
 Total time: **~30 minutes** the first time, **~2 minutes** for every subsequent project.
 
@@ -83,7 +83,7 @@ In the R2 dashboard, click **Create bucket** twice:
 | Bucket name | Purpose |
 |---|---|
 | `herbarium-backup` | One subfolder per project; holds checkpoints, the resized image set, and predictions so you can delete the network volume between projects |
-| `herbarium-cache` | Shared by **every** project: cached PyPI wheels (~2 GB) and Hugging Face model weights (~2 GB) so fresh pods skip the slow downloads |
+| `herbarium-cache` | Shared by **every** project: Hugging Face model weights (~2.7 GB) so fresh pods restore the pretrained backbone from R2 instead of re-downloading it. (Also holds a PyPI-wheel / venv fallback cache, rarely needed now that the pod environment is baked into the image.) |
 
 Leave region and other settings at defaults.
 
@@ -146,18 +146,17 @@ The UI runs in **Cloud mode** by default. The header carries a Local/Cloud toggl
 
 3. **Tab 1 Download → Local DwC-A ZIP**: select your downloaded GBIF DwC-A ZIP file. (The Output paths below are hidden in Cloud mode — the pod uses fixed paths under `/workspace/data/`.) Then in the header, click **Upload DwC-A**.
 
-4. **Tab 1 Download → Run Download** (this dispatches the bootstrap `download` step on the pod). Each fresh pod auto-runs `setup` first. Three speed regimes:
-   - **Cold R2** (very first time anyone in your R2 bucket has run setup): ~5–10 min — pulls all wheels from PyPI, builds the venv, then pushes both the wheel cache and the assembled venv tarball to R2.
-   - **Warm R2 venv cache** (most cases — same lockfile + same Python + same CUDA major as a previous run): ~30–60 s — pulls the assembled venv tarball directly from R2 and skips `uv sync` entirely.
-   - **Same-volume re-provision** (you terminated and re-provisioned a pod attached to the same network volume): near-instant — `/workspace/venv/.cache_key` matches and setup short-circuits.
+4. **Tab 1 Download → Run Download** (this dispatches the bootstrap `download` step on the pod). Each fresh pod auto-runs `setup` first. The pod boots from a **prebaked image** (built by GitHub Actions, published to GHCR) that already contains the full Python environment — torch, DALI, and all locked dependencies baked in at `/opt/venv`. So `setup` is **near-instant**: it detects the prebaked venv and skips the dependency install entirely — nothing to pull from PyPI, no venv to assemble.
 
-   Update `pyproject.toml` or `uv.lock` and the cache key changes, so the next pod takes the cold-R2 path again — but only that once, then everyone else gets the new warm cache. To re-run setup manually (e.g. after `rm -rf /workspace/venv`), use **☁ Cloud Tools → Maintenance → Run Setup step**.
+   The only per-project download is the pretrained backbone weights (~2.7 GB, DINOv3) on the first train; those are cached to `r2:herbarium-cache/huggingface/` so later pods restore them from R2 instead of re-downloading from Hugging Face.
+
+   (A fallback path still exists for a pod **not** started from the prebaked image — it pulls an assembled venv tarball from R2, or as a last resort runs `uv sync` from wheels — but with the default `:latest` image you won't hit it.) To re-run setup manually, use **☁ Cloud Tools → Maintenance → Run Setup step**.
 
 5. **Tab 2 Filter & Crop → Run** (or Tab 3 Resize → Run — both map to the same `prep` step on the pod, which does filter + crop + resize together with hardcoded defaults).
 
 6. **Tab 4 Train → Run Training**. You'll see a one-time confirm: *"Switch to a train pod?"* — this terminates the light pod (volume kept) and provisions an RTX 4090 attached to the same volume. Tick *"Don't ask again"* to make this automatic for future trainings. Configure model / batch size / epochs / LRs / geo / hierarchy / WandB run name on this tab — every knob is shipped to the pod via env vars.
 
-7. **Tab 5 Identify → Run Identify**. Runs on the train pod with bootstrap defaults, auto-picking the most recent .ckpt under `/workspace/data/checkpoints/`.
+7. **Tab 5 Identify → Run Identify**. Runs on the train pod with bootstrap defaults, auto-picking the **best** checkpoint under `/workspace/data/checkpoints/` (highest validation accuracy, then best loss) — so a stale `last.ckpt` left by an earlier run with a different model isn't picked by mistake.
 
 8. **Header → Download results** to pull checkpoints, predictions, and the species list back locally. The Identify-checkpoint and Review-CSV fields auto-populate with the pulled paths.
 
@@ -193,16 +192,14 @@ The whole point of R2 is so you can **terminate volumes between projects** witho
 
 ## Troubleshooting
 
-### "toomanyrequests: You have reached your unauthenticated pull rate limit" at provision time
-RunPod's host hit Docker Hub's anonymous pull cap. The base image (`runpod/pytorch:…`) is on Docker Hub. Wait an hour and retry, or terminate and re-provision (you may land on a different host).
+### Provision fails to pull the pod image
+The pod image lives on GHCR (`ghcr.io/ggosline/herbarium-pipeline:latest`), whose anonymous pulls are **not** subject to Docker Hub's rate limit, so the old "toomanyrequests" failure no longer applies. If a pull does fail, confirm the GHCR package is **public** — a one-time toggle after the first CI build: GitHub → repo → **Packages → herbarium-pipeline → Package settings → Change visibility → Public** — then terminate and re-provision.
 
 ### Pod stuck "waiting for SSH" past 5 minutes
-Check the RunPod console — is the pod's status `RUNNING`? If yes, look at "Connect → SSH over exposed TCP". If grayed out / proxy-only, the image you used doesn't ship `sshd`. Stick with the default image.
+Check the RunPod console — is the pod's status `RUNNING`? If yes, look at "Connect → SSH over exposed TCP". If grayed out / proxy-only, the pod image is missing `sshd`. The prebaked `:latest` image ships `sshd`, so this normally only happens if you overrode the image with one that doesn't.
 
 ### `uv sync` is extremely slow (KB/s, not MB/s)
-PyPI's CDN is sometimes slow from a particular RunPod datacenter. The first setup pays this cost; afterwards the R2 cache short-circuits it. If it never finishes:
-- SSH into the pod and check `ss -i` — if a TCP connection to `151.101.x.x` (Fastly/PyPI) is alive but slow, just wait.
-- If it's truly stuck, terminate and try a different datacenter (but remember: your network volume is locked to its DC, so you'll create a fresh volume).
+This only happens on the **fallback** path — a pod not started from the prebaked image, building the venv from PyPI wheels. The default `:latest` image is prebaked, so you shouldn't see `uv sync` at all. If you do (e.g. after overriding the image), PyPI's CDN can be slow from some datacenters: wait it out, or terminate and re-provision on the default image.
 
 ### `cache_push` / Archive-to-R2 fails with `403 Forbidden / AccessDenied`
 Your R2 API token doesn't have write permission on the target bucket. Cloudflare labels write permission as **"Object Read & Edit"** (not "Write") in the token-creation UI — easy to miss. Recreate the token with that permission and "Apply to all buckets" (or explicitly include both `herbarium-backup` and `herbarium-cache`), then paste the new keys into the WebUI's R2 section and re-Provision.
