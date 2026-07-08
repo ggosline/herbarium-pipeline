@@ -74,8 +74,9 @@ Think of it as a funnel: your inputs (taxon name, optional geographic filter, or
 
 | Field | What to enter |
 |---|---|
-| Taxon rank | Choose Family, Genus, or Order depending on what you are searching |
+| Taxon rank | Choose Family, Genus, or Order depending on what you are searching. Family/Genus query the live GBIF search API; Order fetches a bulk archive |
 | Taxon name | e.g. `Ebenaceae`, `Diospyros`, `Sapindales` |
+| Families (multi) | Optional. One or more family names (space-separated) for a bulk **Darwin Core Archive** download from GBIF — server-side filtering, a citable archive, and no result cap. Preferred over the single Taxon field for whole families; takes precedence when filled |
 | Continent | Optional. Limits results to one continent (e.g. `AFRICA`) |
 | Include countries | Optional. Space-separated ISO-2 codes, e.g. `ZA NG TZ` — only these countries |
 | Exclude countries | Optional. Space-separated ISO-2 codes to leave out, e.g. `MG` |
@@ -189,7 +190,7 @@ Tick **Use lat/lon during training** to fuse geographic coordinates with image f
 
 **WandB run name** *(always visible — just above the Run Training button)*
 
-The one logging field worth changing per experiment. Use descriptive names like `stage2_lr1e-4_geo` so the WandB sidebar stays scannable when you have a dozen runs in one project. The Apply paths button at the top of the page resets it to the project name, so set it after Apply.
+The one logging field worth changing per experiment. Use descriptive names like `stage2_lr1e-4_geo` so the WandB sidebar stays scannable when you have a dozen runs in one project. It defaults to the Project name and **updates automatically whenever you change the Project name**, so if you want a custom run name, set it *after* choosing the project.
 
 Click **Run Training**.
 
@@ -264,7 +265,9 @@ Once you have a trained checkpoint you can publish it to the [Hugging Face Hub](
 
 ## Review tab
 
-Loads a `predictions.csv` file and lets you browse predictions image by image. Filter by category (all, indets, flagged, mis-ID, high confidence) and sort by confidence or species name. You can correct individual determinations directly in the browser and save changes back to the CSV.
+Loads a `predictions.csv` file and lets you browse predictions image by image. Filter by category (all, indets, flagged, mis-ID, high confidence, or sparse) and sort by confidence or species name. *Mis-ID* shows only specimens whose **recorded** species differs from the prediction — specimens with no recorded species (indets) are excluded. You can correct individual determinations directly in the browser and save changes back to the CSV.
+
+If any species were left out of the model (too sparse to train), a notice at the top of this tab lists them — those specimens can never be predicted correctly.
 
 ---
 
@@ -273,7 +276,7 @@ Loads a `predictions.csv` file and lets you browse predictions image by image. F
 Loads a `predictions.csv` and produces three outputs from a single **Load & Plot** click:
 
 - **Overall metrics** — Accuracy, Precision (macro), Recall (macro), and F1 (macro) displayed as summary cards, at species, genus, or family level.
-- **Confusion matrix** — heatmap of the top N most-confused true species (Y-axis) against the top N most-predicted species for those rows (X-axis). Tooltip shows True / Predicted and Recall %.
+- **Confusion matrix** — a square heatmap with the **same class order on both axes**, so correct predictions fall on the diagonal (top-left to bottom-right). The full view shows every class; setting *Top N* restricts it to the most-confused true classes plus the classes they were misidentified as. Tooltip shows True / Predicted and Recall %.
 - **Per-species accuracy** — horizontal bar chart, sorted worst-first, coloured red→green.
 - **Most confused pairs** — plain table of True → Predicted pairs that occur at least *Min confusions* times, sorted by count.
 
@@ -354,7 +357,7 @@ Usually caused by class imbalance. The pipeline compensates with inverse-frequen
 Some GBIF links are broken or the host server is slow. A failure rate below 20% is typical and not a problem — the script logs failures and continues.
 
 **What does "sparse" mean in the metadata?**
-A species is marked sparse if it has fewer than 5 images with confirmed files on disk. Sparse species are excluded from training because there is not enough data to learn them reliably.
+A species is marked sparse if it has fewer than 5 images with confirmed files on disk. Sparse species are excluded from training because there is not enough data to learn them reliably. Because the model never sees them it cannot predict them, so after Identify the excluded species are listed for you — a banner in the run log, `excluded_species.json` / `excluded_species.csv` in the review folder, and a notice at the top of the Review tab. Any specimen of an excluded species is forced to the nearest species the model *does* know.
 
 **The GPU runs out of memory during training. What can I do?**
 Reduce **Batch size** (try 2 or 1), increase **Grad accum** by the same factor to compensate, or choose a smaller model such as `efficientnet_b4`.
