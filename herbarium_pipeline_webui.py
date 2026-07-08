@@ -2990,18 +2990,33 @@ def _cloud_info(msg: str) -> None:
 
 
 def _ensure_orch() -> Optional[CloudOrchestrator]:
-    """Return the active orchestrator, creating one if credentials allow."""
-    if _cloud["orch"] is not None:
-        return _cloud["orch"]
+    """Return the active orchestrator, creating one if credentials allow.
+
+    Rebuilds when the Project name changed since the cached orchestrator was
+    made. Without this, switching the Project name at the top of the page
+    would silently keep the previous project's orchestrator — so provision()
+    would attach to (and save state onto) the old project's volume/pod under
+    the new name. The orchestrator's project is fixed at construction, so a
+    name change must discard the cache.
+    """
+    gs = app.storage.general
+    proj = (gs.get("main_proj") or "").strip()
+    cached: Optional[CloudOrchestrator] = _cloud["orch"]
+    if cached is not None and cached.project == proj:
+        return cached
     api_key = cloud_secrets.get_runpod_api_key()
     if not api_key:
         _cloud_warn("Open the ⚙ Setup tab and save your RunPod API key first.")
         return None
-    gs = app.storage.general
-    proj = (gs.get("main_proj") or "").strip()
     if not proj:
         _cloud_warn("Set the Project name at the top of the page first.")
         return None
+    if cached is not None:
+        # Switching projects: the cached pod handle belongs to the old
+        # project. Drop it so steps don't run against it under the new name;
+        # the old project's state file still tracks that pod for later reuse.
+        _clear_active_pod()
+        _cloud_info(f"Project changed to {proj!r} — orchestrator reloaded.")
     ssh_key = (gs.get("cloud_ssh_key") or "").strip() or None
     _cloud["orch"] = CloudOrchestrator(api_key, proj, key_filename=ssh_key)
     return _cloud["orch"]
