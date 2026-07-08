@@ -4750,6 +4750,13 @@ def main_page():
                             ui.label("Project name:").classes("text-sm font-bold shrink-0")
                             proj_inp = (ui.input(value="").props("dense outlined").classes("w-44")
                                         .bind_value(app.storage.general, "main_proj"))
+                            # Keep the W&B run name in step with the project. tr_wandb_name
+                            # is otherwise only refreshed by "Apply paths", so a project
+                            # switch left it stale and W&B logged the run under the previous
+                            # family's name. Fires only on an actual change to the project.
+                            proj_inp.on_value_change(
+                                lambda e: setattr(tr_wandb_name, "value", (e.value or "").strip())
+                                if (e.value or "").strip() else None)
 
                         with ui.row().classes("items-center gap-1"):
                             ui.label("Image folder:").classes("text-sm font-bold shrink-0")
