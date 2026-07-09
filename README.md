@@ -7,7 +7,7 @@ The application has **two modes**, switchable from the toggle in the top-right o
 - **☁ Cloud** *(default)* — orchestrates a rented GPU pod on RunPod from this UI. Recommended for everyone: training is faster on a 4090 than most local GPUs, costs a few US dollars per run, and needs no local GPU at all. GPU compute becomes a disposable, ephemeral utility — the pod is provisioned on demand and auto-terminated, while your data and trained models persist on Cloudflare R2 and your local disk. Setup is one-time (see [cloud_setup.md](cloud_setup.md)).
 - **💻 Local** — runs the scripts on this machine. Requires an NVIDIA GPU with ≥20 GB VRAM for training the recommended ViT-Large model.
 
-This guide covers both modes. The five processing tabs (Download / Filter & Crop / Resize / Train / Identify) work the same way in either; what differs is *where* the work runs and which fields apply.
+This guide covers both modes. The interface is a numbered workflow, read left to right — **① Download → ② Clean → ③ Train → ④ Identify → ⑤ Review → ⑥ Archive → ⑦ Publish** — plus a **Get Started** tab for one-time setup, a **Tools ▾** menu for ancillary features (Quick ID, Distribution), and a **☁ Cloud** tab (Cloud mode only) for pod plumbing. Each step works the same in either mode; what differs is *where* the work runs and which fields apply.
 
 ---
 
@@ -19,8 +19,7 @@ This guide covers both modes. The five processing tabs (Download / Filter & Crop
 - Local disk space only for downloaded results (checkpoints, predictions, optionally the resized image set for the Review tab).
 
 **For Local mode:**
-- A Windows or Linux PC with an NVIDIA GPU (required for training; ~20 GB VRAM minimum for the default ViT-Large recipe).
-- The conda environment `p12` already set up on this machine.
+- To *run pipeline steps on this machine* you need the ML stack installed (the "Enable offline AI features" button, or `uv sync --extra local-ml`). Identify / Quick ID run on the **CPU** (no GPU needed, just slower); *training* a large model locally still wants an NVIDIA GPU with ~20 GB VRAM.
 - An internet connection for the download step.
 - Disk space: plan for roughly 1–2 GB per 1,000 images at default GBIF thumbnail size; 5–15 GB per 1,000 at IIIF size 2048.
 
@@ -28,29 +27,35 @@ This guide covers both modes. The five processing tabs (Download / Filter & Crop
 
 ## Starting the application
 
-Open a terminal, activate the environment, and launch the web UI:
+**Portable (recommended for most users):** unzip the distribution anywhere and run `start.bat` (Windows) or `./start.sh` (macOS/Linux). No Python or conda required — [uv](https://docs.astral.sh/uv/) fetches its own Python and builds the environment on first launch (~150 MB, ~1 minute). See [PORTABLE.md](PORTABLE.md).
+
+**From source (developers):**
 
 ```
-conda activate p12
-python /path/to/Pipeline/herbarium_pipeline_webui.py
+uv sync                       # slim install (UI + cloud orchestration)
+uv sync --extra local-ml      # add only if you run pipeline steps locally
+uv run python herbarium_pipeline_webui.py
 ```
 
-Your browser will open automatically at `http://localhost:8765`. All settings — including the Local/Cloud toggle — are **saved automatically** as you type. If you close and reopen the application, every field is restored exactly where you left off.
+(A conda environment such as `p12` also works if you already have one.)
+
+Your browser will open automatically at `http://localhost:8765`. All settings — including the Local/Cloud toggle — are **saved automatically** as you type. If you close and reopen the application, every field is restored exactly where you left off. The base install is slim; the whole **cloud** pipeline runs without any ML libraries locally — click **Enable offline AI features** on the Get Started tab when you want to identify specimens on this machine.
 
 ### Header at a glance
 
-- **Top-right toggle** — switches Local ↔ Cloud. Sticky across restarts; defaults to Cloud on first launch.
-- **Cloud pod strip** *(visible in Cloud mode)* — pod ID, hourly rate, running cost, current step. Buttons: Provision, Upload DwC-A, Download results, Cancel step, Terminate. The Purpose dropdown (`light` / `train`) decides which GPU type a fresh Provision asks for; the next section explains why.
+- **Mode toggle** — Local ↔ Cloud lives in **Get Started → Execution mode**; a small "💻 Local mode" badge shows in the header when Local is active. Defaults to Cloud on first launch.
+- **Busy chip** — an amber "⏳ … running" chip appears next to the status whenever a step or transfer is in flight, so you know to Cancel/Stop before starting another action.
+- **Cloud pod strip** *(visible in Cloud mode)* — shows the live pod (ID, hourly rate, running cost, current step) and the GPU the next Provision will request. Buttons: **Provision** (the primary action), **Pod options ▾** (purpose, GPU override, attach an existing pod, prebaked image), **Cancel step**, **Terminate**. Data movement is no longer here — uploads live on **① Download** and pulling results lives on **⑤ Review** (see below).
 
 ### Tabs
 
-The same five processing tabs appear in either mode (1 Download → 5 Identify). In Cloud mode the Run button on each tab dispatches the work to the pod; in Local mode it runs the script as a subprocess on this machine. Path / output fields that don't apply are hidden depending on the mode you're in.
+The numbered spine (① → ⑦) is the workflow. In Cloud mode the Run button on each step dispatches the work to the pod; in Local mode it runs the script as a subprocess on this machine. Path / output fields that don't apply are hidden depending on the mode you're in.
 
-- **⚙ Setup** — one-time configuration: cloud credentials (RunPod / WandB / R2), SSH key, local environment check. Once everything is green here you should not need to come back.
-- **1 Download → 5 Identify** — the five-step pipeline.
-- **Run All** — sequences the five steps end-to-end. In Cloud mode this also handles provisioning and the auto-upgrade from a light pod to a train pod (see "Train tab" below).
-- **Review, Analysis, Quick ID, Distribution** — work with results once produced.
-- **☁ Cloud Tools** *(Cloud mode only, last tab)* — advanced and rare actions: GPU/datacenter overrides, download caps, R2 archive/restore, pull tarred image set, wipe pod-side directories.
+- **Get Started** — orientation, a New-project form, an at-a-glance Status strip (credentials + environment), a progress rail, and one-time setup: cloud credentials (RunPod / WandB / HF / R2), SSH key, environment check, and Portability (export/import settings). Once everything is green you rarely come back.
+- **① Download → ⑦ Publish** — the seven-step pipeline (Download, Clean, Train, Identify, Review, Archive, Publish).
+- **Run All** — sequences the core steps end-to-end. In Cloud mode this also handles provisioning and the auto-upgrade from a light pod to a train pod (see "Train tab" below).
+- **Tools ▾** — a menu holding the ancillary features: **Quick ID** (single-image drag-and-drop identification) and **Distribution** (image-count charts).
+- **☁ Cloud** *(Cloud mode only, last tab)* — advanced and rare actions: GPU/datacenter overrides, download caps, prep settings, maintenance, and a danger zone for wiping pod-side directories.
 
 ---
 
@@ -62,11 +67,11 @@ At the very top of the window are two fields and an image folder selector:
 - **Project name** — a short name for the current project (e.g. `Sapindales` or `AfricanEbenaceae`).
 - **Image folder** — which subfolder of the project holds the images (`images`, `images_cropped`, or `images_filtered`). You can type a custom name.
 
-Click **Apply paths** and the application fills in sensible file paths for every tab, all stored under `<Projects root>/<ProjectName>/`. You can still change any individual path afterwards.
+Click **Apply paths** and the application fills in sensible file paths for every tab, all stored under `<Projects root>/<ProjectName>/`. You can still change any individual path afterwards. The easiest way to start a project is the **New-project form on the Get Started tab** — enter a family (and optional region) and click **Create / open project**; it makes the folder and wires every step's paths in one click.
 
 ---
 
-## Tab 1 — Download
+## ① Download
 
 Downloads specimen images and metadata from [GBIF](https://www.gbif.org), the Global Biodiversity Information Facility.
 
@@ -89,7 +94,9 @@ Think of it as a funnel: your inputs (taxon name, optional geographic filter, or
 | Resize on download | Optional. Shrink images to at most N pixels on the longer side immediately after downloading, saving disk space. 0 = off. |
 | Max per species | Optional. Randomly subsample each species to at most N images (0 = no cap). |
 
-Click **Run Download**. Progress appears in the log panel. The script skips images already downloaded, so re-running safely picks up additions.
+Click **Run Download**. Progress appears in the log panel. The script skips images already downloaded, so re-running safely picks up additions. If one institution's image server is degraded (common in the afternoon), the downloader now detects the failing host and gives up on it quickly rather than letting it stall the parallel workers — so a single dead provider no longer drags the whole run to a crawl.
+
+**Send to pod** *(Cloud mode)* — if you prepared a Darwin Core Archive ZIP or a `specsin.csv` locally, the **Send to pod** buttons here upload them to the running pod as an alternative to fetching from GBIF on the pod itself.
 
 **IIIF note:** Many herbaria (Naturalis/Leiden, Meise, Kew, and others) serve scans through the IIIF standard, allowing the client to request a specific resolution. Setting IIIF size to `2048` retrieves a much larger version than the GBIF default thumbnail. `max` requests the full archival scan — useful for inspection but very large (10–150 MB per image).
 
@@ -97,9 +104,9 @@ Click **Run Download**. Progress appears in the log panel. The script skips imag
 
 ---
 
-## Tab 2 — Filter & Crop
+## ② Clean
 
-Removes non-herbarium images (field photographs of living plants, microscope slides) and trims the dark scanning-bed border many institutional scanners leave around sheets.
+Removes non-herbarium images (field photographs of living plants, microscope slides) and trims the dark scanning-bed border many institutional scanners leave around sheets. (This was the old "Filter & Crop" tab; the separate Resize step is now folded in here as an option — see below.)
 
 | Field | What to enter |
 |---|---|
@@ -114,32 +121,18 @@ Removes non-herbarium images (field photographs of living plants, microscope sli
 
 **Filter options**
 
-- *Method* — `clip` uses an AI vision model (requires GPU, more accurate); `hsv` uses colour statistics (faster, CPU only)
+- *Method* — `clip` uses an AI vision model (runs on the pod's GPU, more accurate); `hsv` uses colour statistics (faster, CPU only)
 - *Confidence* — how certain the classifier must be to keep an image (0.6 = 60%). Lower keeps more; higher is stricter
 
 Rejected images go into a `rejected/` subfolder; living-plant field photographs go into `live/`.
 
-Click **Run Filter & Crop**.
+Click **Run Clean**.
+
+**Optional: resize** — expand *"Optional: resize images before upload / train"* to scale images so their longest side is at most 1,024 px (or another size). Downloads are already size-capped, so this is usually unnecessary — use it only to shrink an existing image set. Options: max size, *No upscale* (leave small images as-is), and *Force PIL* (if NVIDIA DALI isn't available).
 
 ---
 
-## Tab 3 — Resize
-
-Scales all images so their longest side is at most 1,024 pixels (or another size you choose). Smaller uniform images train faster and use less disk space.
-
-| Field | What to enter |
-|---|---|
-| Input images dir | Folder of images to resize |
-| Output images dir | Leave blank to resize in place, or enter a different folder to keep originals |
-| Max size (px) | Longest-side limit in pixels (default 1,024) |
-| No upscale | Ticked by default — small images are left as-is rather than enlarged |
-| Force PIL (no DALI) | Tick if NVIDIA DALI is not installed or causes errors |
-
-Click **Run Resize**.
-
----
-
-## Tab 4 — Train
+## ③ Train
 
 Trains the AI model. Expect hours depending on the number of images and GPU speed. Settings are organised into accordion sections — **Model & batch size** and **Schedule (epochs, learning rates, cool-down)** are open by default; the rest (Loss & hierarchy, Geo features, Logging & resume) are collapsed because their defaults work for most runs.
 
@@ -192,11 +185,11 @@ Tick **Use lat/lon during training** to fuse geographic coordinates with image f
 
 The one logging field worth changing per experiment. Use descriptive names like `stage2_lr1e-4_geo` so the WandB sidebar stays scannable when you have a dozen runs in one project. It defaults to the Project name and **updates automatically whenever you change the Project name**, so if you want a custom run name, set it *after* choosing the project.
 
-Click **Run Training**.
+Click **Run Training**. When the run prints its Weights & Biases URL, a clickable **W&B run** chip appears in the Output panel's header so you don't have to hunt for it in the log — it opens the live dashboard in a new tab.
 
 ---
 
-## Tab 5 — Identify
+## ④ Identify
 
 Runs the trained model over your images along two paths:
 
@@ -263,42 +256,52 @@ Once you have a trained checkpoint you can publish it to the [Hugging Face Hub](
 
 ---
 
-## Review tab
+## ⑤ Review
 
-Loads a `predictions.csv` file and lets you browse predictions image by image. Filter by category (all, indets, flagged, mis-ID, high confidence, or sparse) and sort by confidence or species name. *Mis-ID* shows only specimens whose **recorded** species differs from the prediction — specimens with no recorded species (indets) are excluded. You can correct individual determinations directly in the browser and save changes back to the CSV.
+Browse, correct, and analyse the predictions — the old Review and Analysis tabs are now one place to "look at the results."
 
-If any species were left out of the model (too sparse to train), a notice at the top of this tab lists them — those specimens can never be predicted correctly.
+**Get results** *(top of the Data source section)* — fetch what you need to review straight from wherever it lives, then load it in one click:
+- **From pod** — pulls `predictions.csv` + the trained checkpoint (and the images, only if they aren't already on disk), while a pod is running.
+- **From R2 archive** — restores an archived project (checkpoints, specsin, predictions, images) via rclone; works with the pod shut down. Images are pulled only if the local folder is empty — delete it to force a refresh.
 
----
+**Browse & correct** — page through predictions image by image. Filter by category (all, indets, flagged, mis-ID, high confidence, or sparse) and sort by confidence or species name. *Mis-ID* shows only specimens whose **recorded** species differs from the prediction — indets are excluded. Correct individual determinations directly in the browser and save changes back to the CSV. If any species were too sparse to train, a notice at the top lists them — those specimens can never be predicted correctly.
 
-## Analysis tab
-
-Loads a `predictions.csv` and produces three outputs from a single **Load & Plot** click:
-
-- **Overall metrics** — Accuracy, Precision (macro), Recall (macro), and F1 (macro) displayed as summary cards, at species, genus, or family level.
-- **Confusion matrix** — a square heatmap with the **same class order on both axes**, so correct predictions fall on the diagonal (top-left to bottom-right). The full view shows every class; setting *Top N* restricts it to the most-confused true classes plus the classes they were misidentified as. Tooltip shows True / Predicted and Recall %.
-- **Per-species accuracy** — horizontal bar chart, sorted worst-first, coloured red→green.
-- **Most confused pairs** — plain table of True → Predicted pairs that occur at least *Min confusions* times, sorted by count.
+**Analysis** *(below the carousel)* — a single **Load & Plot** produces: overall metrics (Accuracy, Precision, Recall, F1 — macro, at species/genus/family level); a **confusion matrix** (square heatmap, same class order on both axes so correct predictions fall on the diagonal; *Top N* restricts to the most-confused classes); a **per-species accuracy** bar chart (worst-first, red→green); and a **most-confused pairs** table.
 
 ---
 
-## Distribution tab
+## ⑥ Archive
 
-Shows the image count per species as a bar chart. Enter a specsin CSV and images directory, then optionally cap the number of images per species and filter to only species that have image files on disk. Use the export button to save a filtered CSV.
+Pull the finished image set and predictions back to this machine, or archive the whole project to **Cloudflare R2** so you can delete the pod's network volume and restore it later (to a fresh pod, or directly to this machine via rclone — no pod needed). Restoring is also available straight from ⑤ Review's "Get results → From R2 archive".
+
+---
+
+## ⑦ Publish
+
+The final step: push the project's best checkpoint (highest validation accuracy) to the **Hugging Face Hub** so the public **herbarium-id** Space can serve it — needs a write token (Get Started → Hugging Face). See "Publishing a model & identifying on a phone" above for how discovery and phone identification work.
+
+---
+
+## Tools ▾ — Quick ID & Distribution
+
+Reached from the **Tools ▾** menu next to the tab strip:
+
+- **Quick ID** — drag, paste, or drop a single image (or an image URL) to identify one specimen on the spot, using the Active checkpoint. Optionally enter lat/lon for geo-aware models. Runs on CPU locally (needs the offline AI features installed) or you can use the hosted Space from a phone.
+- **Distribution** — image count per species as a bar chart. Enter a specsin CSV and images directory, optionally cap images per species and filter to species with files on disk, and export a filtered CSV.
 
 ---
 
 ## Run All tab
 
-Chains all five pipeline steps together automatically. Tick only the steps you want to run, then click **Run Full Pipeline**. Each step uses the settings entered in its own tab, so configure those first.
+Chains the core pipeline steps together automatically. Tick only the steps you want to run, then click **Run Full Pipeline**. Each step uses the settings entered in its own tab, so configure those first.
 
 In **Cloud mode** Run All also handles pod lifecycle: it provisions a light pod, uploads the DwC-A, runs Setup → Download → Prep, then auto-terminates the light pod (volume preserved), provisions a train pod, and runs Train → Identify → Download results. The pod stays alive after — terminate from the header strip when finished. If a step fails the sequencer stops and leaves the current pod running so you can investigate.
 
 In **Local mode** the steps run as subprocesses on this machine in the order shown.
 
 Typical use:
-- First time: tick all five steps
-- Re-training after adding more images: tick Download, Filter & Crop, and Train only
+- First time: tick all steps
+- Re-training after adding more images: tick Download, Clean, and Train only
 - Re-running identification after improving the model: tick Identify only
 
 ## Train tab — auto upgrade from light to train pod (Cloud mode)
@@ -307,7 +310,7 @@ Cloud mode uses two GPU sizes:
 - **light** — cheap L4 — fine for Download, Prep, Identify
 - **train** — RTX 4090 — needed for the actual training run
 
-When you click **Run Training** in Cloud mode while the active pod is `light`, you get a one-time confirmation: *"Switch to a train pod?"*. Confirming terminates the light pod (the network volume + downloaded images are preserved), provisions a train pod attached to the same volume, syncs your code, and runs train. Tick *"Don't ask again"* in that dialog to make this automatic for all future trainings. Identify can run on either pod size, so the train pod is reused; downsize manually from Cloud Tools if you want to save a few cents.
+When you click **Run Training** in Cloud mode while the active pod is `light`, you get a one-time confirmation: *"Switch to a train pod?"*. Confirming terminates the light pod (the network volume + downloaded images are preserved), provisions a train pod attached to the same volume, syncs your code, and runs train. Tick *"Don't ask again"* in that dialog to make this automatic for all future trainings. Identify can run on either pod size, so the train pod is reused; downsize manually from the ☁ Cloud tab if you want to save a few cents.
 
 The `Purpose` dropdown in the header pod strip controls what a manual *Provision* call asks for — it doesn't trigger an upgrade by itself.
 
@@ -354,7 +357,7 @@ No. Browse to `<project>/runs/checkpoints/last.ckpt` in the **Resume checkpoint*
 Usually caused by class imbalance. The pipeline compensates with inverse-frequency weighting, but very extreme imbalances can still cause problems. Try downloading more images for rare species, or use *Max per species* to cap the dominant ones.
 
 **Images are downloading but many are failing. Is that normal?**
-Some GBIF links are broken or the host server is slow. A failure rate below 20% is typical and not a problem — the script logs failures and continues.
+Some GBIF links are broken or the host server is slow. A failure rate below 20% is typical and not a problem — the script logs failures and continues. If one institution's server is badly degraded, the downloader detects the failing host after a few timeouts and stops waiting on it, so it can't stall the whole run; those images are simply skipped and can be retried later. Slowness that's clearly one provider is usually best waited out (try again when European servers are less busy).
 
 **What does "sparse" mean in the metadata?**
 A species is marked sparse if it has fewer than 5 images with confirmed files on disk. Sparse species are excluded from training because there is not enough data to learn them reliably. Because the model never sees them it cannot predict them, so after Identify the excluded species are listed for you — a banner in the run log, `excluded_species.json` / `excluded_species.csv` in the review folder, and a notice at the top of the Review tab. Any specimen of an excluded species is forced to the nearest species the model *does* know.
@@ -366,13 +369,13 @@ Reduce **Batch size** (try 2 or 1), increase **Grad accum** by the same factor t
 This is handled automatically — the DDP strategy sets `find_unused_parameters=True` whenever hierarchical mode is enabled.
 
 **My settings are gone after restarting the app.**
-Settings are persisted to `<Pipeline repo>/.nicegui/storage-general.json` (relative to where you launched the script). If this file is missing or corrupted, fields will revert to defaults. Use **Apply paths** to quickly restore all project paths from the Projects root and Project name fields. Cloud credentials live in the OS keyring (not this JSON), so they survive even if the storage file is wiped.
+Settings are persisted to `<Pipeline repo>/.nicegui/storage-general.json` (relative to where you launched the script). If this file is missing or corrupted, fields will revert to defaults. Use **Apply paths** to quickly restore all project paths from the Projects root and Project name fields. Cloud credentials live in the OS keyring (not this JSON), so they survive even if the storage file is wiped. To move a whole setup to another machine, use **Get Started → Portability → Export / Import settings**.
 
 ---
 
 ## Stopping a running step
 
-Click the **Stop** button in the top-right corner of the window at any time. The current process will be terminated.
+Click **Stop** in the top-right corner (local runs) or **Cancel step** in the pod strip (cloud runs) at any time. The amber "⏳ … running" chip in the header shows when something is in flight — if a click is ignored with "already running", cancel the current work first. Note that a browser refresh leaves a running task going in the background; the busy chip and Stop stay usable so you can still cancel it.
 
 ---
 

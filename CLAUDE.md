@@ -96,12 +96,24 @@ Updated incrementally during Download (new rows), Filter (hasfile, rejected flag
 # Activate the conda environment (assumes it exists)
 conda activate p12
 
-# Install/update dependencies (uses uv, faster than pip)
+# Slim install — web UI + cloud orchestration, no torch (~150 MB).
+# Enough to drive the whole CLOUD pipeline from any machine.
 uv sync
+
+# Full install — adds the ML stack (torch, timm, transformers, opencv, wandb)
+# needed to run training / identify / filter / Quick ID ON THIS MACHINE.
+uv sync --extra local-ml
 
 # Run the web UI
 python herbarium_pipeline_webui.py
 ```
+
+**Dependency split:** heavy ML deps live in the optional `local-ml` extra so a
+plain `uv sync` stays slim and portable — the web UI imports no torch at module
+load (Quick ID / analysis import it lazily). If you run any pipeline step
+locally (not on a pod), you need `uv sync --extra local-ml`. The pod image and
+`pod_bootstrap.sh` always install the extra; the UI exposes it as the
+"Enable offline AI features" button.
 
 Opens automatically at `http://localhost:8765`. Settings persist to `~/.config/herbarium_pipeline.json` and OS keyring.
 
@@ -156,14 +168,24 @@ python identify_herbarium.py \
 
 **Package manager**: `uv` (faster, more efficient than pip; `uv.lock` is the lockfile).
 
-**Key dependencies**:
-- **ML**: torch, torchvision, pytorch-lightning, timm, transformers (CLIP)
+**Key dependencies** — split into a slim core and an optional `local-ml` extra:
+
+*Core (always installed by `uv sync`):*
 - **Data**: numpy, pandas, scikit-learn
-- **Image I/O**: Pillow, opencv-python-headless
-- **NVIDIA DALI**: installed separately (not in `pyproject.toml`) because the wheel name depends on CUDA version; see `pod_bootstrap.sh`.
-- **Web UI**: nicegui
+- **Image I/O**: Pillow (review display + PIL resize fallback)
+- **Web UI**: nicegui (charts use its built-in ECharts — no matplotlib/plotly)
 - **Cloud**: httpx, paramiko, keyring
-- **Tracking**: wandb, tqdm
+- **CLI**: tqdm
+
+*`local-ml` extra (`uv sync --extra local-ml`) — only to run pipeline steps on this machine:*
+- **ML**: torch, torchvision, pytorch-lightning, torchmetrics, timm, transformers (CLIP)
+- **Image**: opencv-python-headless (crop in filter_and_crop)
+- **Tracking**: wandb
+- **NVIDIA DALI**: installed separately (not in `pyproject.toml`) because the wheel name depends on CUDA version; see `pod_bootstrap.sh`.
+
+The web UI imports none of the extra at module load, so the slim install runs
+the UI and the entire *cloud* pipeline. The pod image / `pod_bootstrap.sh`
+always install `--extra local-ml`.
 
 **Optional**: WandB for live training graphs (free for academic use, credential optional).
 

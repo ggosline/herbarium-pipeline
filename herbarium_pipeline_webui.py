@@ -13,6 +13,7 @@ Run:
 
 import asyncio
 import json
+import re
 import shlex
 import sys
 import time
@@ -75,6 +76,29 @@ CONFIG_PATH = Path.home() / ".config" / "herbarium_pipeline.json"
 _quick_id_cache: dict = {}   # keys: ckpt, model, nameslist, geo_dim, device
 _qi_url_drop:   dict = {}   # set by /api/qi_fetch_url, consumed by per-client timer
 _review_shared: dict = {}   # shared between review tab and /review-carousel page
+
+# Populated by the page builder (@ui.page("/")) so the Get Started tab — which
+# is built inside a separate function — can drive path setup and tab
+# navigation that otherwise live only in the page-function closure. Filled in
+# after the tabs and _apply_paths exist; the Get Started buttons read these at
+# click time, by which point they're populated.
+_page_hooks: dict = {
+    "apply_paths": None,   # callable(base=None, name=None, img_folder=None)
+    "goto_tab":    None,   # callable(tab_ref)
+    "tab_refs":    {},     # str key -> ui.tab
+}
+
+# The seven-stage workflow, in order. (key, label, one-line description).
+# key doubles as the _page_hooks["tab_refs"] lookup for the "Open" buttons.
+_STEP_FLOW = [
+    ("download", "① Download", "Fetch specimen images + metadata from GBIF"),
+    ("clean",    "② Clean",    "Drop non-herbarium images and crop scanner borders"),
+    ("train",    "③ Train",    "Fine-tune the model on a GPU pod"),
+    ("identify", "④ Identify", "Run inference; flag mismatches and unknowns"),
+    ("review",   "⑤ Review",   "Browse, correct, and analyse the predictions"),
+    ("archive",  "⑥ Archive",  "Back up the whole project to Cloudflare R2"),
+    ("publish",  "⑦ Publish",  "Push the trained model to Hugging Face"),
+]
 
 # ---------------------------------------------------------------------------
 # AI-powered review filter (Claude Haiku)
@@ -412,6 +436,44 @@ _log:      Optional[ui.log]    = None
 _status:   Optional[ui.label]  = None
 _stop_btn: Optional[ui.button] = None
 
+# W&B run link — a clickable chip in the output-panel header that appears the
+# moment a run URL is spotted in the training output, so it isn't lost in the
+# hundreds of streamed lines. _wandb_url holds the current URL for the click
+# handler. Set during UI construction.
+_wandb_link: Optional[ui.button] = None
+_wandb_url:  list[str]           = [""]
+_WANDB_RE = re.compile(r"https?://(?:[\w.-]+\.)?wandb\.ai/[^\s]+?/runs/[\w-]+")
+
+
+def _scan_wandb(text: str) -> None:
+    """Spot a W&B run URL in a streamed output line and surface it in the
+    output-panel header. Cheap short-circuit so it can run on every line."""
+    if _wandb_link is None or not text or "wandb.ai" not in text or "/runs/" not in text:
+        return
+    m = _WANDB_RE.search(text)
+    if not m:
+        return
+    url = m.group(0).rstrip(".,);]'\"")
+    if _wandb_url[0] == url:
+        return
+    _wandb_url[0] = url
+    try:
+        _wandb_link.set_visibility(True)
+        _wandb_link.tooltip(url)
+    except RuntimeError:
+        pass  # client navigated away
+
+
+def _reset_wandb() -> None:
+    """Hide the W&B run chip and forget its URL — called when a new training
+    run starts so a stale link from the previous run can't be clicked."""
+    _wandb_url[0] = ""
+    if _wandb_link is not None:
+        try:
+            _wandb_link.set_visibility(False)
+        except RuntimeError:
+            pass  # client navigated away
+
 # Static-file routes registered for the Review image carousel.
 # Keyed by directory path so each dir is mounted only once per server session.
 _img_routes: dict[str, str] = {}
@@ -435,7 +497,9 @@ async def _launch(cmd: list[str], on_done=None, extra_env: dict | None = None) -
     if not cmd:
         return
     if _proc and _proc.returncode is None:
-        ui.notify("A process is already running.", type="warning")
+        ui.notify("A step is already running — click Stop to cancel it first "
+                  "(a browser refresh can leave one running in the background).",
+                  type="warning", timeout=6000)
         return
 
     _log.push(f"\n$ {shlex.join(cmd)}\n")
@@ -457,6 +521,7 @@ async def _launch(cmd: list[str], on_done=None, extra_env: dict | None = None) -
     def _push(text: str) -> None:
         try:
             _log.push(text)
+            _scan_wandb(text)
         except RuntimeError:
             pass  # client navigated away
 
@@ -548,7 +613,7 @@ def _build_download() -> callable:
     families  = (_text_row("Families (multi):", "", "w-full")
                  .bind_value(gs, "dl_families"))
     ui.label("Space-separated list for a combined GBIF bulk download (e.g. split clades). "
-             "Overrides Taxon name. Cloud mode only — requires GBIF credentials in Setup tab."
+             "Overrides Taxon name. Cloud mode only — requires GBIF credentials in Get Started tab."
              ).classes("text-caption text-grey-7 ml-48")
     continent = _text_row("Continent:", "AFRICA", "w-36").bind_value(gs, "dl_continent")
 
@@ -613,6 +678,21 @@ def _build_download() -> callable:
               on_click=lambda: _run_step_mode_aware(
                   "download", _dl_cmd, cloud_env_fn=_cloud_env_download)
               ).props("color=primary unelevated").classes("mt-4")
+
+    # Cloud seeding: push a locally-prepared DwC-A ZIP or specsin.csv to the
+    # pod, as an alternative to fetching from GBIF on the pod itself. Cloud
+    # mode only. (These used to be a "mystery" Upload menu in the header.)
+    with _cloud_only(ui.row().classes("w-full items-center gap-2 mt-2")):
+        ui.label("Send to pod:").classes("text-sm text-grey-7 shrink-0")
+        ui.button("Upload DwC-A", icon="archive",
+                  on_click=lambda: _wrap_cloud_aux(_do_upload_dwca))\
+            .props("outlined dense color=primary")\
+            .tooltip("Upload the local DwC-A ZIP selected above to the pod.")
+        ui.button("Upload specsin", icon="upload_file",
+                  on_click=lambda: _wrap_cloud_aux(_do_upload_specsin))\
+            .props("outlined dense color=primary")\
+            .tooltip("Upload a local specsin CSV to the pod. Set the remote "
+                     "path in ☁ Cloud → From specsin.")
 
     def _dl_cmd() -> list[str]:
         d  = _v(dwca)
@@ -1709,6 +1789,35 @@ def _build_review() -> tuple:
         with ui.row().classes("w-full items-center gap-2 mt-1 ml-48"):
             load_btn = (ui.button("Load", icon="upload_file")
                         .props("color=primary unelevated"))
+        # Fetch the results to review straight from wherever they live — the
+        # running pod, or the R2 archive (works with the pod shut down). Pulls
+        # predictions + checkpoints; images only when not already downloaded.
+        with ui.row().classes("w-full items-center gap-2 mt-2 ml-48"):
+            ui.label("Get results:").classes("text-sm text-grey-7 shrink-0")
+            fetch_src = (ui.select({"pod": "From pod", "r2": "From R2 archive"},
+                                   value=app.storage.general.get("review_fetch_src", "pod"))
+                         .props("dense outlined").classes("w-44")
+                         .bind_value(app.storage.general, "review_fetch_src"))
+            if not app.storage.general.get("cloud_ckpt_filter"):
+                app.storage.general["cloud_ckpt_filter"] = "latest"
+            (ui.select({"latest": "ckpts: latest",
+                        "best+latest": "ckpts: best + latest",
+                        "all": "ckpts: all"},
+                       value=app.storage.general.get("cloud_ckpt_filter") or "latest")
+             .props("dense outlined").classes("w-44")
+             .bind_value(app.storage.general, "cloud_ckpt_filter")
+             .tooltip("Which checkpoints the pod fetch pulls. 'best + latest' is "
+                      "usually what you want for local CPU Identify."))
+            ui.button("Fetch & load", icon="cloud_download",
+                      on_click=lambda: _wrap_cloud_aux(_run_fetch))\
+                .props("unelevated color=teal")\
+                .tooltip("Pull predictions + checkpoints (and images if missing), "
+                         "wire the paths, and load. Pod source needs a running "
+                         "pod; R2 works with the pod shut down.")
+        ui.label(
+            "Images are pulled only if the local images folder is empty — delete "
+            "it to force a refresh. R2 also restores checkpoints for local Identify."
+        ).classes("text-caption text-grey-6 ml-48")
     summary_lbl = ui.label("").classes("text-caption text-grey-7 mt-1")
     # Notice: taxa the model can't predict (dropped as too sparse at train time).
     # identify writes excluded_species.json next to predictions.csv.
@@ -2073,6 +2182,73 @@ def _build_review() -> tuple:
             ui.notify(f"Loaded {n_total:,} predictions", type="positive")
         except Exception as exc:
             ui.notify(f"Error loading CSV: {exc}", type="negative")
+
+    async def _run_fetch() -> None:
+        """Fetch the results to review from the pod or the R2 archive, then
+        load them. Runs inside a _wrap_cloud_aux slot (error handling +
+        serialisation). Images are pulled only when not already present."""
+        gs = app.storage.general
+        source = (fetch_src.value or "pod")
+
+        if source == "pod":
+            orch = _cloud.get("orch"); pod = _cloud.get("pod")
+            if not (orch and pod):
+                ui.notify("No active pod. Provision or attach one in ☁ Cloud, "
+                          "or switch the source to R2.", type="warning")
+                return
+            # predictions.csv + checkpoints + nameslist (sets review_csv,
+            # id_ckpt, active_ckpt, id_nl in gs).
+            await _do_download_results()
+            imgs = _v(rev_imgs) or gs.get("review_imgs", "")
+            if imgs and Path(imgs).is_dir() and any(Path(imgs).iterdir()):
+                _cloud_info(f"Images already present at {imgs} — skipping pull "
+                            "(delete the folder to force a refresh).")
+            else:
+                await _do_download_images()          # sets review_imgs in gs
+            rev_csv.value  = gs.get("review_csv",  rev_csv.value)
+            rev_imgs.value = gs.get("review_imgs", rev_imgs.value)
+            _load()
+            return
+
+        # ── R2 archive (rclone via restore_local.py; no pod needed) ──────────
+        proj   = (gs.get("main_proj") or "").strip()
+        base   = (gs.get("main_base_dir") or "").strip()
+        remote = (gs.get("rl_remote") or "r2:herbarium-backup").strip()
+        if not proj:
+            ui.notify("Set a Project name first (Get Started).", type="warning")
+            return
+        target = str(Path(base) / proj) if base else (gs.get("rl_target") or "").strip()
+        if not target:
+            ui.notify("No target directory — set Projects root + name in "
+                      "Get Started.", type="warning")
+            return
+        img_folder = (gs.get("main_img_folder") or "images").strip()
+        imgs_dir = Path(target) / img_folder
+        script = str(Path(__file__).with_name("restore_local.py"))
+        # --skip-images-if-present: restore_local skips the multi-GB image pull
+        # when the folder already has files, matching the pod-side rule.
+        cmd = [sys.executable, "-u", script,
+               "--project", proj, "--target", target, "--remote", remote,
+               "--images-dirname", img_folder, "--skip-images-if-present"]
+        await _launch(cmd)
+
+        # Wire Review + local Identify at the restored layout.
+        preds = Path(target) / "predictions" / "predictions.csv"
+        if not preds.is_file():
+            alt = Path(target) / "predictions.csv"
+            if alt.is_file():
+                preds = alt
+        rev_csv.value  = str(preds)
+        rev_imgs.value = str(imgs_dir)
+        gs["review_csv"]  = rev_csv.value
+        gs["review_imgs"] = rev_imgs.value
+        ck_dir = Path(target) / "checkpoints"
+        ckpts = (sorted(ck_dir.glob("*.ckpt"), key=lambda p: p.stat().st_mtime)
+                 if ck_dir.is_dir() else [])
+        if ckpts:
+            gs["id_ckpt"] = str(ckpts[-1])
+            gs["active_ckpt"] = str(ckpts[-1])
+        _load()
 
     def _go(delta: int):
         if _st["view"] is not None:
@@ -2600,8 +2776,312 @@ def _build_confusion() -> "ui.input":
 # user shouldn't need to revisit this tab.
 # ---------------------------------------------------------------------------
 
+def _cred_present(getter) -> bool:
+    """True if a keyring getter returns a credential, swallowing keyring errors."""
+    try:
+        return bool(getter())
+    except Exception:
+        return False
+
+
+def _project_artifacts(base: str, name: str, img_folder: str) -> dict:
+    """Which pipeline artifacts exist for <base>/<name>/ — drives the progress
+    rail. Steps that leave no local trace (archive/publish) return None."""
+    proj = (Path(base) / name) if (base and name) else None
+
+    def _exists(*parts) -> bool:
+        return bool(proj) and proj.joinpath(*parts).exists()
+
+    def _nonempty_dir(*parts) -> bool:
+        p = proj.joinpath(*parts) if proj else None
+        try:
+            return bool(p) and p.is_dir() and any(p.iterdir())
+        except OSError:
+            return False
+
+    ckpt_dir = (proj / "runs" / "checkpoints") if proj else None
+    has_ckpt = bool(ckpt_dir and ckpt_dir.is_dir() and any(ckpt_dir.glob("*.ckpt")))
+    has_preds = _exists("review", "predictions.csv")
+
+    return {
+        "download": _exists("specsin.csv"),
+        "clean":    _nonempty_dir(img_folder or "images_cropped"),
+        "train":    has_ckpt,
+        "identify": has_preds,
+        "review":   has_preds,   # available once there's something to review
+        "archive":  None,        # lives on R2 — not locally detectable
+        "publish":  None,        # lives on the Hub — not locally detectable
+    }
+
+
+def _build_get_started_landing(gs) -> None:
+    """Orientation + project setup + at-a-glance status and progress.
+
+    The credential/environment cards proper are built afterwards by
+    _build_setup(); this landing section sits on top of them so a first-time
+    user sees the workflow, a place to make a project, and what's done."""
+
+    with ui.row().classes("w-full items-baseline gap-2 mb-1"):
+        ui.icon("rocket_launch").style("color:#00897b;font-size:26px")
+        ui.label("Get Started").classes("text-h6").style("color:#00695c")
+    ui.label(
+        "The pipeline runs left to right — download specimen images, clean them, "
+        "train a model, identify new specimens, review the results, then archive "
+        "and publish. Create or pick a project below to begin; everything else is "
+        "credentials you set once."
+    ).classes("text-body2").style("color:#455a64;max-width:900px")
+
+    # ── Flow chips ────────────────────────────────────────────────────────
+    with ui.row().classes("w-full items-center gap-1 flex-wrap my-2"):
+        for i, (_key, title, _desc) in enumerate(_STEP_FLOW):
+            _pill(title, "neutral")
+            if i < len(_STEP_FLOW) - 1:
+                ui.icon("chevron_right").classes("text-grey-5")
+
+    # ── Project card ──────────────────────────────────────────────────────
+    with ui.card().classes("w-full").style("border-left:3px solid #00897b"):
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.icon("create_new_folder").style("color:#00897b;font-size:20px")
+            ui.label("Project").classes("text-subtitle1 font-bold").style("color:#00695c")
+        ui.label(
+            "Enter a family (and optional region). We create the folder and wire "
+            "every step's paths to it — no hand-editing. These fields stay in sync "
+            "with the Projects root / name in the header."
+        ).classes("text-caption text-grey-7")
+
+        with ui.row().classes("w-full items-center gap-2 mt-1"):
+            root_inp = (ui.input(label="Projects root",
+                                 value=gs.get("main_base_dir") or str(Path.home()))
+                        .classes("flex-1").props("dense outlined")
+                        .bind_value(gs, "main_base_dir"))
+
+            async def _browse_root() -> None:
+                r = await FilePicker(root_inp.value or str(Path.home()), mode="dir")
+                if r:
+                    root_inp.value = r
+
+            ui.button(icon="folder_open", on_click=_browse_root
+                      ).props("flat dense round").tooltip("Browse")
+
+        with ui.row().classes("w-full items-center gap-2 mt-1"):
+            fam_inp = (ui.input(label="Family", placeholder="e.g. Ebenaceae")
+                       .classes("flex-1").props("dense outlined"))
+            reg_inp = (ui.input(label="Region (optional)", placeholder="e.g. Africa")
+                       .classes("flex-1").props("dense outlined"))
+            name_inp = (ui.input(label="Project name")
+                        .classes("flex-1").props("dense outlined")
+                        .bind_value(gs, "main_proj"))
+
+        # Suggest a project name from family (+ region) unless the user has
+        # already typed one. Fires when they leave the family/region field.
+        def _suggest_name() -> None:
+            fam = _v(fam_inp)
+            if not fam or _v(name_inp):
+                return
+            parts = [p for p in (_v(reg_inp), fam) if p]
+            name_inp.value = "-".join(parts).lower().replace(" ", "-")
+
+        fam_inp.on("blur", lambda e: _suggest_name())
+        reg_inp.on("blur", lambda e: _suggest_name())
+
+        def _create_project() -> None:
+            base = _v(root_inp)
+            name = _v(name_inp) or _v(fam_inp)
+            if not base:
+                ui.notify("Enter a Projects root.", type="warning"); return
+            if not name:
+                ui.notify("Enter a Family or Project name.", type="warning"); return
+            img_folder = (gs.get("main_img_folder") or "images_cropped").strip()
+            proj = Path(base) / name
+            try:
+                (proj / img_folder).mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                ui.notify(f"Couldn't create {proj}: {e}", type="negative"); return
+            name_inp.value = name
+            apply = _page_hooks.get("apply_paths")
+            if apply:
+                apply(base=base, name=name, img_folder=img_folder)
+            else:
+                ui.notify(f"Project folder ready: {proj}", type="positive")
+            _refresh()
+
+        with ui.row().classes("w-full gap-2 mt-2"):
+            ui.button("Create / open project", icon="check_circle",
+                      on_click=_create_project).props("unelevated color=primary")
+
+    # ── Status strip + progress rail (rebuilt by _refresh) ────────────────
+    status_card = ui.card().classes("w-full").style("border-left:3px solid #00897b")
+    with status_card:
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.icon("checklist").style("color:#00897b;font-size:20px")
+            ui.label("Status").classes("text-subtitle1 font-bold").style("color:#00695c")
+            ui.button(icon="refresh", on_click=lambda: _refresh()
+                      ).props("flat dense round").classes("ml-auto")\
+                .tooltip("Re-check credentials and project progress")
+        status_row = ui.row().classes("w-full items-center gap-2 flex-wrap mt-1")
+        ui.separator().classes("my-2")
+        rail_col = ui.column().classes("w-full gap-1")
+
+    def _refresh() -> None:
+        # -- credential / mode / env pills --
+        status_row.clear()
+        cloud = (gs.get("main_mode", "cloud") == "cloud")
+        with status_row:
+            _pill("☁ Cloud" if cloud else "💻 Local", "ok" if cloud else "neutral")
+            for label, ok, optional in [
+                ("RunPod",       _cred_present(cloud_secrets.get_runpod_api_key), False),
+                ("WandB",        _cred_present(cloud_secrets.get_wandb_api_key),  True),
+                ("Hugging Face", _cred_present(cloud_secrets.get_hf_token),       False),
+                ("R2",           _cred_present(cloud_secrets.get_r2_credentials), False),
+                ("GBIF",         _cred_present(cloud_secrets.get_gbif_credentials), True),
+            ]:
+                kind = "ok" if ok else ("neutral" if optional else "warn")
+                mark = "✓" if ok else ("·" if optional else "—")
+                _pill(f"{label} {mark}", kind)
+
+        # -- progress rail --
+        base = (gs.get("main_base_dir") or "").strip()
+        name = (gs.get("main_proj") or "").strip()
+        img_folder = (gs.get("main_img_folder") or "images_cropped").strip()
+        done = _project_artifacts(base, name, img_folder)
+        rail_col.clear()
+        with rail_col:
+            if not (base and name):
+                ui.label("Create or pick a project to track progress.")\
+                    .classes("text-caption text-grey-6")
+            else:
+                ui.label(f"Project: {Path(base) / name}")\
+                    .classes("text-caption text-grey-7 mb-1")
+            refs = _page_hooks.get("tab_refs") or {}
+            goto = _page_hooks.get("goto_tab")
+            for key, title, desc in _STEP_FLOW:
+                state = done.get(key)
+                if state is True:
+                    icon, color = "check_circle", "#2e7d32"
+                elif state is False:
+                    icon, color = "radio_button_unchecked", "#b0bec5"
+                else:
+                    icon, color = "remove_circle_outline", "#cfd8dc"
+                with ui.row().classes("w-full items-center gap-2"):
+                    ui.icon(icon).style(f"color:{color};font-size:20px")
+                    ui.label(title).classes("font-medium").style("width:120px")
+                    ui.label(desc).classes("text-caption text-grey-7 flex-1")
+                    if goto and key in refs:
+                        ui.button("Open",
+                                  on_click=lambda k=key: goto(refs[k]))\
+                            .props("flat dense color=primary").classes("shrink-0")
+
+    _refresh()
+    # _page_hooks (tab navigation) is populated only after the whole page is
+    # built, which happens after this function returns. Re-render once shortly
+    # after so the rail's per-step "Open" buttons appear on first load.
+    ui.timer(0.1, _refresh, once=True)
+
+
+def _collect_creds() -> dict:
+    """Gather saved credentials from the OS keyring into a plain dict for
+    export. Only includes slots that are actually set."""
+    c: dict = {}
+    if (k := cloud_secrets.get_runpod_api_key()): c["runpod"] = k
+    if (k := cloud_secrets.get_wandb_api_key()):  c["wandb"] = k
+    if (k := cloud_secrets.get_hf_token()):       c["huggingface"] = k
+    if (r2 := cloud_secrets.get_r2_credentials()):
+        c["r2"] = {"account_id": r2.account_id,
+                   "access_key_id": r2.access_key_id,
+                   "secret_access_key": r2.secret_access_key,
+                   "bucket": r2.bucket}
+    if (g := cloud_secrets.get_gbif_credentials()):
+        c["gbif"] = {"username": g.username, "password": g.password}
+    return c
+
+
+def _restore_creds(c: dict) -> int:
+    """Write imported credentials back into the OS keyring. Returns the count
+    restored. Best-effort — a malformed blob warns rather than aborting."""
+    n = 0
+    try:
+        if c.get("runpod"):      cloud_secrets.set_runpod_api_key(c["runpod"]); n += 1
+        if c.get("wandb"):       cloud_secrets.set_wandb_api_key(c["wandb"]); n += 1
+        if c.get("huggingface"): cloud_secrets.set_hf_token(c["huggingface"]); n += 1
+        if c.get("r2"):
+            cloud_secrets.set_r2_credentials(
+                cloud_secrets.R2Credentials(**c["r2"])); n += 1
+        if c.get("gbif"):
+            cloud_secrets.set_gbif_credentials(
+                cloud_secrets.GBIFCredentials(**c["gbif"])); n += 1
+    except Exception as e:
+        ui.notify(f"Some credentials couldn't be imported: {e}", type="warning")
+    return n
+
+
+def _build_portability(gs) -> None:
+    """Export / import UI settings (and, opt-in, credentials) so a project can
+    be moved to another machine without hand-re-entering everything."""
+    card, _ = _setup_card("swap_horiz", "Portability",
+                          "move settings to another machine")
+    with card:
+        ui.label(
+            "Export your project paths and options to a JSON file, then import "
+            "it on another machine. Credentials are included only if you tick "
+            "the box below."
+        ).classes("text-body2").style("color:#455a64")
+        inc_creds = ui.checkbox(
+            "Include credentials — written in PLAINTEXT; keep the file private",
+            value=False)
+
+        async def _export() -> None:
+            dest = await FilePicker(
+                str(Path.home() / "herbarium_settings.json"), mode="save")
+            if not dest:
+                return
+            payload: dict = {"settings": dict(app.storage.general)}
+            if inc_creds.value:
+                payload["credentials"] = _collect_creds()
+            try:
+                Path(dest).write_text(json.dumps(payload, indent=2))
+            except OSError as e:
+                ui.notify(f"Export failed: {e}", type="negative")
+                return
+            extra = " (with credentials)" if inc_creds.value else ""
+            ui.notify(f"Settings exported to {dest}{extra}", type="positive")
+
+        async def _import() -> None:
+            src = await FilePicker(str(Path.home()), mode="file")
+            if not src:
+                return
+            try:
+                data = json.loads(Path(src).read_text())
+            except (OSError, json.JSONDecodeError) as e:
+                ui.notify(f"Couldn't read {src}: {e}", type="negative")
+                return
+            settings = data.get("settings", {})
+            if not isinstance(settings, dict):
+                ui.notify("File has no 'settings' object — not a herbarium "
+                          "export.", type="negative")
+                return
+            for k, v in settings.items():
+                app.storage.general[k] = v
+            n = _restore_creds(data.get("credentials") or {})
+            msg = f"Imported {len(settings)} setting(s)"
+            if n:
+                msg += f" + {n} credential(s)"
+            ui.notify(msg + ". Reload the page to refresh every field.",
+                      type="positive")
+
+        with ui.row().classes("gap-2 mt-2"):
+            ui.button("Export settings…", icon="upload_file", on_click=_export)\
+                .props("outlined dense color=primary")
+            ui.button("Import settings…", icon="download", on_click=_import)\
+                .props("outlined dense color=primary")
+
+        ui.label(
+            f"Config lives in: {CONFIG_PATH} · .nicegui/storage-general.json "
+            "(app launch dir) · OS keyring (credentials)."
+        ).classes("text-caption text-grey-6 mt-1").style("word-break:break-all")
+
+
 def _build_setup() -> None:
-    """One-time setup: local environment check + cloud credentials.
+    """Get Started landing + one-time setup: credentials and environment.
 
     All credentials persist in the OS keyring (RunPod / WandB / R2) and the
     SSH key path persists in app.storage.general. Once everything is green
@@ -2610,12 +3090,14 @@ def _build_setup() -> None:
     import platform as _platform
     gs = app.storage.general
 
-    with ui.row().classes("w-full items-baseline gap-2 mb-2"):
-        ui.icon("settings").style("color:#00897b;font-size:26px")
-        ui.label("One-time setup").classes("text-h6").style("color:#00695c")
+    # Landing: orientation, project setup, status + progress. Built first so
+    # it's the top of the tab; the credential cards follow beneath it.
+    _build_get_started_landing(gs)
+
+    _section("Credentials & environment")
     ui.label(
-        "Configure credentials and check your environment. Once everything below "
-        "is green you can switch to the ☁ Cloud tab and forget this exists. "
+        "Set these once. RunPod, Hugging Face, and R2 are required for the full "
+        "cloud workflow; WandB and GBIF are optional. "
         "Full step-by-step guide: cloud_setup.md."
     ).classes("text-body2").style("color:#455a64;max-width:820px")
 
@@ -2659,20 +3141,31 @@ def _build_setup() -> None:
                     rows.append(("PyTorch GPU", f"{n}× {name}", True))
                     cuda_ok = True
                 else:
-                    rows.append(("PyTorch GPU",
-                                 "CPU only — fine for local Quick ID, "
-                                 "use ☁ Cloud tab for training", False))
+                    rows.append(("PyTorch", "CPU (fine for local Quick ID; "
+                                 "train on the ☁ Cloud pod)", True))
             except ImportError:
-                rows.append(("PyTorch", "not installed", False))
+                rows.append(("Local AI", "not installed — slim mode "
+                             "(click \"Enable offline AI features\" to add it)",
+                             False))
 
             base = (gs.get("main_base_dir") or str(Path.home())).strip()
+            import shutil as _shutil
             try:
-                import shutil as _shutil
                 free = _shutil.disk_usage(base).free // (1 << 30)
                 rows.append(("Projects root",
                              f"{base} ({free} GB free)", free > 5))
             except Exception:
                 rows.append(("Projects root", base, False))
+
+            # External tools preflight — so a missing binary is flagged here
+            # instead of failing mid-action.
+            for tool, why in [
+                ("uv",     "runs the app + installs offline AI features"),
+                ("rclone", "R2 archive restore / Review 'From R2 archive'"),
+            ]:
+                path = _shutil.which(tool)
+                rows.append((tool, path or f"not found — needed for {why}",
+                             bool(path)))
 
             html_rows = []
             for label, value, ok in rows:
@@ -2693,8 +3186,43 @@ def _build_setup() -> None:
             _set_pill(env_pill, "ready" if cuda_ok else "CPU only", "ok" if cuda_ok else "warn")
 
         _refresh_env()
-        ui.button("Re-check", icon="refresh", on_click=_refresh_env
-                  ).props("flat dense").classes("mt-2")
+
+        async def _enable_local_ml() -> None:
+            """Install the optional ML stack so Quick ID / local Identify run
+            on this machine. Streams `uv sync --extra local-ml` to the log."""
+            async def _done(rc: int) -> None:
+                _refresh_env()
+                if rc == 0:
+                    ui.notify("Offline AI features enabled — Quick ID and local "
+                              "Identify are ready.", type="positive")
+                else:
+                    ui.notify("Install failed — see the Output panel.",
+                              type="negative")
+            ui.notify("Installing the local AI stack (torch, timm, transformers"
+                      "…). This can take a few minutes — watch the Output panel.",
+                      type="info")
+            try:
+                await _launch(["uv", "sync", "--extra", "local-ml"], on_done=_done)
+            except FileNotFoundError:
+                ui.notify("`uv` isn't on PATH. Install uv "
+                          "(https://docs.astral.sh/uv/), or launch the app via "
+                          "start.bat / start.sh.", type="negative")
+
+        with ui.row().classes("items-center gap-2 mt-2"):
+            ui.button("Re-check", icon="refresh", on_click=_refresh_env
+                      ).props("flat dense")
+            ui.button("Enable offline AI features", icon="download_for_offline",
+                      on_click=_enable_local_ml)\
+                .props("outlined dense color=primary")\
+                .tooltip("Install torch + the ML stack so Quick ID and local "
+                         "Identify run on this machine (CPU works, like the HF "
+                         "Space). Adds a few hundred MB. Not needed for cloud "
+                         "training — that runs on the pod.")
+        ui.label(
+            "The base install is slim (no torch). Click \"Enable offline AI "
+            "features\" to add the ML stack when you want to identify specimens "
+            "locally without a pod. One-time; runs uv sync --extra local-ml."
+        ).classes("text-caption text-grey-6").style("max-width:820px")
 
     # ── RunPod ──────────────────────────────────────────────────────────
     rp_card, rp_pill = _setup_card("cloud", "RunPod (the GPU host)")
@@ -2814,7 +3342,7 @@ def _build_setup() -> None:
     with hf_card:
         ui.label(
             "A write token lets the pod publish a trained family model to the "
-            "Hugging Face Hub (Cloud Tools → Publish to HF), where the "
+            "Hugging Face Hub (⑦ Publish tab), where the "
             "herbarium-id Space picks it up automatically. Create one at "
             "huggingface.co/settings/tokens with the 'Write' role."
         ).classes("text-body2").style("color:#455a64")
@@ -2961,6 +3489,9 @@ def _build_setup() -> None:
             ui.button("Save", on_click=_save_gbif).props("unelevated dense color=primary")
             ui.button("Forget", on_click=_forget_gbif).props("flat dense")
 
+    # ── Portability: export / import settings ────────────────────────────
+    _build_portability(gs)
+
 
 # ---------------------------------------------------------------------------
 # Cloud orchestration — module-scope state + helpers.
@@ -3016,6 +3547,7 @@ def _cloud_log(line: str) -> None:
     """Adapter: orchestrator emits plain strings, log widget wants newlines."""
     try:
         _log.push(line if line.endswith("\n") else line + "\n")
+        _scan_wandb(line)
     except RuntimeError:
         pass  # client navigated away
 
@@ -3054,7 +3586,7 @@ def _ensure_orch() -> Optional[CloudOrchestrator]:
         return cached
     api_key = cloud_secrets.get_runpod_api_key()
     if not api_key:
-        _cloud_warn("Open the ⚙ Setup tab and save your RunPod API key first.")
+        _cloud_warn("Open the Get Started tab and save your RunPod API key first.")
         return None
     if not proj:
         _cloud_warn("Set the Project name at the top of the page first.")
@@ -3206,7 +3738,8 @@ def _wrap_cloud_aux(coro_factory):
     slot = "aux_task"
     t = _cloud.get(slot)
     if t is not None and not t.done():
-        ui.notify("A transfer is already running.", type="warning")
+        ui.notify("A transfer is already running — click Cancel step to abort "
+                  "it first.", type="warning", timeout=6000)
         return
     async def _run():
         try:
@@ -3387,7 +3920,7 @@ async def _do_provision(purpose: str | None = None) -> None:
             _cloud_warn(
                 f"Ignoring GPU override '{gpu}' for the train pod — it's a "
                 f"light-tier card, so honouring it would cancel the upgrade. "
-                f"Using the train GPU list. Clear the override in Cloud Tools, "
+                f"Using the train GPU list. Clear the override in the ☁ Cloud tab, "
                 f"or set it to a train GPU to force a specific one.")
             gpu = None
     dc = (gs.get("cloud_datacenter") or "").strip() or DEFAULT_DATACENTER
@@ -3506,6 +4039,8 @@ async def _do_upload_specsin() -> None:
 
 
 async def _do_step(step: str, *, env: dict[str, str] | None = None) -> int:
+    if step == "train":
+        _reset_wandb()   # clear any run link from a previous training run
     orch = _cloud["orch"]; pod = _cloud["pod"]
     if not (orch and pod):
         _cloud_warn("Provision a pod first.")
@@ -3600,7 +4135,7 @@ async def _do_publish() -> None:
                     "before publishing.")
         return
     if not cloud_secrets.get_hf_token():
-        _cloud_warn("Add a Hugging Face token first (⚙ Setup → Hugging Face).")
+        _cloud_warn("Add a Hugging Face token first (Get Started → Hugging Face).")
         return
     env = {
         "FAMILY":    fam,
@@ -3817,6 +4352,8 @@ def _run_step_mode_aware(
     cloud_env_fn     — optional callable returning env dict for the pod.
     extra_env        — local subprocess env additions (e.g. NCCL flags).
     """
+    if step == "train":
+        _reset_wandb()   # clear any run link from a previous training run
     if _is_cloud_mode():
         if _cloud_running():
             ui.notify("A cloud step is already running.", type="warning")
@@ -3866,6 +4403,7 @@ def _build_pod_strip() -> None:
     gs = app.storage.general
 
     with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+        # ── Live pod state (always visible) ──────────────────────────────
         ui.icon("cloud").style("color:#80cbc4;font-size:22px")
         pod_lbl = ui.label("No active pod").classes("text-body2 font-mono")\
             .style("color:#e0f2f1")
@@ -3876,16 +4414,9 @@ def _build_pod_strip() -> None:
 
         ui.space()
 
-        ui.label("Purpose:").classes("text-caption").style("color:#b2dfdb")
-        ui.select({"light": "light (L4)", "train": "train (A6000+)"},
-                  value=gs.get("cloud_purpose") or "light")\
-            .props("dense outlined dark options-dense")\
-            .classes("w-44").bind_value(gs, "cloud_purpose")
-
-        # Effective-GPU readout: shows what provision would actually request.
-        # If a Cloud Tools override is set, surface it here (instead of letting
-        # it be invisible) so the user can see the surprising value before
-        # committing to a pod, and clear it inline.
+        # Effective-GPU readout: what Provision will actually request (purpose
+        # default, or the ☁ Cloud override if one is set). Kept visible so the
+        # value isn't a surprise at launch.
         from cloud.orchestrator import GPU_BY_PURPOSE as _GPU_BY_PURPOSE
         def _gpu_label_text() -> str:
             override = (gs.get("cloud_gpu_override") or "").strip()
@@ -3901,15 +4432,11 @@ def _build_pod_strip() -> None:
         gpu_lbl = ui.label(_gpu_label_text())\
             .classes("text-caption font-mono")\
             .style("color:#b2dfdb;border-left:2px solid #4db6ac;padding-left:6px")
-        gpu_lbl.tooltip(
-            "Provision offers RunPod this GPU plus fallbacks, in order; it "
-            "places on the first one that's free — so a busy top card no "
-            "longer fails the launch. For a fresh project it also tries other "
-            "datacenters. Set a specific GPU in Cloud Tools to override.")
+        gpu_lbl.tooltip("Provision offers RunPod this GPU plus fallbacks in "
+                        "order and places on the first free one. Change purpose "
+                        "or clear the override under Pod options.")
         def _refresh_gpu_lbl() -> None:
             gpu_lbl.set_text(_gpu_label_text())
-        # Re-render on either control change. NiceGUI propagates gs changes
-        # via bind, but the label needs a tick to recompute.
         ui.timer(1.0, _refresh_gpu_lbl)
 
         def _clear_gpu_override() -> None:
@@ -3917,102 +4444,76 @@ def _build_pod_strip() -> None:
             _refresh_gpu_lbl()
             ui.notify("GPU override cleared — purpose default will be used.",
                       type="info")
-        ui.button(icon="close",
-                  on_click=_clear_gpu_override)\
-            .props("dense flat round color=teal-2 size=sm")\
-            .tooltip("Clear the Cloud Tools GPU override so this provision "
-                     "uses the purpose default.")
 
+        # ── Primary action: Provision ────────────────────────────────────
         ui.button("Provision", icon="cloud_upload",
                   on_click=lambda: _wrap_cloud(_do_provision))\
             .props("dense color=teal-3 unelevated")\
-            .tooltip("Auto-provision a pod: offers RunPod the GPU fallback "
-                     "list (first free one wins), creates/reuses the volume, "
-                     "syncs code, pushes wandb / R2 keys. If every card is "
-                     "busy, use 'existing pod' on the right instead.")
-        # Manual pod path — a first-class equal to Provision. When every GPU
-        # in the fallback list is busy you make a pod in the RunPod console
-        # and paste its ID here; everything downstream is identical.
-        with ui.row().classes("items-center gap-1")\
-                .style("border-left:2px solid #4db6ac;padding-left:8px"):
-            ui.label("or existing pod:").classes("text-caption")\
-                .style("color:#b2dfdb")
-            pod_id_inp = ui.input(value="", placeholder="paste Pod ID")\
-                .props("dense outlined dark").classes("w-44")\
-                .style("font-size:11px; color:#e0f2f1")\
-                .bind_value(gs, "cloud_attach_pod_id")\
-                .tooltip("Made a pod yourself in the RunPod console? Paste its "
-                         "ID (the code in the console URL / pod card). Attach "
-                         "connects, syncs code and starts the idle watchdog — "
-                         "then Download / Prep / Train work exactly as with an "
-                         "auto-provisioned pod.")
-            ui.button("Attach", icon="link",
-                      on_click=lambda: _wrap_cloud(_do_attach))\
-                .props("dense color=teal-2 unelevated")\
-                .tooltip("Connect to the pod whose ID is in the box.")
-        # Prebaked-image helpers for the manual path — show the exact image to
-        # select in the console, one-click copy it, and optionally save a RunPod
-        # template pinned to it so future hand-allocated pods pick it in one tap.
-        with ui.row().classes("items-center gap-1")\
-                .style("border-left:2px solid #4db6ac;padding-left:8px"):
-            ui.label("pod image:").classes("text-caption")\
-                .style("color:#b2dfdb")
-            ui.label(DEFAULT_IMAGE).classes("text-caption")\
-                .style("color:#e0f2f1;font-family:monospace;font-size:11px")\
-                .tooltip("Set this as the container image when you create a pod "
-                         "by hand in the RunPod console — it's the prebaked env "
-                         "so setup is near-instant. (Auto-provision uses it too.)")
-            ui.button(icon="content_copy", on_click=_copy_pod_image)\
-                .props("dense flat round size=sm color=teal-2")\
-                .tooltip("Copy the image string to paste into the console.")
-            ui.button("Save template", icon="bookmark_add",
-                      on_click=lambda: _wrap_cloud_aux(_do_save_template))\
-                .props("dense flat color=teal-2")\
-                .tooltip("Create a RunPod template pinned to this image so manual "
-                         "allocation can pick it from the template dropdown.")
-        ui.button("Upload DwC-A", icon="archive",
-                  on_click=lambda: _wrap_cloud_aux(_do_upload_dwca))\
-            .props("dense flat color=teal-2")\
-            .tooltip("Upload the DwC-A ZIP from Tab 1 (Download) to the pod.")
-        ui.button("Upload specsin", icon="upload_file",
-                  on_click=lambda: _wrap_cloud_aux(_do_upload_specsin))\
-            .props("dense flat color=teal-2")\
-            .tooltip("Upload the specsin CSV from Tab 1 (Download) to the pod. "
-                     "Set the remote path in Cloud Tools → From specsin.")
-        ui.button("Download results", icon="cloud_download",
-                  on_click=lambda: _wrap_cloud_aux(_do_download_results))\
-            .props("dense flat color=teal-2")\
-            .tooltip("Pull checkpoints, nameslist, predictions back locally. "
-                     "Use the dropdown to control how many checkpoints. "
-                     "Does NOT include images — use the next button for those.")
-        # Default to "latest" — the most recent .ckpt is what the local
-        # Identify run almost always uses; pulling all checkpoints is
-        # multi-GB over single-threaded SFTP and rarely worth it.
-        if not gs.get("cloud_ckpt_filter"):
-            gs["cloud_ckpt_filter"] = "latest"
-        ui.select(
-            options={
-                "latest":      "ckpts: latest only",
-                "best+latest": "ckpts: best + latest",
-                "all":         "ckpts: all",
-            },
-            value=gs.get("cloud_ckpt_filter") or "latest",
-        ).classes("w-44").props("dense outlined")\
-         .bind_value(gs, "cloud_ckpt_filter")\
-         .tooltip("Which checkpoints to include in 'Download results'. "
-                  "'latest' = single most recent .ckpt by mtime "
-                  "(usually all you need for local Identify). "
-                  "'best+latest' = also includes lowest-valid_loss. "
-                  "'all' = every .ckpt under checkpoints/ (legacy, multi-GB).")
-        ui.button("Pull images", icon="image",
-                  on_click=lambda: _wrap_cloud_aux(_do_download_images))\
-            .props("dense flat color=teal-2")\
-            .tooltip("Tar /workspace/data/images/ on the pod (or /images_1024 "
-                     "for legacy layouts) and pull the bundle back (typically "
-                     "5–15 GB; takes minutes). Required for the Review tab to "
-                     "render specimens.")
+            .tooltip("Auto-provision a pod: offers RunPod the GPU fallback list "
+                     "(first free one wins), creates/reuses the volume, syncs "
+                     "code, pushes wandb / R2 keys. No free card? Use an "
+                     "existing pod under Pod options.")
+
+        # ── Pod options — purpose, GPU override, manual attach, image ────
+        # Everything pre-provision and rarely-touched lives in this menu so the
+        # header shows only the live state and the primary actions.
+        with ui.button("Pod options", icon="tune").props("dense flat color=teal-2"):
+            with ui.menu():
+                with ui.column().classes("p-3 gap-2").style("min-width:340px"):
+                    with ui.row().classes("items-center gap-2 w-full"):
+                        ui.label("Purpose:").classes("text-caption text-grey-8 shrink-0")
+                        ui.select({"light": "light (L4)", "train": "train (A6000+)"},
+                                  value=gs.get("cloud_purpose") or "light")\
+                            .props("dense outlined options-dense")\
+                            .classes("flex-1").bind_value(gs, "cloud_purpose")
+                    ui.button("Clear GPU override", icon="close",
+                              on_click=_clear_gpu_override)\
+                        .props("flat dense color=primary")\
+                        .tooltip("Use the purpose default instead of the "
+                                 "☁ Cloud GPU override.")
+                    ui.separator()
+                    ui.label("Use an existing pod")\
+                        .classes("text-caption text-grey-8 font-medium")
+                    with ui.row().classes("items-center gap-1 w-full"):
+                        pod_id_inp = ui.input(value="", placeholder="paste Pod ID")\
+                            .props("dense outlined").classes("flex-1")\
+                            .bind_value(gs, "cloud_attach_pod_id")\
+                            .tooltip("Made a pod yourself in the RunPod console? "
+                                     "Paste its ID. Attach connects, syncs code "
+                                     "and starts the idle watchdog — then every "
+                                     "step works as with an auto-provisioned pod.")
+                        ui.button("Attach", icon="link",
+                                  on_click=lambda: _wrap_cloud(_do_attach))\
+                            .props("dense color=teal unelevated")\
+                            .tooltip("Connect to the pod whose ID is in the box.")
+                    ui.separator()
+                    ui.label("Prebaked pod image")\
+                        .classes("text-caption text-grey-8 font-medium")
+                    with ui.row().classes("items-center gap-1 w-full"):
+                        ui.label(DEFAULT_IMAGE)\
+                            .style("font-family:monospace;font-size:11px;"
+                                   "overflow-wrap:anywhere")\
+                            .classes("flex-1")\
+                            .tooltip("Container image to select when you create a "
+                                     "pod by hand — the prebaked env, so setup is "
+                                     "near-instant. (Auto-provision uses it too.)")
+                        ui.button(icon="content_copy", on_click=_copy_pod_image)\
+                            .props("dense flat round size=sm")\
+                            .tooltip("Copy the image string.")
+                    ui.button("Save RunPod template", icon="bookmark_add",
+                              on_click=lambda: _wrap_cloud_aux(_do_save_template))\
+                        .props("flat dense color=primary")\
+                        .tooltip("Create a RunPod template pinned to this image so "
+                                 "manual allocation can pick it from the dropdown.")
+
+        # Data movement is no longer in the header: uploads live in the
+        # ① Download tab ("Send to pod"), and pulling results back lives in
+        # the ⑤ Review tab ("Get results") — where each is actually used.
+
+        # ── Run control (always visible) ─────────────────────────────────
         ui.button("Cancel step", icon="stop",
-                  on_click=_cancel_cloud).props("dense flat color=warning")
+                  on_click=_cancel_cloud).props("dense flat color=warning")\
+            .tooltip("Interrupt the running step; the pod stays alive.")
         ui.button("Terminate", icon="power_settings_new",
                   on_click=lambda: _confirm_terminate(keep_volume=True))\
             .props("dense flat color=red-3")\
@@ -4048,7 +4549,7 @@ def _build_pod_strip() -> None:
         if not has_key: missing.append("RunPod API key")
         if not has_ssh: missing.append("SSH private key")
         setup_warn.set_text(
-            f"⚠ Missing: {', '.join(missing)} — open the ⚙ Setup tab. "
+            f"⚠ Missing: {', '.join(missing)} — open the Get Started tab. "
             "Cloud actions will fail until configured.")
         setup_warn.style(
             "background:#ffebee;border-left:3px solid #c62828;padding:6px 10px;"
@@ -4069,6 +4570,149 @@ def _build_pod_strip() -> None:
 # ☁ Cloud Tools tab — advanced / rare / destructive actions.
 # Visible only in Cloud mode (positioned at end of tab list).
 # ---------------------------------------------------------------------------
+
+def _build_archive() -> None:
+    """⑥ Archive — pull results back and archive the whole project to R2.
+
+    Promoted out of Cloud Tools onto the workflow spine: this is the tail of
+    the normal pipeline (download → … → identify → review → archive → publish).
+    """
+    gs = app.storage.general
+
+    with ui.row().classes("w-full items-baseline gap-2 mb-1"):
+        ui.icon("cloud_done").style("color:#00897b;font-size:24px")
+        ui.label("Archive & results").classes("text-h6").style("color:#00695c")
+    ui.label(
+        "Pull the finished image set and predictions back to this machine, or "
+        "archive the whole project to Cloudflare R2 so you can delete the pod's "
+        "network volume and restore it later."
+    ).classes("text-body2").style(
+        "background:#f0f7f6;border-left:3px solid #00897b;padding:8px 12px;"
+        "border-radius:0 4px 4px 0;color:#37474f;max-width:1100px;margin-bottom:8px")
+
+    # ── Pull images / R2 archive ─────────────────────────────────────────
+    with ui.card().classes("w-full mt-2").style("border-left:3px solid #00897b"):
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.icon("download").style("color:#00897b;font-size:20px")
+            ui.label("Results & Archive").classes("text-subtitle1 font-bold")\
+                .style("color:#00695c")
+        ui.label(
+            "Pull the resized image set to enable Review locally, or archive "
+            "the whole project to Cloudflare R2 so you can delete the pod's "
+            "network volume and bring it back later."
+        ).classes("text-body2 mt-1").style("color:#455a64;max-width:820px")
+
+        with ui.row().classes("w-full gap-2 mt-2 flex-wrap"):
+            ui.button("Pull images (tar)", icon="image",
+                      on_click=lambda: _wrap_cloud_aux(_do_download_images))\
+                .props("flat dense color=primary")\
+                .tooltip("Tar the resized image set on the pod and pull it back "
+                         "so the Review tab can show specimens.")
+            ui.button("Archive project to R2", icon="cloud_done",
+                      on_click=lambda: _wrap_cloud(
+                          lambda: _do_step("backup",
+                              env={"PROJECT": (gs.get("main_proj") or "").strip()})))\
+                .props("outlined dense color=primary")\
+                .tooltip("Push ckpt, specsin, DwC-A, predictions, and "
+                         "the images tar to r2:<bucket>/<project>/.")
+            ui.button("Restore project from R2", icon="cloud_download",
+                      on_click=_confirm_restore)\
+                .props("outlined dense color=primary")\
+                .tooltip("Pull a previously archived project back onto a "
+                         "fresh volume — skip download/prep entirely.")
+
+        # ── Restore to LOCAL machine (no pod required) ────────────────────
+        with ui.row().classes("w-full items-center gap-2 mt-4"):
+            ui.icon("download_for_offline").style("color:#00897b;font-size:20px")
+            ui.label("Restore to this machine").classes("text-subtitle1 font-bold")\
+                .style("color:#00695c")
+        ui.label(
+            "Pull an archived project directly onto this computer for local "
+            "review / Identify, no pod needed. Requires rclone on PATH "
+            "(https://rclone.org/install/) configured with the same R2 remote "
+            "(default name 'r2'). Cross-platform — works on Windows, macOS, Linux."
+        ).classes("text-body2 mt-1").style("color:#455a64;max-width:820px")
+        with ui.row().classes("w-full items-center gap-2 mt-1"):
+            ui.label("Project:").classes("w-24 text-right shrink-0")
+            ui.input(value="").classes("w-48").props("dense outlined")\
+              .bind_value(gs, "rl_project")\
+              .tooltip("Project name as used at backup (PROJECT env var). "
+                       "Defaults to the current 'main_proj' if blank.")
+            ui.label("Remote:").classes("w-20 text-right shrink-0")
+            ui.input(value="r2:herbarium-backup").classes("w-56")\
+              .props("dense outlined").bind_value(gs, "rl_remote")\
+              .tooltip("rclone remote + bucket, e.g. r2:herbarium-backup")
+        with ui.row().classes("w-full items-center gap-2 mt-1"):
+            rl_target = _path_input("Target directory:", mode="dir")\
+                .bind_value(gs, "rl_target")
+        ui.button("Restore to local", icon="download_for_offline",
+                  on_click=lambda: _do_restore_local())\
+            .props("unelevated dense color=primary").classes("mt-2")
+
+
+def _build_publish() -> None:
+    """⑦ Publish — push the best checkpoint to the Hugging Face Hub."""
+    gs = app.storage.general
+
+    with ui.row().classes("w-full items-baseline gap-2 mb-1"):
+        ui.icon("smart_toy").style("color:#ff8f00;font-size:24px")
+        ui.label("Publish model").classes("text-h6").style("color:#e65100")
+    ui.label(
+        "Final step: push this project's trained model to Hugging Face so the "
+        "herbarium-id Space can serve it. Needs a write token (Get Started → "
+        "Hugging Face)."
+    ).classes("text-body2").style(
+        "background:#fff8e1;border-left:3px solid #ff8f00;padding:8px 12px;"
+        "border-radius:0 4px 4px 0;color:#5d4037;max-width:1100px;margin-bottom:8px")
+
+    # ── Publish to Hugging Face ──────────────────────────────────────────
+    with ui.card().classes("w-full mt-2").style("border-left:3px solid #ff8f00"):
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.icon("smart_toy").style("color:#ff8f00;font-size:20px")
+            ui.label("Publish to Hugging Face").classes("text-subtitle1 font-bold")\
+                .style("color:#e65100")
+        ui.label(
+            "Push this project's best checkpoint (highest validation accuracy) "
+            "to the Hugging Face Hub. It's tagged so the herbarium-id Space "
+            "discovers it automatically — no redeploy. Needs a write token "
+            "(Get Started → Hugging Face)."
+        ).classes("text-body2 mt-1").style("color:#455a64;max-width:820px")
+
+        with ui.row().classes("w-full items-center gap-2 mt-1"):
+            ui.label("HF user:").classes("w-24 text-right shrink-0")
+            ui.input(value="", placeholder="e.g. ggosline").classes("w-48")\
+              .props("dense outlined").bind_value(gs, "pub_hfuser")\
+              .tooltip("Your Hugging Face username. Used to build the repo name "
+                       "when no explicit repo is given.")
+            ui.label("Family:").classes("w-20 text-right shrink-0")
+            ui.input(value="", placeholder="defaults to project").classes("w-48")\
+              .props("dense outlined").bind_value(gs, "pub_family")\
+              .tooltip("Family this model covers. Defaults to the current "
+                       "project name if left blank.")
+        with ui.row().classes("w-full items-center gap-2 mt-1"):
+            ui.label("Region:").classes("w-24 text-right shrink-0")
+            ui.input(value="", placeholder="optional, e.g. Africa").classes("w-48")\
+              .props("dense outlined").bind_value(gs, "pub_region")\
+              .tooltip("Optional geographic scope, folded into the repo name "
+                       "and model card.")
+            ui.label("Select:").classes("w-20 text-right shrink-0")
+            ui.select(["", "accuracy", "loss"], value="")\
+              .props("dense outlined").classes("w-32")\
+              .bind_value(gs, "pub_select_by")\
+              .tooltip("Which checkpoint to publish. Blank = accuracy-best "
+                       "(default); 'loss' = lowest valid_loss.")
+        with ui.row().classes("w-full items-center gap-2 mt-1"):
+            ui.label("Repo:").classes("w-24 text-right shrink-0")
+            ui.input(value="", placeholder="optional override, user/name")\
+              .classes("w-80").props("dense outlined").bind_value(gs, "pub_repo")\
+              .tooltip("Explicit HF repo id (overrides the user/family/region "
+                       "derivation), e.g. ggosline/herbarium-africa-ebenaceae-species.")
+        ui.button("Publish model to HF", icon="cloud_upload",
+                  on_click=lambda: _wrap_cloud(_do_publish))\
+            .props("unelevated dense color=primary").classes("mt-2")\
+            .tooltip("Runs the publish step on the pod: picks the best "
+                     "checkpoint and uploads it to the Hub.")
+
 
 def _build_cloud_tools() -> None:
     gs = app.storage.general
@@ -4221,113 +4865,6 @@ def _build_cloud_tools() -> None:
             "hsv = HSV heuristic (CPU, faster). Set No filter / No crop to "
             "\"1\" to skip those phases. The resize step always runs."
         ).classes("text-caption mt-1").style("color:#546e7a;max-width:780px")
-
-    # ── Pull images / R2 archive ─────────────────────────────────────────
-    with ui.card().classes("w-full mt-2").style("border-left:3px solid #00897b"):
-        with ui.row().classes("w-full items-center gap-2"):
-            ui.icon("download").style("color:#00897b;font-size:20px")
-            ui.label("Results & Archive").classes("text-subtitle1 font-bold")\
-                .style("color:#00695c")
-        ui.label(
-            "Pull the resized image set to enable Review locally, or archive "
-            "the whole project to Cloudflare R2 so you can delete the pod's "
-            "network volume and bring it back later."
-        ).classes("text-body2 mt-1").style("color:#455a64;max-width:820px")
-
-        with ui.row().classes("w-full gap-2 mt-2 flex-wrap"):
-            ui.button("Pull images (tar)", icon="image",
-                      on_click=lambda: _wrap_cloud_aux(_do_download_images))\
-                .props("flat dense color=primary")\
-                .tooltip("Tar the resized image set on the pod and pull it back "
-                         "so the Review tab can show specimens.")
-            ui.button("Archive project to R2", icon="cloud_done",
-                      on_click=lambda: _wrap_cloud(
-                          lambda: _do_step("backup",
-                              env={"PROJECT": (gs.get("main_proj") or "").strip()})))\
-                .props("outlined dense color=primary")\
-                .tooltip("Push ckpt, specsin, DwC-A, predictions, and "
-                         "the images tar to r2:<bucket>/<project>/.")
-            ui.button("Restore project from R2", icon="cloud_download",
-                      on_click=_confirm_restore)\
-                .props("outlined dense color=primary")\
-                .tooltip("Pull a previously archived project back onto a "
-                         "fresh volume — skip download/prep entirely.")
-
-        # ── Restore to LOCAL machine (no pod required) ────────────────────
-        with ui.row().classes("w-full items-center gap-2 mt-4"):
-            ui.icon("download_for_offline").style("color:#00897b;font-size:20px")
-            ui.label("Restore to this machine").classes("text-subtitle1 font-bold")\
-                .style("color:#00695c")
-        ui.label(
-            "Pull an archived project directly onto this computer for local "
-            "review / Identify, no pod needed. Requires rclone on PATH "
-            "(https://rclone.org/install/) configured with the same R2 remote "
-            "(default name 'r2'). Cross-platform — works on Windows, macOS, Linux."
-        ).classes("text-body2 mt-1").style("color:#455a64;max-width:820px")
-        with ui.row().classes("w-full items-center gap-2 mt-1"):
-            ui.label("Project:").classes("w-24 text-right shrink-0")
-            ui.input(value="").classes("w-48").props("dense outlined")\
-              .bind_value(gs, "rl_project")\
-              .tooltip("Project name as used at backup (PROJECT env var). "
-                       "Defaults to the current 'main_proj' if blank.")
-            ui.label("Remote:").classes("w-20 text-right shrink-0")
-            ui.input(value="r2:herbarium-backup").classes("w-56")\
-              .props("dense outlined").bind_value(gs, "rl_remote")\
-              .tooltip("rclone remote + bucket, e.g. r2:herbarium-backup")
-        with ui.row().classes("w-full items-center gap-2 mt-1"):
-            rl_target = _path_input("Target directory:", mode="dir")\
-                .bind_value(gs, "rl_target")
-        ui.button("Restore to local", icon="download_for_offline",
-                  on_click=lambda: _do_restore_local())\
-            .props("unelevated dense color=primary").classes("mt-2")
-
-    # ── Publish to Hugging Face ──────────────────────────────────────────
-    with ui.card().classes("w-full mt-2").style("border-left:3px solid #ff8f00"):
-        with ui.row().classes("w-full items-center gap-2"):
-            ui.icon("smart_toy").style("color:#ff8f00;font-size:20px")
-            ui.label("Publish to Hugging Face").classes("text-subtitle1 font-bold")\
-                .style("color:#e65100")
-        ui.label(
-            "Push this project's best checkpoint (highest validation accuracy) "
-            "to the Hugging Face Hub. It's tagged so the herbarium-id Space "
-            "discovers it automatically — no redeploy. Needs a write token "
-            "(⚙ Setup → Hugging Face)."
-        ).classes("text-body2 mt-1").style("color:#455a64;max-width:820px")
-
-        with ui.row().classes("w-full items-center gap-2 mt-1"):
-            ui.label("HF user:").classes("w-24 text-right shrink-0")
-            ui.input(value="", placeholder="e.g. ggosline").classes("w-48")\
-              .props("dense outlined").bind_value(gs, "pub_hfuser")\
-              .tooltip("Your Hugging Face username. Used to build the repo name "
-                       "when no explicit repo is given.")
-            ui.label("Family:").classes("w-20 text-right shrink-0")
-            ui.input(value="", placeholder="defaults to project").classes("w-48")\
-              .props("dense outlined").bind_value(gs, "pub_family")\
-              .tooltip("Family this model covers. Defaults to the current "
-                       "project name if left blank.")
-        with ui.row().classes("w-full items-center gap-2 mt-1"):
-            ui.label("Region:").classes("w-24 text-right shrink-0")
-            ui.input(value="", placeholder="optional, e.g. Africa").classes("w-48")\
-              .props("dense outlined").bind_value(gs, "pub_region")\
-              .tooltip("Optional geographic scope, folded into the repo name "
-                       "and model card.")
-            ui.label("Select:").classes("w-20 text-right shrink-0")
-            ui.select(["", "accuracy", "loss"], value="")\
-              .props("dense outlined").classes("w-32")\
-              .bind_value(gs, "pub_select_by")\
-              .tooltip("Which checkpoint to publish. Blank = accuracy-best "
-                       "(default); 'loss' = lowest valid_loss.")
-        with ui.row().classes("w-full items-center gap-2 mt-1"):
-            ui.label("Repo:").classes("w-24 text-right shrink-0")
-            ui.input(value="", placeholder="optional override, user/name")\
-              .classes("w-80").props("dense outlined").bind_value(gs, "pub_repo")\
-              .tooltip("Explicit HF repo id (overrides the user/family/region "
-                       "derivation), e.g. ggosline/herbarium-africa-ebenaceae-species.")
-        ui.button("Publish model to HF", icon="cloud_upload",
-                  on_click=lambda: _wrap_cloud(_do_publish))\
-            .props("unelevated dense color=primary").classes("mt-2")\
-            .tooltip("Runs the publish step on the pod: picks the best "
-                     "checkpoint and uploads it to the Hub.")
 
     # ── Maintenance ────────────────────────────────────────────────────────
     with ui.card().classes("w-full mt-2").style("border-left:3px solid #ffa726"):
@@ -4712,7 +5249,7 @@ def carousel_page():
 
 @ui.page("/")
 def main_page():
-    global _log, _status, _stop_btn
+    global _log, _status, _stop_btn, _wandb_link
 
     ui.query("body").style("font-family:'Roboto',sans-serif; font-weight:500; background:#f0f2f4; color:#1a2027")
     ui.add_head_html(
@@ -4750,6 +5287,16 @@ def main_page():
                             app.storage.general, "main_mode",
                             lambda v: (v or "cloud") == "local"))
                     _status = ui.label("Ready").classes("text-body2")
+                    # Persistent "busy" chip — visible whenever a local
+                    # subprocess or cloud task is in flight, so a rejected
+                    # click ("already running") is self-explanatory and the
+                    # user knows to Cancel/Stop first. Driven by a 1s timer.
+                    busy_chip = (ui.label("")
+                                 .classes("text-caption")
+                                 .style("background:#fff3e0;color:#e65100;"
+                                        "border-radius:10px;padding:2px 10px;"
+                                        "font-weight:600;white-space:nowrap"))
+                    busy_chip.set_visibility(False)
                     _stop_btn = (ui.button("Stop", icon="stop", on_click=_stop_process)
                                  .props("flat color=white")
                                  .classes("text-white"))
@@ -4856,26 +5403,39 @@ def main_page():
                         ui.button(icon="refresh", on_click=_clear_model_cache
                                   ).props("flat dense round").tooltip("Clear cached model")
 
-                # Tabs — Cloud Tools at the end is hidden in Local mode.
-                with ui.tabs().classes("w-full") as tabs:
-                    t_setup    = ui.tab("⚙ Setup")
-                    t_dl       = ui.tab("1  Download")
-                    t_fc       = ui.tab("2  Filter & Crop")
-                    t_rs       = ui.tab("3  Resize")
-                    t_tr       = ui.tab("4  Train")
-                    t_id       = ui.tab("5  Identify")
-                    t_all      = ui.tab("Run All")
-                    t_review   = ui.tab("Review")
-                    t_conf     = ui.tab("Analysis")
-                    t_qi       = ui.tab("Quick ID")
-                    t_dist     = ui.tab("Distribution")
-                    t_cloud_tools = ui.tab("☁ Cloud Tools")
-                    _cloud_only(t_cloud_tools)
+                # Tabs — the numbered spine (①–⑦) is the workflow, read
+                # left to right. Quick ID and Distribution are ancillary and
+                # hidden from the strip, reached via the Tools ▾ menu. ☁ Cloud
+                # holds pod plumbing and is hidden in Local mode.
+                with ui.row().classes("w-full items-center gap-1 no-wrap"):
+                    with ui.tabs().classes("flex-1") as tabs:
+                        t_setup    = ui.tab("Get Started")
+                        t_dl       = ui.tab("① Download")
+                        t_fc       = ui.tab("② Clean")
+                        t_tr       = ui.tab("③ Train")
+                        t_id       = ui.tab("④ Identify")
+                        t_review   = ui.tab("⑤ Review")
+                        t_archive  = ui.tab("⑥ Archive")
+                        t_publish  = ui.tab("⑦ Publish")
+                        t_all      = ui.tab("Run All")
+                        # Ancillary tools — hidden from the strip, opened via
+                        # the Tools ▾ menu below.
+                        t_qi       = ui.tab("Quick ID")
+                        t_dist     = ui.tab("Distribution")
+                        t_cloud_tools = ui.tab("☁ Cloud")
+                        t_qi.style("display:none")
+                        t_dist.style("display:none")
+                        _cloud_only(t_cloud_tools)
+                    with ui.button("Tools", icon="build").props("flat dense no-caps"):
+                        with ui.menu():
+                            ui.menu_item("Quick ID",
+                                         on_click=lambda: tabs.set_value(t_qi))
+                            ui.menu_item("Distribution map",
+                                         on_click=lambda: tabs.set_value(t_dist))
 
-                # Default tab: Setup on first launch (so users configure
-                # creds), Download otherwise. Sticky tab not implemented —
-                # the user lands on whichever they last viewed via the
-                # browser's hash routing.
+                # Default tab: Get Started on first launch (so users configure
+                # creds). Sticky tab not implemented — the user lands on
+                # whichever they last viewed via the browser's hash routing.
                 with ui.tab_panels(tabs, value=t_setup).classes("w-full rounded").style(
                         "border:1px solid #dde1e4;background:#ffffff;box-shadow:0 1px 3px rgba(0,0,0,.08)"):
 
@@ -4885,11 +5445,19 @@ def main_page():
                     with ui.tab_panel(t_dl).classes("p-4"):
                         dl_cmd, dl_out_dir, dl_specsin = _build_download()
 
+                    # ② Clean = filter + crop, with the (now optional) resize
+                    # step folded in as an expansion rather than its own tab.
                     with ui.tab_panel(t_fc).classes("p-4"):
                         fc_cmd, fc_inp, fc_out, fc_spec = _build_filter_crop()
-
-                    with ui.tab_panel(t_rs).classes("p-4"):
-                        rs_cmd, rs_inp = _build_resize()
+                        with ui.expansion(
+                                "Optional: resize images before upload / train",
+                                icon="photo_size_select_large").classes("w-full mt-3"):
+                            ui.label(
+                                "Downloads are already size-capped, so a separate "
+                                "resize is usually unnecessary. Use this only to "
+                                "shrink an existing image set."
+                            ).classes("text-caption text-grey-7 mb-1")
+                            rs_cmd, rs_inp = _build_resize()
 
                     with ui.tab_panel(t_tr).classes("p-4"):
                         tr_cmd, tr_out, tr_wandb_name, tr_sources, tr_model = _build_train()
@@ -4897,14 +5465,21 @@ def main_page():
                     with ui.tab_panel(t_id).classes("p-4"):
                         id_cmd, id_ckpt, id_nl, id_out, id_sources = _build_identify(tr_model)
 
-                    with ui.tab_panel(t_all).classes("p-4"):
-                        _build_run_all(dl_cmd, fc_cmd, rs_cmd, tr_cmd, id_cmd)
-
+                    # ⑤ Review = browse/correct predictions + the analysis plots,
+                    # merged into one "look at the results" tab.
                     with ui.tab_panel(t_review).classes("p-4"):
                         review_csv, review_imgs = _build_review()
-
-                    with ui.tab_panel(t_conf).classes("p-4"):
+                        ui.separator().classes("my-4")
                         conf_csv = _build_confusion()
+
+                    with ui.tab_panel(t_archive).classes("p-4"):
+                        _build_archive()
+
+                    with ui.tab_panel(t_publish).classes("p-4"):
+                        _build_publish()
+
+                    with ui.tab_panel(t_all).classes("p-4"):
+                        _build_run_all(dl_cmd, fc_cmd, rs_cmd, tr_cmd, id_cmd)
 
                     with ui.tab_panel(t_qi).classes("p-4"):
                         _build_quick_identify()
@@ -4922,13 +5497,44 @@ def main_page():
             with ui.row().classes("items-center justify-between px-3 py-2 shrink-0").style(
                     "background:#2d2d2d; border-bottom:1px solid #444"):
                 ui.label("Output").classes("text-sm font-bold").style("color:#d4d4d4")
-                ui.button("Clear", icon="delete_sweep",
-                          on_click=lambda: _log.clear()
-                          ).props("flat dense").style("color:#aaa")
+                with ui.row().classes("items-center gap-1"):
+                    # Clickable W&B run chip — hidden until a run URL is spotted
+                    # in the training output, then opens the live dashboard.
+                    _wandb_link = (ui.button("W&B run", icon="insights",
+                                   on_click=lambda: ui.navigate.to(_wandb_url[0], new_tab=True)
+                                                    if _wandb_url[0] else None)
+                                   .props("flat dense no-caps")
+                                   .style("color:#ffd54f; font-weight:600"))
+                    _wandb_link.set_visibility(False)
+                    ui.button("Clear", icon="delete_sweep",
+                              on_click=lambda: _log.clear()
+                              ).props("flat dense").style("color:#aaa")
             _log = ui.log(max_lines=5000).style(
                 "flex:1 1 0; min-height:0; width:100%; overflow-y:auto;"
                 "font-family:'Roboto Mono',monospace; font-size:13px;"
                 "background:#1e1e1e; color:#d4d4d4; padding:10px")
+
+    # ---- Busy indicator: reflect any in-flight local proc or cloud task ----
+    def _update_busy() -> None:
+        proc_busy = bool(_proc and _proc.returncode is None)
+        task = _cloud.get("task")
+        aux  = _cloud.get("aux_task")
+        cloud_busy = ((task is not None and not task.done()) or
+                      (aux is not None and not aux.done()))
+        if proc_busy or cloud_busy:
+            what = "cloud step" if cloud_busy else "step"
+            if proc_busy and cloud_busy:
+                what = "step + transfer"
+            busy_chip.set_text(f"⏳ {what} running — Cancel/Stop before another action")
+            busy_chip.set_visibility(True)
+        else:
+            busy_chip.set_visibility(False)
+        # A fresh page (e.g. after a refresh) starts Stop disabled, but the
+        # local process it would stop may still be alive in the background.
+        # Keep Stop clickable whenever a process is actually running.
+        if proc_busy:
+            _stop_btn.enable()
+    ui.timer(1.0, _update_busy)
 
     # ---- Output-panel toggle ----
     _log_panel_vis = [True]
@@ -4943,7 +5549,16 @@ def main_page():
         )
 
     # ---- Apply-paths logic (closure over all inputs) ----
-    def _apply_paths():
+    def _apply_paths(base=None, name=None, img_folder=None):
+        # Explicit args come from the Get Started "Create / open project" flow;
+        # when the header button calls this they're None and we read the inputs.
+        if base is not None:
+            base_inp.value = base
+        if name is not None:
+            proj_inp.value = name
+        if img_folder is not None:
+            img_folder_inp.value = img_folder
+
         base = _v(base_inp)
         name = _v(proj_inp)
         if not base:
@@ -4986,6 +5601,16 @@ def main_page():
         dist_img_inp.value = images
 
         ui.notify(f"Paths set for {name}", type="positive")
+
+    # Expose the page-closure navigation + path setup to the Get Started tab,
+    # which is built in a separate function and can't see these directly.
+    _page_hooks["apply_paths"] = _apply_paths
+    _page_hooks["goto_tab"] = lambda t: tabs.set_value(t)
+    _page_hooks["tab_refs"] = {
+        "setup":    t_setup, "download": t_dl,     "clean":   t_fc,
+        "train":    t_tr,    "identify": t_id,      "review":  t_review,
+        "archive":  t_archive, "publish": t_publish, "run_all": t_all,
+    }
 
 
 import os as _os_run

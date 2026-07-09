@@ -110,7 +110,8 @@ def _copy(rclone: str, src: str, dst: Path, *extra: str,
 
 
 def restore(project: str, target: Path, remote: str = "r2:herbarium-backup",
-            images_dirname: str = "images") -> int:
+            images_dirname: str = "images",
+            skip_images_if_present: bool = False) -> int:
     rclone = _have_rclone()
     env = _r2_env()
     if env:
@@ -136,6 +137,16 @@ def restore(project: str, target: Path, remote: str = "r2:herbarium-backup",
 
     # 4. Images tarball — try the modern <images_dirname>.tar first, then the
     #    legacy `images_1024.tar` name used by older archives.
+    #    Skip the (multi-GB) image pull entirely when the caller says images
+    #    are already present locally — the Review "Fetch" path passes this so a
+    #    re-fetch of predictions doesn't re-download images. Delete the folder
+    #    to force a refresh.
+    img_present = (target / images_dirname)
+    if skip_images_if_present and img_present.is_dir() and any(img_present.iterdir()):
+        print(f"  images already present at {img_present} — skipping image pull "
+              f"(delete the folder to force a refresh).", flush=True)
+        print(f"✓ Restore complete at {target}", flush=True)
+        return 0
     candidates = [f"{images_dirname}.tar", "images_1024.tar"]
     found = None
     for name in candidates:
@@ -197,9 +208,13 @@ def main() -> int:
     p.add_argument("--images-dirname", default="images",
                    help="Final name of the images directory under <target>. "
                         "Default: images")
+    p.add_argument("--skip-images-if-present", action="store_true",
+                   help="Skip pulling/extracting the image tarball when the "
+                        "images directory already exists and is non-empty.")
     args = p.parse_args()
     return restore(args.project, args.target.resolve(),
-                   remote=args.remote, images_dirname=args.images_dirname)
+                   remote=args.remote, images_dirname=args.images_dirname,
+                   skip_images_if_present=args.skip_images_if_present)
 
 
 if __name__ == "__main__":

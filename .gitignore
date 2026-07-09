@@ -5,6 +5,9 @@ __pycache__/
 .venv/
 .nicegui/
 
+# Portable-build output (regenerable via make_portable.py)
+dist/
+
 # Experiment artifacts (large, regenerable)
 wandb/
 *.ckpt

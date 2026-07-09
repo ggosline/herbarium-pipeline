@@ -53,7 +53,10 @@ COPY pyproject.toml uv.lock ./
 
 # Locked deps into /opt/venv. --no-install-project skips building the
 # herbarium-pipeline package (code runs by path, never imported as a dist).
-RUN uv sync --frozen --no-install-project
+# --extra local-ml pulls the full ML stack (torch, timm, transformers, …):
+# it lives in an optional group so a plain `uv sync` stays slim for local UI
+# installs, but the POD needs it to train / identify.
+RUN uv sync --frozen --no-install-project --extra local-ml
 
 # DALI, out-of-lock, exactly as the slow path does. cuda120 wheel runs on ANY
 # CUDA-12+ driver, so one image serves the whole GPU fallback list.

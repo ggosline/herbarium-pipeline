@@ -28,6 +28,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 import argparse
 import urllib.request
@@ -48,6 +49,45 @@ GBIF_SPECIES_MATCH = "https://api.gbif.org/v1/species/match"
 GBIF_DOWNLOAD_API  = "https://api.gbif.org/v1/occurrence/download/request"
 GBIF_DOWNLOAD_INFO = "https://api.gbif.org/v1/occurrence/download/{key}"
 HEADERS = {"User-Agent": "HerbariumImageDownloader/1.0 (research)"}
+
+# ── Per-host circuit breaker ────────────────────────────────────────────────
+# A single degraded image server (common in the afternoon when European
+# herbaria are busy) used to stall workers: every URL cost up to timeout ×
+# retries (~90 s) before giving up, and with N workers all hitting the same
+# dead host the whole download crawled. We track consecutive failures per host
+# and, once a host trips the threshold, serve its URLs a short timeout and no
+# retries — so a dead provider fails fast (~5 s) instead of blocking a worker.
+# A single success resets the host, so a briefly-flaky host recovers on its own.
+IMG_TIMEOUT = 20            # normal per-request timeout (herbarium thumbnails are small)
+IMG_RETRIES = 2            # normal attempts per URL before giving up
+_HOST_FAIL_THRESHOLD = 8   # consecutive failures before a host is "degraded"
+_DEGRADED_TIMEOUT = 5      # quick give-up timeout for a known-bad host
+_host_fails: dict[str, int] = {}
+_host_lock = threading.Lock()
+
+
+def _host_of(url: str) -> str:
+    try:
+        return urllib.parse.urlparse(url).netloc
+    except Exception:
+        return ""
+
+
+def _host_degraded(host: str) -> bool:
+    with _host_lock:
+        return _host_fails.get(host, 0) >= _HOST_FAIL_THRESHOLD
+
+
+def _note_host(host: str, ok: bool) -> None:
+    """Record a connection outcome for host health. Only call for transient
+    (timeout / connection) results — not permanent per-image HTTP errors."""
+    if not host:
+        return
+    with _host_lock:
+        if ok:
+            _host_fails[host] = 0
+        else:
+            _host_fails[host] = _host_fails.get(host, 0) + 1
 PAGE_SIZE = 300  # GBIF max per request
 GBIF_MAX_OFFSET = 100_000  # GBIF hard cap on paged results
 
@@ -394,12 +434,23 @@ def _iiif_upgrade(url: str, iiif_size: str) -> list[str]:
 # Download worker
 # ---------------------------------------------------------------------------
 
-def _fetch_bytes(url: str, retries: int = 3) -> bytes | None:
-    """Fetch URL, retrying on transient errors and truncation. Returns None on any failure."""
+def _fetch_bytes(url: str, retries: int = IMG_RETRIES) -> bytes | None:
+    """Fetch URL, retrying on transient errors and truncation. Returns None on any failure.
+
+    A host that has already failed repeatedly (see the circuit breaker above)
+    is served a single short-timeout attempt so one dead server can't stall a
+    worker for ~90 s per URL.
+    """
+    host = _host_of(url)
+    if _host_degraded(host):
+        retries = 1
+        timeout = _DEGRADED_TIMEOUT
+    else:
+        timeout = IMG_TIMEOUT
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = resp.read()
             # Check for truncated response — some servers silently cut off
             content_length = resp.headers.get("Content-Length")
@@ -411,24 +462,27 @@ def _fetch_bytes(url: str, retries: int = 3) -> bytes | None:
                         time.sleep(2 ** attempt)
                         continue
                     return None
+            _note_host(host, True)   # a real response — host is healthy
             return data
         except urllib.error.HTTPError as exc:
             if exc.code in (400, 403, 404, 410, 501):
-                return None  # permanent — don't retry
+                return None  # permanent, per-image — not a host-health signal
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
             else:
                 return None
         except (urllib.error.URLError, OSError, http.client.IncompleteRead):
+            # Timeout / connection failure — the signal the circuit breaker uses.
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
             else:
+                _note_host(host, False)
                 return None
     return None
 
 
 def download_image(img_url: str, dest: Path, max_size: int | None = None,
-                   iiif_size: str | None = None, retries: int = 3) -> bool:
+                   iiif_size: str | None = None, retries: int = IMG_RETRIES) -> bool:
     """
     Download a single image to dest, optionally resizing so the longer side <= max_size.
     If iiif_size is set (e.g. "2048" or "max"), attempts IIIF size-upgrade variants

@@ -534,7 +534,10 @@ setup() {
     # 6b. Create venv + install locked deps. With a populated UV_CACHE_DIR
     #     this is link-only (no downloads) and finishes in ~1 min. Cold
     #     cache can take an hour on a slow PyPI path.
-    uv sync --frozen
+    #     --extra local-ml pulls the full ML stack (torch/timm/transformers/…),
+    #     which moved to an optional group so plain `uv sync` stays slim for
+    #     local UI installs. The pod always needs it.
+    uv sync --frozen --extra local-ml
 
     # 6c. DALI — installed outside the lock (it's not in pyproject.toml).
     #     Pinned to the cuda120 wheel regardless of the pod's driver: torch is
@@ -1430,7 +1433,7 @@ repair_cache() {
   echo "→ Forcing re-download of all wheels into $UV_CACHE_DIR..."
   echo "  (uv sync --frozen --reinstall — this is the slow PyPI step we"
   echo "   want to do exactly once, then never again on any future pod.)"
-  uv sync --frozen --reinstall
+  uv sync --frozen --reinstall --extra local-ml
   echo
   echo "→ Wheel cache size after redownload:"
   du -sh "$UV_CACHE_DIR" 2>/dev/null
