@@ -82,6 +82,23 @@ _host_perm_fails: dict[str, int] = {}
 _host_ok: set[str] = set()         # hosts that have served >= 1 image
 _host_blocked: dict[str, int] = {}  # host -> refusals when it was blocked
 
+# ── Cooldown for hosts that stop answering ─────────────────────────────────
+# The degraded state above only makes failure *cheaper* (5 s, one try); it
+# never stops. When a provider firewalls us — images.mobot.org blackholed this
+# project's pod at the TCP level after ~4.5k downloads, every port, every MO
+# hostname — that is still 5 s burned per URL, times thousands.
+#
+# So once a host has failed _HOST_FAIL_THRESHOLD times in a row, stop asking
+# for a while. Each successive cooldown doubles, capped, and one success
+# anywhere in the cycle clears it. That bounds the waste on a host that has
+# banned us to a handful of probes, while a host having a two-minute wobble
+# recovers on its own. It also stops us hammering a server that has, quite
+# explicitly, asked us to go away.
+_COOLDOWN_BASE = 60.0        # seconds, first cooldown
+_COOLDOWN_MAX = 1800.0       # 30 min ceiling
+_host_cooldown: dict[str, float] = {}   # host -> epoch when we may retry
+_host_backoff: dict[str, float] = {}    # host -> current cooldown length
+
 
 def _host_of(url: str) -> str:
     try:
@@ -124,11 +141,33 @@ def blocked_hosts() -> dict[str, int]:
         return dict(_host_blocked)
 
 
+def _host_cooling(host: str) -> bool:
+    """True while a host is in its back-off window. Callers skip it entirely."""
+    with _host_lock:
+        until = _host_cooldown.get(host)
+        if until is None:
+            return False
+        if time.time() < until:
+            return True
+        # Window elapsed — let exactly one request through to probe the host.
+        # If it fails, _note_host re-arms with a doubled cooldown.
+        del _host_cooldown[host]
+        return False
+
+
+def cooling_hosts() -> dict[str, float]:
+    """Snapshot of hosts in cooldown and their current back-off, for reporting."""
+    with _host_lock:
+        return {h: _host_backoff.get(h, 0.0) for h in _host_cooldown}
+
+
 def _note_host(host: str, ok: bool) -> None:
     """Record a connection outcome for host health. Only call for transient
     (timeout / connection) results — not permanent per-image HTTP errors."""
     if not host:
         return
+    now = time.time()
+    entered = 0.0
     with _host_lock:
         if ok:
             _host_fails[host] = 0
@@ -136,8 +175,27 @@ def _note_host(host: str, ok: bool) -> None:
             # us; it can never be blocked as dead afterwards.
             _host_ok.add(host)
             _host_perm_fails.pop(host, None)
+            _host_cooldown.pop(host, None)
+            _host_backoff.pop(host, None)
         else:
-            _host_fails[host] = _host_fails.get(host, 0) + 1
+            n = _host_fails.get(host, 0) + 1
+            _host_fails[host] = n
+            # Arm at most once per cooldown cycle. Workers already in flight
+            # when the window opens will land here too; without this guard each
+            # one would double the backoff and re-log, so a brief wobble on a
+            # healthy host would jump straight to the 30-minute ceiling.
+            if n >= _HOST_FAIL_THRESHOLD and host not in _host_cooldown:
+                # Double the previous cooldown; a probe that fails again lands
+                # here with the counter still above the threshold.
+                back = min(_host_backoff.get(host, 0.0) * 2 or _COOLDOWN_BASE,
+                           _COOLDOWN_MAX)
+                _host_backoff[host] = back
+                _host_cooldown[host] = now + back
+                entered = back
+    if entered:
+        msg = (f"  ⏸ {host}: {_HOST_FAIL_THRESHOLD}+ consecutive connection "
+               f"failures — backing off {entered / 60:.0f} min.")
+        (tqdm.write if tqdm else print)(msg)
 PAGE_SIZE = 300  # GBIF max per request
 GBIF_MAX_OFFSET = 100_000  # GBIF hard cap on paged results
 
@@ -494,6 +552,8 @@ def _fetch_bytes(url: str, retries: int = IMG_RETRIES) -> bytes | None:
     host = _host_of(url)
     if _host_is_blocked(host):
         return None  # host refuses everything — don't even open a socket
+    if _host_cooling(host):
+        return None  # host stopped answering — leave it alone for now
     if _host_degraded(host):
         retries = 1
         timeout = _DEGRADED_TIMEOUT
@@ -1184,6 +1244,15 @@ def main() -> None:
         print("  Their specimens are marked hasfile=False. Some providers "
               "(e.g. mediaphoto.mnhn.fr) sit behind a bot challenge and cannot "
               "be fetched by any script.")
+
+    cooling = cooling_hosts()
+    if cooling:
+        print("\nHosts still in back-off when the run ended (stopped answering):")
+        for host, back in sorted(cooling.items(), key=lambda kv: -kv[1]):
+            print(f"  {host:44s} backing off {back / 60:.0f} min")
+        print("  A host that stops accepting connections mid-run has usually "
+              "rate-limited or firewalled this machine. Lower --workers before "
+              "retrying; do not route around the block.")
 
     save_specsin(specsin_path, updated)
 
