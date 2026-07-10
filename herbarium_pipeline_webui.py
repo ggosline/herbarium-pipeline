@@ -3755,12 +3755,21 @@ def _wrap_cloud_aux(coro_factory):
 
 
 async def _kill_remote_step() -> None:
-    """Stop the detached step on the pod, if one is running."""
-    orch = _ensure_orch()
-    pod = _cloud.get("pod")
-    if orch is None or pod is None:
-        return
+    """Stop the detached step on the pod, if one is running.
+
+    Runs as a bare background task, so it must never raise and must never
+    touch ui.notify (no slot context) — everything reports via _cloud_log.
+    """
     try:
+        orch = _ensure_orch()
+        pod = _cloud.get("pod")
+        if orch is None:
+            _cloud_warn("No orchestrator — can't reach the pod to cancel.")
+            return
+        if pod is None:
+            _cloud_warn("No active pod handle. Provision or Attach first, "
+                        "then Cancel.")
+            return
         step = await orch.running_step(pod, on_log=_cloud_log)
         if not step:
             _cloud_log("No step is running on the pod.")

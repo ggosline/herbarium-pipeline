@@ -729,9 +729,16 @@ class CloudOrchestrator:
         only way to stop the work — cancelling the local asyncio task that
         tails the log merely stops watching it.
 
-        No ``.rc`` is written (``run_detached`` dies before it gets there), so
-        a later ``run_step`` sees no rc and no process, and starts cleanly.
+        Killing the group means ``run_detached`` dies before it writes the
+        ``.rc``. We must write one ourselves (130, "terminated by Ctrl-C"):
+        ``_follow_step`` blocks in ``while [ ! -f <rc> ]``, and ``exec_streaming``
+        reads that channel on a thread, which ``task.cancel()`` cannot
+        interrupt. Without an ``.rc`` the follower waits forever and the UI's
+        in-flight task never completes, so every later click reports "a cloud
+        step is already running". ``spawn_step`` removes the ``.rc`` before it
+        launches, so a stale 130 never blocks the next Run.
         """
+        rcf = f"{REMOTE_LOGS}/{step}.rc"
         cmd = (
             f'pid=$(pgrep -f "pod_bootstrap.sh __run_detached {step} " | head -1); '
             f'[ -n "$pid" ] || pid=$(pgrep -f "pod_bootstrap.sh {step}\\$" | head -1); '
@@ -740,8 +747,11 @@ class CloudOrchestrator:
             f'kill -TERM -"$pgid" 2>/dev/null; '
             f'for i in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done; '
             f'if kill -0 "$pid" 2>/dev/null; then '
-            f'kill -KILL -"$pgid" 2>/dev/null; echo "CANCEL=killed"; '
-            f'else echo "CANCEL=terminated"; fi'
+            f'kill -KILL -"$pgid" 2>/dev/null; verdict=killed; '
+            f'else verdict=terminated; fi; '
+            # Release the log follower, which is blocked on this file.
+            f'echo 130 > {rcf}.tmp && mv {rcf}.tmp {rcf}; '
+            f'echo "CANCEL=$verdict"'
         )
         # Session open is inside the try: if SSH is gone we report failure
         # rather than raising out of a UI button handler.
