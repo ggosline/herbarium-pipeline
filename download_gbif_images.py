@@ -65,6 +65,23 @@ _DEGRADED_TIMEOUT = 5      # quick give-up timeout for a known-bad host
 _host_fails: dict[str, int] = {}
 _host_lock = threading.Lock()
 
+# ── Dead-host detection (permanent refusals) ────────────────────────────────
+# Distinct from the transient breaker above. Some providers refuse *every*
+# image to an automated client: mediaphoto.mnhn.fr (Paris, ~13% of Rubiaceae
+# specimen images) sits behind a Cloudflare managed challenge and answers 403
+# to any request without a JS challenge solve. Each 403 is cheap on its own,
+# but 14k of them is 14k pointless round-trips and 14k bogus hasfile=False
+# rows.
+#
+# A 403/404 on a *healthy* host is a normal dead link, so we must not block on
+# those. The signal is a host that has produced many permanent refusals and
+# has never once served an image. One success exonerates a host for the rest
+# of the run, so a provider with a high dud rate is never blocked.
+_HOST_PERM_THRESHOLD = 25          # permanent refusals before a host is dead
+_host_perm_fails: dict[str, int] = {}
+_host_ok: set[str] = set()         # hosts that have served >= 1 image
+_host_blocked: dict[str, int] = {}  # host -> refusals when it was blocked
+
 
 def _host_of(url: str) -> str:
     try:
@@ -78,6 +95,35 @@ def _host_degraded(host: str) -> bool:
         return _host_fails.get(host, 0) >= _HOST_FAIL_THRESHOLD
 
 
+def _host_is_blocked(host: str) -> bool:
+    """True when the host has proven it will refuse everything. Callers skip
+    the request entirely — no socket, no timeout, no retry."""
+    with _host_lock:
+        return host in _host_blocked
+
+
+def _note_permanent_refusal(host: str) -> bool:
+    """Record a 403/404-class refusal. Returns True the moment the host
+    crosses the threshold, so the caller can log it exactly once."""
+    if not host:
+        return False
+    with _host_lock:
+        if host in _host_ok or host in _host_blocked:
+            return False
+        n = _host_perm_fails.get(host, 0) + 1
+        _host_perm_fails[host] = n
+        if n >= _HOST_PERM_THRESHOLD:
+            _host_blocked[host] = n
+            return True
+        return False
+
+
+def blocked_hosts() -> dict[str, int]:
+    """Snapshot of hosts abandoned this run, for the end-of-run summary."""
+    with _host_lock:
+        return dict(_host_blocked)
+
+
 def _note_host(host: str, ok: bool) -> None:
     """Record a connection outcome for host health. Only call for transient
     (timeout / connection) results — not permanent per-image HTTP errors."""
@@ -86,6 +132,10 @@ def _note_host(host: str, ok: bool) -> None:
     with _host_lock:
         if ok:
             _host_fails[host] = 0
+            # A single served image proves the host is alive and talking to
+            # us; it can never be blocked as dead afterwards.
+            _host_ok.add(host)
+            _host_perm_fails.pop(host, None)
         else:
             _host_fails[host] = _host_fails.get(host, 0) + 1
 PAGE_SIZE = 300  # GBIF max per request
@@ -442,6 +492,8 @@ def _fetch_bytes(url: str, retries: int = IMG_RETRIES) -> bytes | None:
     worker for ~90 s per URL.
     """
     host = _host_of(url)
+    if _host_is_blocked(host):
+        return None  # host refuses everything — don't even open a socket
     if _host_degraded(host):
         retries = 1
         timeout = _DEGRADED_TIMEOUT
@@ -466,7 +518,15 @@ def _fetch_bytes(url: str, retries: int = IMG_RETRIES) -> bytes | None:
             return data
         except urllib.error.HTTPError as exc:
             if exc.code in (400, 403, 404, 410, 501):
-                return None  # permanent, per-image — not a host-health signal
+                # Permanent for this image. Normally a dead link and no signal
+                # about the host — but a host that only ever refuses, and has
+                # never served an image, is not worth asking again.
+                if _note_permanent_refusal(host):
+                    msg = (f"  ⨯ {host}: {_HOST_PERM_THRESHOLD} refusals and no "
+                           f"successes — skipping this host for the rest of the "
+                           f"run (HTTP {exc.code}).")
+                    (tqdm.write if tqdm else print)(msg)
+                return None
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
             else:
@@ -1115,6 +1175,15 @@ def main() -> None:
         f"\nDone — {newly_downloaded} new images downloaded, "
         f"{failed} failures, {species_updated} species name(s) updated."
     )
+
+    dead = blocked_hosts()
+    if dead:
+        print("\nHosts abandoned this run (refused everything, served nothing):")
+        for host, n in sorted(dead.items(), key=lambda kv: -kv[1]):
+            print(f"  {host:44s} {n:>6,} refusals before skip")
+        print("  Their specimens are marked hasfile=False. Some providers "
+              "(e.g. mediaphoto.mnhn.fr) sit behind a bot challenge and cannot "
+              "be fetched by any script.")
 
     save_specsin(specsin_path, updated)
 
