@@ -1034,6 +1034,11 @@ download() {
   # Without a default, full archival scans (5–15 MB each) accumulate.
   MAX_SIZE="${MAX_SIZE:-1200}"
   WORKERS="${WORKERS:-16}"
+  # --workers is a global pool. Without a per-host cap all 16 can pile
+  # onto one provider; that is how images.mobot.org came to firewall a
+  # pod mid-run. 4 is polite and costs ~nothing (traffic spreads over
+  # dozens of hosts).
+  PER_HOST_WORKERS="${PER_HOST_WORKERS:-4}"
   EXTRA=()
   if [ -n "${MAX_SIZE:-}" ];       then EXTRA+=(--max-size "$MAX_SIZE"); fi
   if [ -n "${LIMIT:-}" ];          then EXTRA+=(--limit "$LIMIT"); fi
@@ -1050,6 +1055,7 @@ download() {
       --specsin "$SPECSIN" \
       --iiif-size "$IIIF" \
       --workers "$WORKERS" \
+      --per-host-workers "$PER_HOST_WORKERS" \
       "${EXTRA[@]}"
   elif [ -n "$DWCA" ] && [ -f "$DWCA" ]; then
     echo "Using local DwC-A: $DWCA (iiif-size=$IIIF${MAX_SIZE:+ max-size=$MAX_SIZE}${LIMIT:+ limit=$LIMIT}${MAX_PER_SP:+ max-per-sp=$MAX_PER_SP}${MAX_PER_GENUS:+ max-per-genus=$MAX_PER_GENUS}${MAX_PER_FAMILY:+ max-per-family=$MAX_PER_FAMILY})"
@@ -1059,6 +1065,7 @@ download() {
       --specsin "$SPECSIN" \
       --iiif-size "$IIIF" \
       --workers "$WORKERS" \
+      --per-host-workers "$PER_HOST_WORKERS" \
       "${EXTRA[@]}"
   elif [ -n "${TAXON_FAMILIES:-}" ]; then
     # Multiple families (e.g. split clade like old Olacaceae).
@@ -1077,6 +1084,7 @@ download() {
       --specsin "$SPECSIN" \
       --iiif-size "$IIIF" \
       --workers "$WORKERS" \
+      --per-host-workers "$PER_HOST_WORKERS" \
       "${GEO[@]}" \
       "${EXTRA[@]}"
   elif [ -n "${TAXON:-}" ]; then
@@ -1100,6 +1108,7 @@ download() {
       --specsin "$SPECSIN" \
       --iiif-size "$IIIF" \
       --workers "$WORKERS" \
+      --per-host-workers "$PER_HOST_WORKERS" \
       "${GEO[@]}" \
       "${EXTRA[@]}"
   else

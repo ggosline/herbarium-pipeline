@@ -99,6 +99,29 @@ _COOLDOWN_MAX = 1800.0       # 30 min ceiling
 _host_cooldown: dict[str, float] = {}   # host -> epoch when we may retry
 _host_backoff: dict[str, float] = {}    # host -> current cooldown length
 
+# ── Per-host politeness ────────────────────────────────────────────────────
+# --workers is a *global* pool, so N workers could all land on one provider at
+# once. That is how images.mobot.org came to firewall this project's pod: 16
+# concurrent connections, thousands of requests, one IP. Cap in-flight requests
+# per host instead. Traffic spreads across ~46 hosts in a typical family, so a
+# small per-host cap costs almost nothing in aggregate throughput while keeping
+# us well inside what any single herbarium would consider reasonable.
+#
+# Bound the semaphore table: hosts are drawn from GBIF media URLs, so the key
+# space is small (tens), but a bad DwC-A could in principle blow it up.
+PER_HOST_CONCURRENCY = 4
+_host_sems: dict[str, threading.Semaphore] = {}
+
+
+def _host_semaphore(host: str) -> threading.Semaphore:
+    """Get (or create) the in-flight limiter for ``host``. Never blocks."""
+    with _host_lock:
+        sem = _host_sems.get(host)
+        if sem is None:
+            sem = threading.Semaphore(PER_HOST_CONCURRENCY)
+            _host_sems[host] = sem
+        return sem
+
 
 def _host_of(url: str) -> str:
     try:
@@ -559,13 +582,18 @@ def _fetch_bytes(url: str, retries: int = IMG_RETRIES) -> bytes | None:
         timeout = _DEGRADED_TIMEOUT
     else:
         timeout = IMG_TIMEOUT
+    sem = _host_semaphore(host)
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = resp.read()
+            # Hold the per-host slot only for the connection itself. The retry
+            # sleeps below sit outside it, so a backing-off worker never parks
+            # on a slot another host's URL could be using.
+            with sem:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    data = resp.read()
+                    content_length = resp.headers.get("Content-Length")
             # Check for truncated response — some servers silently cut off
-            content_length = resp.headers.get("Content-Length")
             if content_length is not None:
                 expected = int(content_length)
                 actual = len(data)
@@ -887,6 +915,7 @@ def request_gbif_download(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global PER_HOST_CONCURRENCY
     parser = argparse.ArgumentParser(
         description="Download GBIF herbarium images and build a specsin CSV.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -930,6 +959,13 @@ def main() -> None:
                         help="specsin CSV to create/update (default: ./<taxon>_specsin.csv)")
     parser.add_argument("--workers", type=int, default=8,
                         help="Parallel download threads (default: 8)")
+    parser.add_argument("--per-host-workers", type=int,
+                        default=PER_HOST_CONCURRENCY, metavar="N",
+                        help=f"Max concurrent requests to any single image host "
+                             f"(default: {PER_HOST_CONCURRENCY}). --workers is a "
+                             f"global pool; without this cap every worker can "
+                             f"pile onto one provider and get the machine "
+                             f"firewalled. 0 disables the cap.")
     parser.add_argument("--max-size", type=int, default=0, metavar="PX",
                         help="Resize so the longer side <= PX using PIL (default: disabled). "
                              "Prefer a separate DALI post-processing pass for bulk resizing.")
@@ -1158,7 +1194,13 @@ def main() -> None:
         print(f"Specsin-only mode: {len(rows)} rows written, no images downloaded.")
         return
 
-    print(f"\nProcessing {total} records with {args.workers} workers...")
+    if args.per_host_workers and args.per_host_workers > 0:
+        PER_HOST_CONCURRENCY = args.per_host_workers
+    else:
+        PER_HOST_CONCURRENCY = args.workers  # cap disabled — no limit below the pool
+
+    print(f"\nProcessing {total} records with {args.workers} workers "
+          f"(max {PER_HOST_CONCURRENCY} concurrent per host)...")
     print(f"Output directory: {out_dir}\n")
 
     newly_downloaded = failed = species_updated = 0
