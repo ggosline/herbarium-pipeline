@@ -229,6 +229,36 @@ venv_cache_key() {
   echo "$VENV_CACHE_KEY"
 }
 
+# ─── uv, installed on demand ──────────────────────────────────────────────
+# Only the slow paths (`uv sync`, `uv pip install`) need uv; the prebaked
+# image ships a complete venv without it. Call this immediately before the
+# first uv invocation, never up front — an unreachable astral.sh must not be
+# able to abort a setup that was never going to run uv at all.
+#
+# The connect timeout matters: curl's default lets a blackholed host hang for
+# ~5 min, and under `set -e` that failure is fatal.
+ensure_uv() {
+  if command -v uv >/dev/null; then
+    return 0
+  fi
+  echo "Installing uv..."
+  if ! curl -LsSf --connect-timeout 15 --retry 3 https://astral.sh/uv/install.sh | sh; then
+    # Best-effort fallback. The CUDA base image ships no system python3 (uv
+    # installs its own CPython), so this only helps on the runpod/pytorch
+    # fallback image — hence the guard and the `|| true`.
+    echo "⚠ astral.sh unreachable — trying 'pip install uv'" >&2
+    if command -v python3 >/dev/null; then
+      python3 -m pip install --quiet uv || true
+    fi
+  fi
+  export PATH="$HOME/.local/bin:$PATH"
+  if ! command -v uv >/dev/null; then
+    echo "✗ Could not install uv, and this pod needs the slow venv path." >&2
+    echo "  Check the pod's outbound network (astral.sh, pypi.org)." >&2
+    return 1
+  fi
+}
+
 # ─── prebaked image detection ─────────────────────────────────────────────
 # On the prebaked Docker image (see /Dockerfile) the fully assembled venv is
 # already at $HERBARIUM_PREBAKED_VENV (/opt/venv) — on the container's LOCAL
@@ -487,14 +517,15 @@ setup() {
   #    from R2. Without it venv_pull short-circuits and we fall through to
   #    the slow path.
   if ! command -v rclone >/dev/null; then
-    curl -fsSL https://rclone.org/install.sh | bash
+    curl -fsSL --connect-timeout 15 --retry 3 https://rclone.org/install.sh | bash
   fi
 
-  # 4. uv — needed in both fast and slow paths. Tiny, fast install.
-  if ! command -v uv >/dev/null; then
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.local/bin:$PATH"
-  fi
+  # 4. uv is NOT installed here. It is only ever invoked on the slow path
+  #    (`uv sync` / `uv pip install` below), and the prebaked image ships a
+  #    complete venv with no uv on purpose (see Dockerfile). Installing it up
+  #    front made every prebaked pod reach out to astral.sh for a tool it never
+  #    ran — and under `set -e` an unreachable astral.sh killed setup outright.
+  #    It is now installed lazily, inside the slow path that needs it.
 
   # 5. GPU-vs-CPU detection. CUDA_MAJOR only distinguishes a GPU pod ("12",
   #    or any number → GPU venv with DALI) from a CPU pod ("cpu" → no DALI);
@@ -528,6 +559,9 @@ setup() {
     echo "Setup fast path complete — venv pulled from R2."
   else
     # ── Slow path: build the venv from wheels. ──
+    # 6a′. uv is only needed from here on. See ensure_uv().
+    ensure_uv
+
     # 6a. Pull shared wheel + HF caches from R2. Best-effort: never fails.
     cache_pull
 
@@ -1471,6 +1505,7 @@ repair_cache() {
     echo "Repo missing at $REPO — run setup first."; exit 1
   fi
   cd "$REPO"
+  ensure_uv
   echo "→ Forcing re-download of all wheels into $UV_CACHE_DIR..."
   echo "  (uv sync --frozen --reinstall — this is the slow PyPI step we"
   echo "   want to do exactly once, then never again on any future pod.)"
