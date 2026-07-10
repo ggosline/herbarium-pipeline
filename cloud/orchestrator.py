@@ -686,6 +686,62 @@ class CloudOrchestrator:
             f"paste its Pod ID into Attach."
         )
 
+    async def running_step(
+        self, handle: PodHandle, *, on_log: LogFn = print,
+    ) -> str | None:
+        """Name of the detached step currently running on the pod, or None.
+
+        A step is running when its log exists, its ``.rc`` does not (spawn_step
+        removes the .rc before launching), and the step process is alive. Only
+        one step runs at a time, so the first match wins.
+        """
+        probe = (
+            f'for f in {REMOTE_LOGS}/*.log; do '
+            f'[ -e "$f" ] || continue; '
+            f's=${{f##*/}}; s=${{s%.log}}; '
+            f'[ -f "{REMOTE_LOGS}/$s.rc" ] && continue; '
+            f'if pgrep -f "pod_bootstrap.sh ${{s}}\\$" >/dev/null 2>&1; then '
+            f'echo "RUNNING_STEP=$s"; break; fi; '
+            f'done'
+        )
+        try:
+            session = await self._ensure_session(handle, on_log=on_log)
+            _, out = await session.exec_capture(probe)
+        except Exception as e:
+            on_log(f"  could not check for a running step: {e}")
+            return None
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("RUNNING_STEP="):
+                step = line.partition("=")[2].strip()
+                if step:
+                    return step
+        return None
+
+    async def follow_running_step(
+        self, handle: PodHandle, step: str, *, on_log: LogFn = print,
+    ) -> int:
+        """Re-attach to an already-running detached step and stream its log
+        until it finishes. Returns the step's exit code.
+
+        The log is re-tailed from line 1, so the whole run history replays.
+        Safe to call repeatedly — it never spawns anything.
+        """
+        session = await self._ensure_session(handle, on_log=on_log)
+        self._state.current_step = step
+        self._save_state()
+        rc = await self._follow_step(
+            session,
+            f"{REMOTE_LOGS}/{step}.log",
+            f"{REMOTE_LOGS}/{step}.rc",
+            on_log=on_log,
+        )
+        if rc == 0 and step not in self._state.completed_steps:
+            self._state.completed_steps.append(step)
+        self._state.current_step = ""
+        self._save_state()
+        return rc
+
     async def attach(self, pod_id: str, *, on_log: LogFn = print) -> PodHandle:
         """Connect to a manually-created pod by its RunPod ID.
 
@@ -741,6 +797,14 @@ class CloudOrchestrator:
         else:
             self._state.data_center_id = None
         self._save_state()
+
+        # A step spawned before the UI restarted is still running (setsid +
+        # nohup). Say so — the pod looks idle otherwise. Callers should then
+        # follow_running_step() rather than sync_code(), which would SFTP over
+        # a pod_bootstrap.sh that a live bash is still reading by offset.
+        step = await self.running_step(handle, on_log=on_log)
+        if step:
+            on_log(f"↻ '{step}' is still running on this pod.")
         return handle
 
     async def ensure_pod_template(

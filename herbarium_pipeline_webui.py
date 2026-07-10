@@ -3964,7 +3964,18 @@ async def _do_attach() -> None:
         return
     _cloud["pod"] = pod
     _cloud["purpose"] = "train"  # assume manually-created pod is train-capable
-    await orch.sync_code(pod, on_log=_cloud_log)
+
+    # A step spawned before this UI restarted survives the disconnect (setsid
+    # + nohup). Find it before touching anything: sync_code would SFTP over
+    # pod_bootstrap.sh while a live bash is still reading it by file offset,
+    # which can corrupt the running step.
+    step = await orch.running_step(pod, on_log=_cloud_log)
+    if step:
+        _cloud_log(f"Skipping code sync — '{step}' is running and bash is "
+                   f"still reading pod_bootstrap.sh.")
+    else:
+        await orch.sync_code(pod, on_log=_cloud_log)
+
     # Start the idle watchdog so the pod self-terminates after inactivity.
     # Surface failures — silent best-effort previously hid bugs (eg the
     # source-time dispatcher fault) and left attached pods billing forever.
@@ -3982,6 +3993,18 @@ async def _do_attach() -> None:
     except Exception as e:
         _cloud_warn(f"Watchdog start raised: {e}")
     _refresh_cloud_status()
+
+    # Re-attach to the live step's log. Blocks until it finishes, exactly as
+    # if the user had pressed its Run button — which is what they want after
+    # reconnecting to a multi-hour download.
+    if step:
+        _cloud_log(f"↻ Re-attaching to '{step}' — streaming its log from the start.")
+        rc = await orch.follow_running_step(pod, step, on_log=_cloud_log)
+        if rc == 0:
+            ui.notify(f"'{step}' finished", type="positive")
+        else:
+            _cloud_warn(f"'{step}' exited with code {rc}")
+        _refresh_cloud_status()
 
 
 async def _copy_pod_image() -> None:

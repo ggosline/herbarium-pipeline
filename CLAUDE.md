@@ -219,6 +219,7 @@ To debug a single pipeline stage, run its script with `--help` and test with a s
 2. SSH directly: `ssh root@<pod-ip>:22001 -i ~/.ssh/id_ed25519_herbarium`.
 3. Logs on the pod are in `/workspace/logs/`.
 4. The running step can be interrupted with the **Cancel step** button; the pod stays alive for inspection.
+5. Steps run detached on the pod (`spawn_step`: `setsid` + `nohup`, log to `/workspace/logs/<step>.log`, exit code to `<step>.rc`), so they survive a dropped web UI. On reconnect, **Attach** detects a live step via `running_step()` and re-tails its log from the top; it also skips `sync_code` in that case, because SFTP-ing over a `pod_bootstrap.sh` that a running bash is still reading by file offset can corrupt the step. Pressing the step's own Run button also re-attaches rather than launching a duplicate (`run_step` pgreps first).
 
 **Modify training loss or metrics**:
 1. `train_herbarium.py` defines the Lightning module class; loss is computed in its `training_step()` method.
