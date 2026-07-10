@@ -120,6 +120,25 @@ DEFAULT_DATACENTER = "EUR-IS-1"
 DEFAULT_VOLUME_GB = 80
 DEFAULT_CONTAINER_DISK_GB = 40
 
+# ── Egress preflight ──────────────────────────────────────────────────────
+# A RunPod host can rent, boot, and serve SSH while its outbound connectivity
+# is broken. Nothing in the pod lifecycle notices: `setup` hangs on whatever
+# it curls first, and `download` grinds at a fraction of normal throughput
+# while marking perfectly good image URLs as permanently failed. Probe the
+# hosts every later step depends on, as soon as SSH is up, and recycle the pod
+# if it can't reach them — a bad host costs seconds instead of hours.
+#
+# We test *connectivity*, not HTTP status: ghcr.io/v2/ answers 401 unauthed
+# and some image servers 403 a bare GET. Any complete response proves egress.
+EGRESS_PROBE_URLS: tuple[str, ...] = (
+    "https://ghcr.io/v2/",            # pod image + prebaked venv fast path
+    "https://api.gbif.org/v1/",       # download step: occurrence search
+    "https://images.mobot.org/",      # download step: a major image provider
+)
+EGRESS_PROBE_TIMEOUT = 8   # seconds, connect and total, per probe
+EGRESS_MIN_OK = 2          # probes that must answer; one flaky provider is OK
+PROVISION_ATTEMPTS = 3     # fresh pods to try before giving up on the DC
+
 # When a fresh project has no network volume yet, provisioning may place the
 # pod (and its new volume) in whichever of these datacenters actually has a
 # GPU free — tried in order after the requested/default DC. A volume can't
@@ -145,10 +164,17 @@ DEFAULT_DATACENTERS: list[str] = [
 # list as fallbacks for when they happen to be free; the 24 GB 4090 is the
 # cheap last resort.
 GPU_BY_PURPOSE: dict[str, list[str]] = {
+    # L4 is the cheapest card here but EUR-IS-1 carries very few L4 hosts, so
+    # "first available L4" collapsed onto one machine — and when that machine
+    # had broken egress, every provision landed back on it (three in a row:
+    # ghcr pull timeout, then astral.sh timeout, then 76% image-fetch failures
+    # at 0.3 img/s). The card was never at fault; the thin host pool was. Lead
+    # with the A4000/A5000 for a deeper pool, keep L4 as a cheap fallback.
+    # The egress preflight below is the real guard — this is just odds.
     "light": [
-        "NVIDIA L4",
         "NVIDIA RTX A4000",
         "NVIDIA RTX A5000",
+        "NVIDIA L4",
         "NVIDIA GeForce RTX 4090",
     ],
     "train": [
@@ -282,6 +308,43 @@ class CloudOrchestrator:
             network_volume_id=pod.network_volume_id,
             started_at=self._state.pod_started_at or time.time(),
         )
+
+    async def _egress_ok(self, handle: PodHandle, *, on_log: LogFn) -> bool:
+        """True when the pod can reach the outside world.
+
+        Runs one bounded curl per probe URL and counts complete responses.
+        ``curl`` is asked only to connect and read — no ``-f`` — so a 401 or
+        403 still counts as reachable. A host that cannot answer at least
+        ``EGRESS_MIN_OK`` of them is not worth keeping.
+        """
+        urls = " ".join(f"'{u}'" for u in EGRESS_PROBE_URLS)
+        cmd = (
+            f"ok=0; for u in {urls}; do "
+            f'if curl -s -o /dev/null --connect-timeout {EGRESS_PROBE_TIMEOUT} '
+            f'-m {EGRESS_PROBE_TIMEOUT} "$u"; then ok=$((ok+1)); '
+            f'else echo "  unreachable: $u"; fi; done; echo "EGRESS_OK=$ok"'
+        )
+        # Opening the session is inside the try on purpose: a host broken
+        # enough to fail the probe is a host whose SSH may not come up at
+        # all, and that must recycle the pod rather than abort provisioning.
+        try:
+            session = await self._ensure_session(handle, on_log=on_log)
+            _, out = await session.exec_capture(cmd)
+        except Exception as e:
+            on_log(f"  egress probe could not run: {e}")
+            return False
+
+        n_ok = 0
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("EGRESS_OK="):
+                n_ok = int(line.partition("=")[2] or 0)
+            elif line.startswith("unreachable:"):
+                on_log(f"  {line}")
+        total = len(EGRESS_PROBE_URLS)
+        on_log(f"  egress probe: {n_ok}/{total} hosts reachable "
+               f"(need {EGRESS_MIN_OK})")
+        return n_ok >= EGRESS_MIN_OK
 
     async def _ensure_volume(
         self, *, size_gb: int, data_center_id: str, on_log: LogFn,
@@ -446,64 +509,88 @@ class CloudOrchestrator:
             state.close_active_pod(self._state)
             self._save_state()
 
-        # 2) Provision a fresh pod.
+        # 2) Provision a fresh pod, retrying past hosts with broken egress.
+        #    RunPod will happily hand back the same bad machine, so each retry
+        #    is a fresh roll of the dice rather than a targeted exclusion —
+        #    the API has no "not this machineId" parameter.
         gpus = self._gpu_candidates(purpose, gpu_type)
         on_log(f"GPU preference (first available wins): {', '.join(gpus)}")
-        requested_dc = (data_center_id or self._state.data_center_id
-                        or DEFAULT_DATACENTER)
+        bad_machines: list[str] = []
 
-        if self._state.volume_id:
-            # Existing project — the volume pins the DC (volumes can't move).
-            # _ensure_volume may override `requested_dc` to the volume's real
-            # region so we don't silently destroy data on a GPU-only override.
-            volume_id, dc = await self._ensure_volume(
-                size_gb=volume_gb, data_center_id=requested_dc, on_log=on_log,
-            )
-            pod = await self._create_pod_in_dc(
-                gpus=gpus, dc=dc, volume_id=volume_id, purpose=purpose,
-                image=image, container_disk_gb=container_disk_gb, on_log=on_log,
-            )
-            if pod is None:
-                raise RuntimeError(
-                    f"None of the {len(gpus)} candidate GPUs were available in "
-                    f"{dc} (where this project's volume lives — it can't move "
-                    f"to another region). Options: wait and retry, widen the "
-                    f"GPU list, or create a pod in the RunPod console and paste "
-                    f"its Pod ID into Attach."
+        for attempt in range(1, PROVISION_ATTEMPTS + 1):
+            requested_dc = (data_center_id or self._state.data_center_id
+                            or DEFAULT_DATACENTER)
+
+            if self._state.volume_id:
+                # Existing project — the volume pins the DC (volumes can't move).
+                # _ensure_volume may override `requested_dc` to the volume's real
+                # region so we don't silently destroy data on a GPU-only override.
+                volume_id, dc = await self._ensure_volume(
+                    size_gb=volume_gb, data_center_id=requested_dc, on_log=on_log,
                 )
-        else:
-            # Fresh project — no data yet, so we can chase a free GPU across
-            # datacenters and create the volume wherever one lands.
-            dc_list = [requested_dc]
-            if allow_other_datacenters:
-                dc_list += [d for d in DEFAULT_DATACENTERS if d != requested_dc]
-            pod, volume_id, dc = await self._provision_fresh(
-                gpus=gpus, dc_list=dc_list, volume_gb=volume_gb, purpose=purpose,
-                image=image, container_disk_gb=container_disk_gb, on_log=on_log,
-            )
-        on_log(f"  pod {pod.id} created (${pod.cost_per_hr}/hr), waiting for SSH...")
-        # Persist the pod_id NOW, before any wait that might fail. If
-        # wait_until_ready times out we still know which pod is paid-for so
-        # the next provision call can reuse / clean it up instead of
-        # silently spawning a second pod.
-        self._state.pod_id = pod.id
-        self._state.pod_started_at = time.time()
-        self._state.pod_hourly_rate = pod.cost_per_hr
-        self._save_state()
+                pod = await self._create_pod_in_dc(
+                    gpus=gpus, dc=dc, volume_id=volume_id, purpose=purpose,
+                    image=image, container_disk_gb=container_disk_gb, on_log=on_log,
+                )
+                if pod is None:
+                    raise RuntimeError(
+                        f"None of the {len(gpus)} candidate GPUs were available in "
+                        f"{dc} (where this project's volume lives — it can't move "
+                        f"to another region). Options: wait and retry, widen the "
+                        f"GPU list, or create a pod in the RunPod console and paste "
+                        f"its Pod ID into Attach."
+                    )
+            else:
+                # Fresh project — no data yet, so we can chase a free GPU across
+                # datacenters and create the volume wherever one lands. On a
+                # retry the volume now exists, so we take the branch above.
+                dc_list = [requested_dc]
+                if allow_other_datacenters:
+                    dc_list += [d for d in DEFAULT_DATACENTERS if d != requested_dc]
+                pod, volume_id, dc = await self._provision_fresh(
+                    gpus=gpus, dc_list=dc_list, volume_gb=volume_gb, purpose=purpose,
+                    image=image, container_disk_gb=container_disk_gb, on_log=on_log,
+                )
+            on_log(f"  pod {pod.id} created (${pod.cost_per_hr}/hr), waiting for SSH...")
+            # Persist the pod_id NOW, before any wait that might fail. If
+            # wait_until_ready times out we still know which pod is paid-for so
+            # the next provision call can reuse / clean it up instead of
+            # silently spawning a second pod.
+            self._state.pod_id = pod.id
+            self._state.pod_started_at = time.time()
+            self._state.pod_hourly_rate = pod.cost_per_hr
+            self._save_state()
 
-        # NGC's pytorch image (~10 GB) + cold-host scheduling can push first-
-        # boot past the old 300s budget. 900s covers the worst case we've seen.
-        ready = await self._rp().wait_until_ready(pod.id, timeout=900)
-        host, port = ready.ssh_endpoint  # type: ignore[misc]
-        on_log(f"  pod ready @ {host}:{port}")
+            # NGC's pytorch image (~10 GB) + cold-host scheduling can push first-
+            # boot past the old 300s budget. 900s covers the worst case we've seen.
+            ready = await self._rp().wait_until_ready(pod.id, timeout=900)
+            host, port = ready.ssh_endpoint  # type: ignore[misc]
+            machine = str(ready.raw.get("machineId") or "?")
+            on_log(f"  pod ready @ {host}:{port} (machine {machine})")
 
-        self._state.ssh_host = host
-        self._state.ssh_port = port
-        self._save_state()
+            self._state.ssh_host = host
+            self._state.ssh_port = port
+            self._save_state()
 
-        handle = self._handle_from_pod(ready)
-        await self._ensure_session(handle, on_log=on_log)
-        return handle
+            handle = self._handle_from_pod(ready)
+            if await self._egress_ok(handle, on_log=on_log):
+                return handle
+
+            # Bad host. Recycling costs a couple of minutes; keeping it costs
+            # a silently broken download. terminate() closes the session,
+            # rolls the accrued cost into state, and keeps the volume.
+            bad_machines.append(machine)
+            on_log(f"  ⚠ pod {pod.id} (machine {machine}) has broken egress — "
+                   f"recycling (attempt {attempt}/{PROVISION_ATTEMPTS})")
+            await self.terminate(handle, keep_volume=True, on_log=on_log)
+
+        raise RuntimeError(
+            f"{PROVISION_ATTEMPTS} pods in a row could not reach the internet "
+            f"(machines: {', '.join(bad_machines)}). This project's volume pins "
+            f"it to one datacenter, so retrying may keep landing on the same "
+            f"bad hosts. Check RunPod status, try again later, or create a pod "
+            f"in the console and paste its Pod ID into Attach."
+        )
 
     async def _create_pod_in_dc(
         self,
