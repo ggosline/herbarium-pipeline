@@ -3754,21 +3754,46 @@ def _wrap_cloud_aux(coro_factory):
     _cloud[slot] = asyncio.create_task(_run())
 
 
+async def _kill_remote_step() -> None:
+    """Stop the detached step on the pod, if one is running."""
+    orch = _ensure_orch()
+    pod = _cloud.get("pod")
+    if orch is None or pod is None:
+        return
+    try:
+        step = await orch.running_step(pod, on_log=_cloud_log)
+        if not step:
+            _cloud_log("No step is running on the pod.")
+            return
+        await orch.cancel_step(pod, step, on_log=_cloud_log)
+    except Exception as e:
+        _cloud_warn(f"Could not stop the remote step: {e}")
+
+
 def _cancel_cloud() -> None:
-    """Cancel any in-flight cloud work — both the main step task and the
-    aux transfer task (download_results / download_images / uploads).
-    Earlier this only cancelled the main task, leaving aux transfers
-    uncancellable from the UI."""
+    """Cancel in-flight cloud work: the local tasks *and* the step on the pod.
+
+    Steps run detached (setsid + nohup) so they survive a dropped connection.
+    That also means cancelling the local asyncio task only stops us *watching*
+    the step — it keeps running, and the next Run re-attaches to it. Kill it
+    on the pod too, or Cancel is a lie.
+    """
     cancelled = []
     for slot in ("task", "aux_task"):
         t = _cloud.get(slot)
         if t is not None and not t.done():
             t.cancel()
             cancelled.append(slot)
+
+    # Fire-and-forget: the local task above may be the one holding the SSH
+    # session, so this needs its own task rather than awaiting inline.
+    _cloud["cancel_task"] = asyncio.create_task(_kill_remote_step())
+
     if cancelled:
-        ui.notify(f"Cancellation requested ({', '.join(cancelled)}).", type="info")
+        ui.notify(f"Cancelling ({', '.join(cancelled)}) and stopping the pod step…",
+                  type="info")
     else:
-        ui.notify("Nothing to cancel.", type="warning")
+        ui.notify("Stopping any step running on the pod…", type="info")
 
 
 # ── per-step env builders (read from gs[...] — same keys the local tabs bind) ──

@@ -718,6 +718,57 @@ class CloudOrchestrator:
                     return step
         return None
 
+    async def cancel_step(
+        self, handle: PodHandle, step: str, *, on_log: LogFn = print,
+    ) -> bool:
+        """Kill a detached step running on the pod. Returns True if it died.
+
+        ``spawn_step`` launches under ``setsid``, so the ``__run_detached``
+        parent is a session leader and its process group contains the step's
+        bash and that bash's python child. Signalling the whole group is the
+        only way to stop the work — cancelling the local asyncio task that
+        tails the log merely stops watching it.
+
+        No ``.rc`` is written (``run_detached`` dies before it gets there), so
+        a later ``run_step`` sees no rc and no process, and starts cleanly.
+        """
+        cmd = (
+            f'pid=$(pgrep -f "pod_bootstrap.sh __run_detached {step} " | head -1); '
+            f'[ -n "$pid" ] || pid=$(pgrep -f "pod_bootstrap.sh {step}\\$" | head -1); '
+            f'if [ -z "$pid" ]; then echo "CANCEL=not_running"; exit 0; fi; '
+            f'pgid=$(ps -o pgid= -p "$pid" | tr -d " "); '
+            f'kill -TERM -"$pgid" 2>/dev/null; '
+            f'for i in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done; '
+            f'if kill -0 "$pid" 2>/dev/null; then '
+            f'kill -KILL -"$pgid" 2>/dev/null; echo "CANCEL=killed"; '
+            f'else echo "CANCEL=terminated"; fi'
+        )
+        # Session open is inside the try: if SSH is gone we report failure
+        # rather than raising out of a UI button handler.
+        try:
+            session = await self._ensure_session(handle, on_log=on_log)
+            _, out = await session.exec_capture(cmd)
+        except Exception as e:
+            on_log(f"  cancel failed: {e}")
+            return False
+
+        verdict = ""
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("CANCEL="):
+                verdict = line.partition("=")[2].strip()
+        if verdict == "not_running":
+            on_log(f"  '{step}' was not running on the pod.")
+            return False
+        if verdict in ("terminated", "killed"):
+            how = "SIGTERM" if verdict == "terminated" else "SIGKILL (it ignored SIGTERM)"
+            on_log(f"  ✖ '{step}' stopped on the pod via {how}.")
+            self._state.current_step = ""
+            self._save_state()
+            return True
+        on_log(f"  cancel gave an unexpected result: {out.strip()[:200]}")
+        return False
+
     async def follow_running_step(
         self, handle: PodHandle, step: str, *, on_log: LogFn = print,
     ) -> int:

@@ -218,8 +218,9 @@ To debug a single pipeline stage, run its script with `--help` and test with a s
 1. Pod state and logs are persisted in `~/.herbarium-cloud/<project>.json`.
 2. SSH directly: `ssh root@<pod-ip>:22001 -i ~/.ssh/id_ed25519_herbarium`.
 3. Logs on the pod are in `/workspace/logs/`.
-4. The running step can be interrupted with the **Cancel step** button; the pod stays alive for inspection.
-5. Steps run detached on the pod (`spawn_step`: `setsid` + `nohup`, log to `/workspace/logs/<step>.log`, exit code to `<step>.rc`), so they survive a dropped web UI. On reconnect, **Attach** detects a live step via `running_step()` and re-tails its log from the top; it also skips `sync_code` in that case, because SFTP-ing over a `pod_bootstrap.sh` that a running bash is still reading by file offset can corrupt the step. Pressing the step's own Run button also re-attaches rather than launching a duplicate (`run_step` pgreps first).
+4. The running step can be interrupted with the **Cancel step** button; the pod stays alive for inspection. Because steps are detached, Cancel must signal the pod (`cancel_step` → `kill -TERM -<pgid>` of the `setsid` session, escalating to `-KILL`), not merely cancel the local asyncio task — cancelling locally only stops *watching* the step, which then keeps running and gets re-attached by the next Run. No `.rc` is written, so the next Run starts fresh.
+5. Editing a pipeline script and re-syncing does **not** affect a step already running: Python compiled the module at import. A code change only takes effect on the next Run.
+6. Steps run detached on the pod (`spawn_step`: `setsid` + `nohup`, log to `/workspace/logs/<step>.log`, exit code to `<step>.rc`), so they survive a dropped web UI. On reconnect, **Attach** detects a live step via `running_step()` and re-tails its log from the top, and skips `sync_code` while a step runs. (`sync_code` finishes with `sed -i` on `pod_bootstrap.sh`, which replaces the inode rather than truncating, so a running bash keeps reading its original file — but don't rely on that; nothing else guarantees it.) Pressing the step's own Run button also re-attaches rather than launching a duplicate (`run_step` pgreps first).
 
 **Modify training loss or metrics**:
 1. `train_herbarium.py` defines the Lightning module class; loss is computed in its `training_step()` method.
