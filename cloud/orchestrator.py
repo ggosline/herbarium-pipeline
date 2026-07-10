@@ -29,6 +29,7 @@ import asyncio
 import hashlib
 import os
 import re
+import shlex
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -176,6 +177,7 @@ GPU_BY_PURPOSE: dict[str, list[str]] = {
 REMOTE_REPO = "/workspace/Pipeline"
 REMOTE_DATA = "/workspace/data"
 REMOTE_DWCA = f"{REMOTE_DATA}/gbif.zip"
+REMOTE_LOGS = "/workspace/logs"   # detached-step logs + .rc files (see spawn_step)
 
 # Files to push from the local Pipeline checkout to the pod. Anything not
 # in this list (caches, wandb runs, dot-dirs) stays local.
@@ -941,21 +943,63 @@ class CloudOrchestrator:
             await self.push_hf_token(handle, on_log=on_log)
         env_prefix = ""
         if env:
-            import shlex as _shlex
             env_prefix = " ".join(
-                f"{k}={_shlex.quote(str(v))}" for k, v in env.items() if v
+                f"{k}={shlex.quote(str(v))}" for k, v in env.items() if v
             )
             if env_prefix:
                 env_prefix += " "
-        cmd = f"{env_prefix}bash {REMOTE_REPO}/pod_bootstrap.sh {step}"
-        on_log(f"$ {cmd}")
-        rc = await session.exec_streaming(cmd, on_log=on_log)
+
+        log = f"{REMOTE_LOGS}/{step}.log"
+        rcf = f"{REMOTE_LOGS}/{step}.rc"
+        # Steps run DETACHED on the pod (spawn_step: setsid + nohup, logging to
+        # <step>.log, exit code to <step>.rc). This survives a dropped ssh
+        # connection, and the pod-side heartbeat keeps the idle watchdog from
+        # killing a long step. We then just tail the log until .rc appears.
+        # On reconnect, if the step is still running we re-attach to its log
+        # instead of launching a duplicate.
+        _, chk = await session.exec_capture(
+            f"if [ ! -f {shlex.quote(rcf)} ] && "
+            f"pgrep -f 'pod_bootstrap.sh {step}$' >/dev/null 2>&1; "
+            f"then echo RUNNING; else echo IDLE; fi"
+        )
+        if "RUNNING" in chk:
+            on_log(f"↻ '{step}' is already running on the pod — re-attaching to its log.")
+        else:
+            spawn = f"{env_prefix}bash {REMOTE_REPO}/pod_bootstrap.sh spawn {step}"
+            on_log(f"$ pod_bootstrap.sh {step}  (detached — survives disconnect)")
+            _, spawn_out = await session.exec_capture(spawn)
+            if spawn_out.strip():
+                on_log(spawn_out.strip())
+
+        rc = await self._follow_step(session, log, rcf, on_log=on_log)
         if rc == 0:
             if step not in self._state.completed_steps:
                 self._state.completed_steps.append(step)
         self._state.current_step = ""
         self._save_state()
         return rc
+
+    async def _follow_step(
+        self, session: PodSession, log: str, rcf: str, *, on_log: LogFn,
+    ) -> int:
+        """Stream a detached step's log until it writes its .rc file, then
+        return the recorded exit code. Re-runnable: on reconnect it re-tails
+        from the top so the whole run history streams again."""
+        follow = (
+            f"touch {shlex.quote(log)}; "
+            f"tail -n +1 -F {shlex.quote(log)} & TP=$!; "
+            f"while [ ! -f {shlex.quote(rcf)} ]; do sleep 2; done; "
+            f"sleep 1; kill $TP 2>/dev/null; true"
+        )
+        await session.exec_streaming(follow, on_log=on_log)
+        _, out = await session.exec_capture(
+            f"cat {shlex.quote(rcf)} 2>/dev/null || echo 999")
+        for tok in reversed(out.split()):
+            try:
+                return int(tok)
+            except ValueError:
+                continue
+        return 999
 
     async def download_results(
         self,

@@ -635,13 +635,17 @@ def save_specsin(path: Path, rows: dict[str, dict]) -> None:
         if str(r.get("hasfile", "")).lower() in ("true", "1") and r.get("species")
     )
 
-    with open(path, "w", newline="") as f:
+    # Write to a temp file then atomically rename, so a periodic checkpoint
+    # interrupted mid-write can't leave a truncated / corrupt specsin.csv.
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=SPECSIN_COLS, extrasaction="ignore")
         writer.writeheader()
         for row in rows.values():
             sp = row.get("species", "")
             row["sparse"] = species_counts.get(sp, 0) < 5
             writer.writerow(row)
+    os.replace(tmp, path)
 
     n_species = sum(1 for sp, cnt in species_counts.items() if cnt >= 5)
     print(f"Saved {len(rows)} records ({n_species} non-sparse species) to {path}")
@@ -1042,6 +1046,13 @@ def main() -> None:
     # Start with a copy of existing rows; new/updated rows will overwrite
     updated: dict[str, dict] = dict(existing)
 
+    # Checkpoint specsin.csv periodically so an interrupted run (lost pod
+    # connection, cancelled step) keeps the metadata for everything downloaded
+    # so far — otherwise it was only written once, at the very end, and a
+    # crash left the images on disk with no updated specsin.
+    _SPECSIN_SAVE_INTERVAL = 30.0   # seconds
+    last_save = time.time()
+
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(process_record, r, out_dir, max_size, iiif_size): r for r in records}
 
@@ -1092,6 +1103,13 @@ def main() -> None:
             if tqdm is not None:
                 completed.set_postfix({"new": newly_downloaded, "fail": failed,
                                        "sp_upd": species_updated})
+
+            # Periodic checkpoint so an interruption doesn't lose this run's
+            # metadata. save_specsin writes atomically; time-throttled to bound
+            # rewrite churn on large specsins.
+            if time.time() - last_save >= _SPECSIN_SAVE_INTERVAL:
+                save_specsin(specsin_path, updated)
+                last_save = time.time()
 
     print(
         f"\nDone — {newly_downloaded} new images downloaded, "

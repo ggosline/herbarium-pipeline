@@ -684,6 +684,47 @@ EOF
   echo "Watchdog started (idle limit ${IDLE_LIMIT_SECONDS}s, log $WS/watchdog.log)"
 }
 
+# ─── detached step runner ─────────────────────────────────────────────────
+# `spawn <step>` launches a pipeline step fully detached from the ssh session
+# (setsid + nohup) so it survives a dropped connection, logging to
+# $WS/logs/<step>.log and writing its exit code to <step>.rc when it finishes.
+# While the step runs, $ACTIVITY_FILE is refreshed every 60s so the idle
+# watchdog neither kills a long-running step (e.g. a multi-hour download) nor
+# lingers on a finished, abandoned one. The orchestrator tails the log until
+# the .rc file appears; on reconnect it re-tails the same log rather than
+# launching a duplicate. Returns immediately after backgrounding.
+spawn_step() {
+  local step="${1:?spawn: step required}"
+  local logdir="$WS/logs" log rc
+  log="$logdir/$step.log"; rc="$logdir/$step.rc"
+  mkdir -p "$logdir"
+  rm -f "$rc"
+  : > "$log"
+  # Re-invoke ourselves for the actual run so the detach logic and the step's
+  # env (inherited from this process) both carry through, without nested
+  # bash -c quoting.
+  setsid nohup bash "$REPO/pod_bootstrap.sh" __run_detached "$step" "$log" "$rc" \
+    >/dev/null 2>&1 </dev/null &
+  disown 2>/dev/null || true
+  echo "spawned '$step' detached — log $log"
+}
+
+# Internal target of spawn_step (not for direct invocation). Runs the step,
+# heartbeats the activity file while it runs, then records the exit code
+# atomically so a reader never sees a half-written .rc.
+run_detached() {
+  local step="${1:?}" log="${2:?}" rc="${3:?}"
+  bash "$REPO/pod_bootstrap.sh" "$step" >"$log" 2>&1 &
+  local pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    touch "$ACTIVITY_FILE" 2>/dev/null || true
+    sleep 60
+  done
+  wait "$pid"; local code=$?
+  touch "$ACTIVITY_FILE" 2>/dev/null || true
+  echo "$code" >"$rc.tmp" && mv "$rc.tmp" "$rc"
+}
+
 # ─── local venv mirror (escape MooseFS for python imports) ────────────────
 # /workspace/venv is on MooseFS; cold `import torch` walks hundreds of
 # .py / .so files and each lookup is a network round-trip — ~30–60 s on
@@ -1464,6 +1505,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     mirror_venv_local)  mirror_venv_local ;;
     repair_cache)       repair_cache ;;
     start_watchdog)     start_watchdog ;;
+    spawn)              spawn_step "$2" ;;
+    __run_detached)     run_detached "$2" "$3" "$4" ;;
     *)            echo "unknown step: $1"; exit 1 ;;
   esac
 fi
