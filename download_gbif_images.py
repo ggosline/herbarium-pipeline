@@ -37,6 +37,7 @@ import urllib.parse
 import zipfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable
 from pathlib import Path
 
 try:
@@ -530,6 +531,74 @@ _IIIF_PARAMS_RE = re.compile(
 )
 
 
+def _record_key(rec: dict) -> str:
+    """Stable identity for a record, for deterministic ordering."""
+    return str(rec.get("gbifID") or rec.get("key") or rec.get("catalogNumber") or "")
+
+
+def stable_sample(recs: list[dict], k: int, taxon: str, seed: int,
+                  prefer: Callable[[dict], bool] | None = None) -> list[dict]:
+    """Pick ``k`` of ``recs`` — the same ``k`` on every run.
+
+    ``random.sample`` was previously called on the unseeded global RNG, so
+    ``--max-per-species 80`` chose a *different* 80 specimens each time. Any
+    resumed download therefore re-rolled the selection: the images already on
+    disk were no longer in the sample, so it fetched a fresh set instead of
+    skipping, and repeated restarts accumulated far more than the cap per
+    species while never converging.
+
+    Seed per taxon (not globally) so a taxon's selection is independent of how
+    many other taxa exist or what order they arrive in, and sort first because
+    ``sample`` output depends on input order.
+
+    ``prefer`` (records whose image is already on disk) are taken first. The
+    picks are arbitrary anyway, so choosing the ones we already have turns a
+    resume into a skip instead of a re-download. When more records are
+    preferred than the cap allows, the choice among them is still deterministic.
+    """
+    if len(recs) <= k:
+        return recs
+    ordered = sorted(recs, key=_record_key)
+    if prefer is None:
+        return random.Random(f"{seed}:{taxon}").sample(ordered, k)
+
+    have = [r for r in ordered if prefer(r)]
+    if not have:
+        # Nothing downloaded yet — draw the canonical sample, so a fresh run on
+        # any machine picks exactly what a plain (unbiased) run would.
+        return random.Random(f"{seed}:{taxon}").sample(ordered, k)
+    if len(have) >= k:
+        return random.Random(f"{seed}:{taxon}").sample(have, k)
+    rest = [r for r in ordered if not prefer(r)]
+    need = min(k - len(have), len(rest))
+    return have + random.Random(f"{seed}:{taxon}:fill").sample(rest, need)
+
+
+def local_image_predicate(out_dir: Path) -> Callable[[dict], bool]:
+    """Predicate: does this record's first image already sit in ``out_dir``?
+
+    Names are scanned once (one listdir, not one stat per record) because the
+    caps run over every record in the archive.
+    """
+    try:
+        existing = {e.name for e in os.scandir(out_dir) if e.is_file()}
+    except (FileNotFoundError, NotADirectoryError):
+        existing = set()
+
+    def _has_local(rec: dict) -> bool:
+        urls = get_image_urls(rec)
+        if not urls:
+            return False
+        species = (rec.get("species") or "").strip()
+        genus = (rec.get("genus") or "").strip()
+        verbatim = species if species else f"{genus}_indet"
+        suffix = "_0" if len(urls) > 1 else ""
+        return make_fname(rec.get("family", ""), verbatim,
+                          rec.get("catalogNumber", ""), suffix) in existing
+
+    return _has_local
+
+
 def _iiif_upgrade(url: str, iiif_size: str) -> list[str]:
     """
     If url is an IIIF Image API request, return candidate URLs to try for the
@@ -959,6 +1028,12 @@ def main() -> None:
                         help="specsin CSV to create/update (default: ./<taxon>_specsin.csv)")
     parser.add_argument("--workers", type=int, default=8,
                         help="Parallel download threads (default: 8)")
+    parser.add_argument("--sample-seed", type=int, default=0, metavar="N",
+                        help="Seed for the --max-per-species/genus/family "
+                             "subsampling (default: 0). Fixed by default so a "
+                             "resumed download picks the SAME specimens and "
+                             "skips what's already on disk. Change it only to "
+                             "deliberately draw a different sample.")
     parser.add_argument("--per-host-workers", type=int,
                         default=PER_HOST_CONCURRENCY, metavar="N",
                         help=f"Max concurrent requests to any single image host "
@@ -1115,6 +1190,10 @@ def main() -> None:
         records = records[: args.limit]
 
     # --- per-taxon caps (applied in order: species → genus → family) ---
+    # Bias every cap toward specimens already downloaded, so a resumed run
+    # skips them instead of drawing a fresh sample it has to fetch.
+    have_local = local_image_predicate(out_dir)
+
     if args.max_per_species and args.max_per_species > 0:
         by_species: dict[str, list] = {}
         for r in records:
@@ -1122,9 +1201,8 @@ def main() -> None:
             by_species.setdefault(sp, []).append(r)
         records = []
         for sp, recs in by_species.items():
-            if len(recs) > args.max_per_species:
-                recs = random.sample(recs, args.max_per_species)
-            records.extend(recs)
+            records.extend(stable_sample(recs, args.max_per_species, sp,
+                                         args.sample_seed, prefer=have_local))
         print(f"After per-species cap ({args.max_per_species}): {len(records)} records "
               f"across {len(by_species)} species/taxa")
 
@@ -1135,9 +1213,8 @@ def main() -> None:
             by_genus.setdefault(g, []).append(r)
         records = []
         for g, recs in by_genus.items():
-            if len(recs) > args.max_per_genus:
-                recs = random.sample(recs, args.max_per_genus)
-            records.extend(recs)
+            records.extend(stable_sample(recs, args.max_per_genus, g,
+                                         args.sample_seed, prefer=have_local))
         print(f"After per-genus cap ({args.max_per_genus}): {len(records)} records "
               f"across {len(by_genus)} genera")
 
@@ -1161,20 +1238,23 @@ def main() -> None:
                 selected: list[dict] = []
                 selected_keys: set[str] = set()
 
-                # Floor: 1 per genus (random pick within each)
-                for g, grecs in by_gen.items():
+                # Floor: 1 per genus (deterministic pick within each). Iterate
+                # genera in a fixed order too — dict order follows the input.
+                for g in sorted(by_gen):
                     if len(selected) < cap:
-                        pick = random.sample(grecs, 1)[0]
+                        pick = stable_sample(by_gen[g], 1, f"{fam}/{g}",
+                                             args.sample_seed, prefer=have_local)[0]
                         selected.append(pick)
                         selected_keys.add(pick.get("key", ""))
 
-                # Fill remainder randomly from the pool
+                # Fill remainder from the pool, deterministically
                 if len(selected) < cap:
                     pool = [r for r in frecs if r.get("key", "") not in selected_keys]
                     needed = cap - len(selected)
                     if pool:
-                        extra = random.sample(pool, min(needed, len(pool)))
-                        selected.extend(extra)
+                        selected.extend(stable_sample(
+                            pool, min(needed, len(pool)), f"{fam}/fill",
+                            args.sample_seed, prefer=have_local))
 
                 records.extend(selected)
         print(f"After per-family cap ({args.max_per_family}): {len(records)} records "
