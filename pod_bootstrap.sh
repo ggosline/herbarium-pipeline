@@ -1187,6 +1187,116 @@ prep() {
   if [ "${NO_CACHE_PUSH:-0}" != "1" ] && [ "$FILTER_METHOD" != "hsv" ]; then
     hf_cache_push
   fi
+
+  # Build + cache the staged-training tarball now, right after verify_specsin
+  # fixed hasfile/fname against what's actually on disk — this is the exact
+  # point the image set becomes final for this data cycle. Backgrounded so
+  # prep() doesn't block on the upload; train()'s stage_images() picks it up
+  # from R2 instead of tar-ing 100k+ files off MooseFS itself.
+  if [ "${NO_CACHE_PUSH:-0}" != "1" ]; then
+    image_set_push_bg
+  fi
+}
+
+# ─── image-set cache (R2) ──────────────────────────────────────────────────
+# Same idea as the venv cache: build the staging tarball once, right after
+# prep() finalises the image set, and let every pod that trains against this
+# exact data pull one sequential R2 object instead of re-tar-ing 100k+ files
+# off MooseFS itself. Uncompressed — the images are already-compressed JPEGs,
+# so zstd would burn CPU for near-zero size reduction; the win here is one
+# streamed object, not bandwidth.
+IMAGE_SET_REMOTE_DIR="image-sets"
+
+image_set_cache_key() {
+  # specsin.csv's fname/hasfile columns are exactly what verify_specsin.py
+  # just reconciled against the real files on disk, so hashing the whole
+  # file is a cheap (single sequential read, no per-file MooseFS metadata
+  # storm) stand-in for "what image set is this". Later steps (identify)
+  # rewrite unrelated columns and will change this hash too — that only
+  # costs an extra rebuild on the next prep, never risks stale/wrong images
+  # being used for training.
+  sha256sum "$SPECSIN" 2>/dev/null | cut -d' ' -f1
+}
+
+image_set_push() {
+  if [ ! -d "$IMAGES_DIR" ]; then
+    echo "No $IMAGES_DIR to push — skipping image-set cache push"
+    return 0
+  fi
+  if ! command -v rclone >/dev/null; then
+    echo "rclone not installed — skipping image-set cache push"
+    return 0
+  fi
+  local key
+  key=$(image_set_cache_key)
+  if [ -z "$key" ]; then
+    echo "No specsin at $SPECSIN — skipping image-set cache push"
+    return 0
+  fi
+  if ! _rclone_writable; then
+    echo "Cache remote $CACHE_REMOTE not writable — skipping image-set push"
+    return 0
+  fi
+  local remote="$CACHE_REMOTE/$IMAGE_SET_REMOTE_DIR/${key}.tar"
+  local remote_tmp="${remote}.uploading"
+  local size
+  size=$(du -sh "$IMAGES_DIR" 2>/dev/null | cut -f1)
+  echo "→ Pushing $IMAGES_DIR ($size) → $remote..."
+  # Same atomic-temp-then-move pattern as venv_push: an interrupted upload
+  # (pod reaped, watchdog, network blip) leaves only an orphan .uploading
+  # object, never a truncated real key that would poison every future pull.
+  if tar -cf - -C "$DATA" images | rclone rcat "$remote_tmp" \
+       "${RCLONE_VENV_FLAGS[@]}" 2>&1 | tail -5 \
+     && rclone moveto "$remote_tmp" "$remote" 2>&1 | tail -2; then
+    echo "✓ Image-set push done"
+  else
+    echo "⚠ Image-set push had errors — non-fatal (real cache key untouched)" >&2
+    rclone deletefile "$remote_tmp" 2>/dev/null || true
+  fi
+}
+
+image_set_push_bg() {
+  [ -d "$IMAGES_DIR" ] || return 0
+  echo "→ Backgrounding image-set cache push — tail /workspace/.last_image_set_push.log to follow."
+  _run_bg image_set_push
+}
+
+# Pull the cached image-set tarball straight from R2 to local NVMe/tmpfs,
+# bypassing MooseFS entirely. Mirrors _local_venv_from_r2's structure,
+# including deleting a corrupt/incomplete object on failure so a poisoned
+# cache doesn't fail every future pod (see mirror_venv_local's fix history).
+# Returns 0 on success; 1 on any miss/corruption so the caller falls back
+# to _tar_stage_piped.
+_image_set_from_r2() {
+  local dst_new=$1
+  command -v rclone >/dev/null || return 1
+  local key
+  key=$(image_set_cache_key)
+  [ -n "$key" ] || return 1
+  local remote="$CACHE_REMOTE/$IMAGE_SET_REMOTE_DIR/${key}.tar"
+  rclone lsf "$remote" >/dev/null 2>&1 || return 1
+  echo "→ Fetching staged image set from R2 $remote (skips MooseFS entirely)..."
+  rm -rf "$dst_new"; mkdir -p "$dst_new"
+  if ! rclone cat "$remote" | tar -xf - --strip-components=1 -C "$dst_new"; then
+    echo "  ⚠ R2 image-set fetch failed — falling back to local tar-from-MooseFS"
+    rm -rf "$dst_new"
+    echo "  removing corrupt cache object $remote"
+    rclone deletefile "$remote" 2>/dev/null \
+      || echo "  (couldn't delete $remote — remove it manually if it persists)"
+    return 1
+  fi
+  local n
+  n=$(find "$dst_new" -type f | wc -l)
+  if [ "$n" -lt 1 ]; then
+    echo "  ⚠ R2 image-set empty after extract — falling back to local tar-from-MooseFS"
+    rm -rf "$dst_new"
+    echo "  removing corrupt cache object $remote"
+    rclone deletefile "$remote" 2>/dev/null \
+      || echo "  (couldn't delete $remote — remove it manually if it persists)"
+    return 1
+  fi
+  echo "  ✓ Staged $n files from R2"
+  return 0
 }
 
 # Tar-pipe copy: one continuous sequential read of $src over MooseFS instead
@@ -1194,9 +1304,10 @@ prep() {
 # top of the open() itself). At ~114k small images the open() latency alone
 # dominates (~25ms/file observed — same metadata-bound cost documented on
 # mirror_venv_local's R2 fast path), so cutting rsync's per-file overhead is
-# the win, not compression or bandwidth. Not incremental — a crash mid-copy
-# just leaves an orphan $dst (never exposed; stage_images only swaps it in
-# after this returns 0), and the next run redoes the full copy.
+# the win, not compression or bandwidth. Used as the fallback when the R2
+# image-set cache misses. Not incremental — a crash mid-copy just leaves an
+# orphan $dst (never exposed; stage_images only swaps it in after this
+# returns 0), and the next run redoes the full copy.
 # Args: <src dir> <dst dir, must already exist>
 _tar_stage_piped() {
   local src=$1 dst=$2
@@ -1259,7 +1370,17 @@ stage_images() {
   fi
   rm -rf "$dest.new"
   mkdir -p "$dest.new"
-  _tar_stage_piped "$src/" "$dest.new/"
+  # Fast path: pull the prebuilt tarball straight from R2 (image_set_push_bg,
+  # kicked off at the end of prep()). Fall back to tar-ing MooseFS directly
+  # only on a cache miss/corruption, then backfill R2 so the next pod gets
+  # the fast path — same pattern as mirror_venv_local's R2 fast path.
+  if ! _image_set_from_r2 "$dest.new"; then
+    rm -rf "$dest.new"
+    mkdir -p "$dest.new"
+    _tar_stage_piped "$src/" "$dest.new/"
+    echo "→ Backfilling R2 image-set cache for this key (background)..."
+    image_set_push_bg
+  fi
   echo "$src_kb" > "$dest.new/.stage_size_kb"
   rm -rf "$dest.old"
   [ -d "$dest" ] && mv "$dest" "$dest.old"
@@ -1590,7 +1711,7 @@ repair_cache() {
 # (the webui sources this file to call individual functions like start_watchdog,
 # and an unguarded ${1:?...} aborts the source with no positional args).
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-  case "${1:?usage: $0 [setup|download|prep|stage_images|train|identify|publish|backup|restore|cache_pull|cache_push|cache_push_bg|venv_pull|venv_push|venv_push_bg|mirror_venv_local|repair_cache|start_watchdog]}" in
+  case "${1:?usage: $0 [setup|download|prep|stage_images|train|identify|publish|backup|restore|cache_pull|cache_push|cache_push_bg|venv_pull|venv_push|venv_push_bg|mirror_venv_local|image_set_push|image_set_push_bg|repair_cache|start_watchdog]}" in
     setup)              setup ;;
     download)           download ;;
     prep)               prep ;;
@@ -1607,6 +1728,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     venv_push)          venv_push ;;
     venv_push_bg)       venv_push_bg ;;
     mirror_venv_local)  mirror_venv_local ;;
+    image_set_push)     image_set_push ;;
+    image_set_push_bg)  image_set_push_bg ;;
     repair_cache)       repair_cache ;;
     start_watchdog)     start_watchdog ;;
     spawn)              spawn_step "$2" ;;
