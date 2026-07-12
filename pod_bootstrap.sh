@@ -1189,6 +1189,33 @@ prep() {
   fi
 }
 
+# Tar-pipe copy: one continuous sequential read of $src over MooseFS instead
+# of rsync's per-file protocol (its own stat/compare/checksum round trips on
+# top of the open() itself). At ~114k small images the open() latency alone
+# dominates (~25ms/file observed — same metadata-bound cost documented on
+# mirror_venv_local's R2 fast path), so cutting rsync's per-file overhead is
+# the win, not compression or bandwidth. Not incremental — a crash mid-copy
+# just leaves an orphan $dst (never exposed; stage_images only swaps it in
+# after this returns 0), and the next run redoes the full copy.
+# Args: <src dir> <dst dir, must already exist>
+_tar_stage_piped() {
+  local src=$1 dst=$2
+  ( tar -cf - -C "$src" . | tar -xf - -C "$dst" ) &
+  local tar_pid=$!
+  local started
+  started=$(date +%s)
+  while kill -0 "$tar_pid" 2>/dev/null; do
+    sleep 30
+    kill -0 "$tar_pid" 2>/dev/null || break
+    local size files elapsed
+    size=$(du -sh "$dst" 2>/dev/null | cut -f1)
+    files=$(find "$dst" -type f 2>/dev/null | wc -l)
+    elapsed=$(( $(date +%s) - started ))
+    echo "  tar-stage: ${elapsed}s elapsed, ${files} files, ${size} copied"
+  done
+  wait "$tar_pid"
+}
+
 # ─── stage images to local storage (escape MooseFS for training) ──────────
 # /workspace is a MooseFS network volume on RunPod (mfs#…runpod.net:9421).
 # Per-file read latency is ~ms, which starves DALI and pins the A100 at
@@ -1197,12 +1224,14 @@ prep() {
 #
 # Picks tmpfs (/dev/shm) when the dataset comfortably fits with 25% RAM
 # headroom; falls back to container-disk NVMe at /root/staged_images.
-# Idempotent: rsync only copies new/changed files, so re-running after a
-# partial download adds the diff cheaply.
+# Skips the copy entirely when $dest already holds a matching-size stage
+# from an earlier call this pod's lifetime (see .stage_size_kb below) —
+# tar isn't incremental like rsync was, so re-running train() on the same
+# pod needs its own explicit "already done" check instead of relying on
+# rsync's diff to make a repeat call cheap.
 #
 # Sets STAGED_IMAGES_DIR for downstream steps (consumed by train()).
 stage_images() {
-  _ensure_rsync
   local src="${IMAGES_DIR}"
   if [ ! -d "$src" ]; then
     echo "stage_images: source $src does not exist"; return 1
@@ -1222,8 +1251,20 @@ stage_images() {
     dest=/root/staged_images
     echo "stage_images: tmpfs too small ($((shm_free_kb/1024)) MB free, need $((need_kb/1024)) MB) → $dest"
   fi
-  mkdir -p "$dest"
-  _rsync_piped "$src/" "$dest/"
+  if [ -f "$dest/.stage_size_kb" ] && [ "$(cat "$dest/.stage_size_kb")" = "$src_kb" ]; then
+    echo "stage_images: $dest already matches source ($((src_kb/1024)) MB) — skipping copy"
+    export STAGED_IMAGES_DIR="$dest"
+    echo "$dest" > "$WS/.staged_images_dir"
+    return 0
+  fi
+  rm -rf "$dest.new"
+  mkdir -p "$dest.new"
+  _tar_stage_piped "$src/" "$dest.new/"
+  echo "$src_kb" > "$dest.new/.stage_size_kb"
+  rm -rf "$dest.old"
+  [ -d "$dest" ] && mv "$dest" "$dest.old"
+  mv "$dest.new" "$dest"
+  rm -rf "$dest.old"
   echo "stage_images: staged $(find "$dest" -type f | wc -l) files at $dest"
   export STAGED_IMAGES_DIR="$dest"
   # Persist for follow-up commands (train() in a separate invocation).
