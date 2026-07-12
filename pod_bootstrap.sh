@@ -869,11 +869,24 @@ _local_venv_from_r2() {
   rm -rf "$dst_new"; mkdir -p "$dst_new"
   if ! rclone cat "$remote" | $decompress | tar -xf - --strip-components=1 -C "$dst_new"; then
     echo "  ⚠ R2 venv fetch failed — falling back to MooseFS rsync"
-    rm -rf "$dst_new"; return 1
+    rm -rf "$dst_new"
+    # Same poison as venv_pull(): a truncated/corrupt object at this key
+    # would otherwise fail every future pod's local mirror forever, since
+    # nothing else ever re-validates it. Delete now; mirror_venv_local's
+    # caller backfills a good copy from the (already-valid) /workspace/venv
+    # once the rsync fallback below completes.
+    echo "  removing corrupt cache object $remote"
+    rclone deletefile "$remote" 2>/dev/null \
+      || echo "  (couldn't delete $remote — remove it manually if it persists)"
+    return 1
   fi
   if [ ! -f "$dst_new/bin/activate" ]; then
     echo "  ⚠ R2 venv incomplete (no bin/activate) — falling back to rsync"
-    rm -rf "$dst_new"; return 1
+    rm -rf "$dst_new"
+    echo "  removing corrupt cache object $remote"
+    rclone deletefile "$remote" 2>/dev/null \
+      || echo "  (couldn't delete $remote — remove it manually if it persists)"
+    return 1
   fi
   echo "  ✓ Local venv extracted from R2"
   return 0
@@ -911,6 +924,12 @@ mirror_venv_local() {
     rm -rf "$dst.new"
     mkdir -p "$dst.new"
     _rsync_piped "$src/" "$dst.new/"
+    # $src (/workspace/venv) just proved itself good enough to rsync from, so
+    # if R2 was missing or corrupt for this key, backfill it now — otherwise
+    # every future pod repeats this same slow rsync until something else
+    # happens to trigger a push. Backgrounded: don't block training on it.
+    echo "→ Backfilling R2 venv cache for this key (background)..."
+    venv_push_bg
   fi
   # uv writes absolute shebangs into bin/ entry-point scripts. Rewrite so
   # `wandb` etc. invoke the local python and import from local site-packages.

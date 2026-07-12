@@ -3234,6 +3234,15 @@ def _build_setup() -> None:
             "Settings → SSH Public Keys — RunPod auto-injects it into every "
             "pod, which is how the pipeline runs commands without prompts."
         ).classes("text-body2").style("color:#455a64")
+        ui.label(
+            "The field below must point at the PRIVATE half of that pair "
+            "(no .pub) — e.g. ~/.ssh/id_ed25519, not id_ed25519.pub. RunPod's "
+            "SSH Public Keys page is additive: adding a key from a new "
+            "machine doesn't remove any machine's key already registered "
+            "there, so multiple computers can each keep their own key and "
+            "all stay able to connect. If you use this pipeline from more "
+            "than one machine, each needs its own key registered."
+        ).classes("text-caption text-grey-7 mt-1").style("max-width:820px")
 
         api_inp = (ui.input(label="API key",
                             placeholder="rpa_… (paste once, saved to OS keyring)")
@@ -3258,7 +3267,9 @@ def _build_setup() -> None:
                       ).props("flat dense round").tooltip("Browse")
 
         ui.label("Use a passwordless automation key — pipeline steps shouldn't "
-                 "stop for a passphrase prompt.").classes("text-caption text-grey-7 mt-1")
+                 "stop for a passphrase prompt. Changing this path takes effect "
+                 "immediately for the next pod action, no restart needed."
+                 ).classes("text-caption text-grey-7 mt-1")
 
         def _refresh_rp_pill() -> None:
             has_key = bool(cloud_secrets.get_runpod_api_key())
@@ -3572,17 +3583,20 @@ def _cloud_info(msg: str) -> None:
 def _ensure_orch() -> Optional[CloudOrchestrator]:
     """Return the active orchestrator, creating one if credentials allow.
 
-    Rebuilds when the Project name changed since the cached orchestrator was
-    made. Without this, switching the Project name at the top of the page
-    would silently keep the previous project's orchestrator — so provision()
-    would attach to (and save state onto) the old project's volume/pod under
-    the new name. The orchestrator's project is fixed at construction, so a
-    name change must discard the cache.
+    Rebuilds when the Project name or the SSH key path changed since the
+    cached orchestrator was made. Without this, editing either field at the
+    top of the page would silently keep the previous orchestrator — so
+    provision() would attach to (and save state onto) the old project's
+    volume/pod under the new name, or SSH would keep dialing out with a
+    stale/missing key path (falling back to multi-key discovery, which can
+    choke on an unrelated key in ~/.ssh). Both are fixed at construction, so
+    a change to either must discard the cache.
     """
     gs = app.storage.general
     proj = (gs.get("main_proj") or "").strip()
+    ssh_key = (gs.get("cloud_ssh_key") or "").strip() or None
     cached: Optional[CloudOrchestrator] = _cloud["orch"]
-    if cached is not None and cached.project == proj:
+    if cached is not None and cached.project == proj and cached.key_filename == ssh_key:
         return cached
     api_key = cloud_secrets.get_runpod_api_key()
     if not api_key:
@@ -3596,8 +3610,10 @@ def _ensure_orch() -> Optional[CloudOrchestrator]:
         # project. Drop it so steps don't run against it under the new name;
         # the old project's state file still tracks that pod for later reuse.
         _clear_active_pod()
-        _cloud_info(f"Project changed to {proj!r} — orchestrator reloaded.")
-    ssh_key = (gs.get("cloud_ssh_key") or "").strip() or None
+        if cached.project != proj:
+            _cloud_info(f"Project changed to {proj!r} — orchestrator reloaded.")
+        else:
+            _cloud_info("SSH key path changed — orchestrator reloaded.")
     _cloud["orch"] = CloudOrchestrator(api_key, proj, key_filename=ssh_key)
     return _cloud["orch"]
 
