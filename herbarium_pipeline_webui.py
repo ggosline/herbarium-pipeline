@@ -1005,7 +1005,22 @@ def _build_train() -> tuple:
             with ui.row().classes("items-center gap-1"):
                 ui.label("Cool-down accum:").classes("text-sm")
                 cd_accum = ui.input(value="2").classes("w-16").props("dense outlined").bind_value(gs, "tr_cd_accum")
-        ui.label("Cool-down runs after stage 2 with reduced batch/LR — helps settle into flatter minima"
+        with ui.row().classes("w-full items-center gap-4 flex-wrap mt-1"):
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Early-stop patience (0=auto):").classes("text-sm")
+                tr_es_pat = (ui.input(value="0").classes("w-16").props("dense outlined")
+                             .tooltip("Stop when validation accuracy hasn't improved for this many "
+                                      "epochs. 0 = auto (2 in stage 2). Early stopping watches "
+                                      "ACCURACY, the same metric the best checkpoint is picked by. "
+                                      "Replayed on your past runs, the default stops 2-3 epochs "
+                                      "early and still catches the exact peak — the tail buys "
+                                      "nothing. Raise it to be more cautious. Note this is a "
+                                      "graceful stop, so temperature calibration still runs "
+                                      "(killing the job skips it).")
+                             .bind_value(gs, "tr_es_patience"))
+        ui.label("Cool-down runs after stage 2 with reduced batch/LR — helps settle into flatter minima. "
+                 "Epochs 0–3 are the frozen-backbone warm-up; the big accuracy jump comes at the first "
+                 "stage-2 epoch, so don't judge a run before then."
                  ).classes("text-caption text-grey-7")
 
     # This determines WHAT THE MODEL IS, so it is open by default and states the
@@ -1187,6 +1202,8 @@ def _build_train() -> tuple:
             cmd += ["--use-location", "--geo-dim", geo_dim.value]
         mps = _v(tr_max_per_sp)
         if mps and mps != "0": cmd += ["--max-per-class", mps]
+        esp = _v(tr_es_pat)
+        if esp and esp != "0": cmd += ["--early-stop-patience", esp]
         spq = _v(tr_sparse)
         if spq: cmd += ["--sparse-threshold", spq]
         cwb = _v(tr_cw_beta)
@@ -4000,6 +4017,7 @@ def _cloud_env_train() -> dict[str, str]:
         "COOLDOWN_ACCUM":       "tr_cd_accum",
         "SPARSE_THRESHOLD":     "tr_sparse",
         "CLASS_WEIGHT_BETA":    "tr_cw_beta",
+        "EARLY_STOP_PATIENCE":  "tr_es_patience",
         "NUM_GPUS":             "tr_gpus",
         "MAX_PER_CLASS":        "tr_max_per_sp",
         "LABEL_LEVEL":          "tr_label_level",

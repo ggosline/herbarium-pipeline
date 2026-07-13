@@ -1435,6 +1435,8 @@ train() {
   [ "${RESET_OPTIMIZER:-0}" = "1" ] && EXTRA+=(--reset-optimizer)
   [ "${MAX_PER_CLASS}" != "0" ] && EXTRA+=(--max-per-class "$MAX_PER_CLASS")
   [ -n "${SPARSE_THRESHOLD:-}" ] && EXTRA+=(--sparse-threshold "$SPARSE_THRESHOLD")
+  [ -n "${EARLY_STOP_PATIENCE:-}" ] && [ "${EARLY_STOP_PATIENCE}" != "0" ] \
+    && EXTRA+=(--early-stop-patience "$EARLY_STOP_PATIENCE")
   [ -n "${CLASS_WEIGHT_BETA:-}" ] && EXTRA+=(--class-weight-beta "$CLASS_WEIGHT_BETA")
   [ "${NO_GRAD_CKPT:-0}" = "1" ] && EXTRA+=(--no-grad-checkpoint)
   [ -n "${PREFETCH_QUEUE:-}" ] && EXTRA+=(--prefetch-queue "$PREFETCH_QUEUE")
