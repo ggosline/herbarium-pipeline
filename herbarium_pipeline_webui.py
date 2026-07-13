@@ -940,8 +940,17 @@ def _build_train() -> tuple:
                 ui.label("GPUs:").classes("text-sm")
                 tr_gpus = ui.input(value="2").classes("w-16").props("dense outlined").bind_value(gs, "tr_gpus")
             with ui.row().classes("items-center gap-1"):
-                ui.label("Max per species (0=all):").classes("text-sm")
-                tr_max_per_sp = ui.input(value="0").classes("w-20").props("dense outlined").bind_value(gs, "tr_max_per_sp")
+                ui.label("Max images per class (0=all):").classes("text-sm")
+                tr_max_per_sp = (ui.input(value="0").classes("w-20").props("dense outlined")
+                                 .tooltip("Caps images per CLASS at the rank you are training. "
+                                          "On a genus model this caps each genus (a big genus is "
+                                          "sampled round-robin across its species, so it keeps its "
+                                          "morphological breadth). This is the best way to tame a "
+                                          "long tail — it balances the data instead of distorting "
+                                          "the loss, and cuts training time in proportion. "
+                                          "For Rubiaceae genera, 300 takes the imbalance from 552x "
+                                          "to 15x and trains 3x faster.")
+                                 .bind_value(gs, "tr_max_per_sp"))
             with ui.row().classes("items-center gap-1"):
                 ui.label("Min images per class:").classes("text-sm")
                 tr_sparse = (ui.input(value="20").classes("w-16").props("dense outlined")
@@ -1145,7 +1154,7 @@ def _build_train() -> tuple:
         if use_location.value:
             cmd += ["--use-location", "--geo-dim", geo_dim.value]
         mps = _v(tr_max_per_sp)
-        if mps and mps != "0": cmd += ["--max-per-species", mps]
+        if mps and mps != "0": cmd += ["--max-per-class", mps]
         spq = _v(tr_sparse)
         if spq: cmd += ["--sparse-threshold", spq]
         cwb = _v(tr_cw_beta)
@@ -3960,7 +3969,7 @@ def _cloud_env_train() -> dict[str, str]:
         "SPARSE_THRESHOLD":     "tr_sparse",
         "CLASS_WEIGHT_BETA":    "tr_cw_beta",
         "NUM_GPUS":             "tr_gpus",
-        "MAX_PER_SP":           "tr_max_per_sp",
+        "MAX_PER_CLASS":        "tr_max_per_sp",
         "LABEL_LEVEL":          "tr_label_level",
         "GEO_DIM":              "tr_geo_dim",
         "SPECIES_WEIGHT":       "tr_w_sp",

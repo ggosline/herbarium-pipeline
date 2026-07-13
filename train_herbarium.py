@@ -133,7 +133,7 @@ class HerbariumData:
                  label_level: str = "species",
                  hierarchical: bool = False,
                  sparse_threshold: int = 5, train_val_split: float = 0.2, seed: int = 42,
-                 max_per_species: int = 0, class_weight_beta: float = 0.0):
+                 max_per_class: int = 0, class_weight_beta: float = 0.0):
         keep_cols = {"fname", "species"}
         coord_cols = {"decimalLatitude", "decimalLongitude"}
         frames = []
@@ -192,16 +192,39 @@ class HerbariumData:
                   f"(smallest: {int(kept_counts.min())}). Too sparse to actually learn, "
                   f"but they still occupy a class slot. Raise --sparse-threshold to drop them.")
 
-        # Cap images per species (applied before split so stratification still works)
-        if max_per_species and max_per_species > 0:
-            combined = (combined.groupby("species", group_keys=False)
-                        .apply(lambda g: g.sample(min(len(g), max_per_species),
-                                                   random_state=seed))
-                        .reset_index(drop=True))
-            print(f"  Per-species cap ({max_per_species}): {len(combined):,} specimens remain")
+        # Cap images per CLASS, at the rank actually being trained (applied before
+        # the split so stratification still works).
+        #
+        # This used to group by "species" unconditionally, which quietly did almost
+        # nothing on a genus- or family-level model: capping each of Psychotria's
+        # 344 species at 100 still admits ~10,700 Psychotria images. Capping at the
+        # training rank is what you meant, and it is the cleanest way to deal with a
+        # long tail — it fixes the imbalance in the *data* (Rubiaceae genera: 552x →
+        # 15x at 300/genus) instead of lying to the loss about the class prior, and
+        # it cuts epoch time in proportion.
+        #
+        # Within an over-full class, sample round-robin across the next rank down so
+        # the class keeps its morphological breadth: a flat random 300 of Psychotria
+        # covers ~152 of its 344 species, round-robin covers 300.
+        if max_per_class and max_per_class > 0:
+            sub_col = {"family": "genus", "genus": "species"}.get(rank_col)
+            shuffled = combined.sample(frac=1.0, random_state=seed)
+            if sub_col and sub_col in shuffled.columns:
+                # cumcount gives each row its rank within its sub-taxon; a stable sort
+                # on it interleaves the sub-taxa, so head(cap) takes one from each in
+                # turn before taking a second from any.
+                order = shuffled.groupby([rank_col, sub_col]).cumcount()
+                shuffled = shuffled.assign(_rr=order).sort_values("_rr", kind="stable")
+            kept = shuffled.groupby(rank_col).head(max_per_class)
+            combined = (kept.drop(columns="_rr", errors="ignore")
+                            .sort_index().reset_index(drop=True))
+            per = combined[rank_col].value_counts()
+            print(f"  Per-{rank_col} cap ({max_per_class}): {len(combined):,} specimens remain, "
+                  f"imbalance now {per.max() / per.min():.1f}x"
+                  + (f" (sampled round-robin across {sub_col})" if sub_col else ""))
 
-        # Choose indexing column
-        index_col = "species" if hierarchical else label_level
+        # Choose indexing column (same rank the filter and cap used)
+        index_col = rank_col
         if index_col not in combined.columns:
             raise ValueError(f"Column '{index_col}' not found. Available: {list(combined.columns)}")
 
@@ -927,7 +950,7 @@ def train(config: dict):
         sparse_threshold=config.get("sparse_threshold", 5),
         train_val_split=config.get("train_val_split", 0.2),
         seed=config["seed"],
-        max_per_species=config.get("max_per_species", 0),
+        max_per_class=config.get("max_per_class", 0),
         class_weight_beta=config.get("class_weight_beta", 0.0),
     )
     config["num_classes"] = data.num_classes
@@ -1320,7 +1343,7 @@ DEFAULT_CONFIG = dict(
     wandb_run_name="herbarium_run",
     no_wandb=False,
     resume=None,
-    max_per_species=0,
+    max_per_class=0,
     class_weight_beta=0.0,
 )
 
@@ -1363,8 +1386,17 @@ def parse_args():
                         "0.5 = sqrt inverse-frequency, a mild nudge toward rare taxa. "
                         "1.0 = full inverse-frequency (the old hardcoded behaviour): on "
                         "long-tailed data this lets 5-image classes swamp the commonest ones.")
+    p.add_argument("--max-per-class", type=int, default=0, metavar="N",
+                   help="Cap training images per CLASS, at the rank being trained (0 = no cap). "
+                        "On a genus model this caps each genus; on a species (or hierarchical) "
+                        "model, each species. Over-full classes are sampled round-robin across "
+                        "the next rank down, so a capped genus keeps its species diversity. "
+                        "This is the cheapest way to tame a long tail: it fixes the imbalance in "
+                        "the data rather than in the loss, and cuts epoch time in proportion.")
     p.add_argument("--max-per-species", type=int, default=0, metavar="N",
-                   help="Cap training images per species (0 = no cap)")
+                   help="Deprecated alias for --max-per-class. NOTE: it used to group by species "
+                        "even on a genus/family model, where it barely reduced anything; it now "
+                        "caps at the training rank.")
     p.add_argument("--wandb-project", default=None)
     p.add_argument("--wandb-run-name", default=DEFAULT_CONFIG["wandb_run_name"])
     p.add_argument("--no-wandb", action="store_true")
@@ -1442,7 +1474,7 @@ if __name__ == "__main__":
         seed=args.seed,
         sparse_threshold=args.sparse_threshold,
         class_weight_beta=args.class_weight_beta,
-        max_per_species=args.max_per_species,
+        max_per_class=args.max_per_class or args.max_per_species,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
         no_wandb=args.no_wandb,
