@@ -343,7 +343,7 @@ def _qi_infer(ckpt_path: str, image_path: str,
     cache = _quick_id_cache
     if cache.get("ckpt") != ckpt_path:
         (state_dict, model_name, num_classes, nameslist, geo_dim, _label_level,
-         temperature, _excluded, _class_counts) = load_model(Path(ckpt_path), [], 640)
+         temperature, _excluded, _class_counts, _genus_head) = load_model(Path(ckpt_path), [], 640)
         if not model_name:
             model_name = model_name_hint.strip()
         if not model_name:

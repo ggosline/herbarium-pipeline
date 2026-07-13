@@ -275,6 +275,68 @@ def derive_class_counts(df_all: pd.DataFrame, nameslist: list[str]) -> list[int]
     return [int(best_counts.get(n, 1)) for n in nameslist]
 
 
+def _infer_label_level(nameslist: list[str], hierarchical: bool, stored: str) -> str:
+    """The rank the class indices actually refer to.
+
+    The checkpoint's stored label_level cannot be trusted. In hierarchical mode
+    train_herbarium always indexes by species *regardless of --label-level*, so a
+    run configured with `--label-level family --hierarchical` still produces a
+    species nameslist while recording "family". Believing that writes species
+    binomials into pred_family and leaves pred_genus empty — the whole
+    predictions CSV is then garbage.
+
+    The nameslist is the ground truth, so read it: binomials contain a space.
+    """
+    if hierarchical:
+        return "species"
+    if nameslist and sum(" " in str(n) for n in nameslist) > len(nameslist) / 2:
+        return "species"
+    if stored in ("genus", "family"):
+        return stored
+    return "species"
+
+
+class _DualHead(nn.Module):
+    """Wraps an inference model so it also emits genus logits from the same features.
+
+    The genus head is a separately trained classifier, not a projection of the
+    species prediction, and it is materially better at genus: 93% vs ~88% on the
+    Rubiaceae run, because it is optimised for genus directly and does not have to
+    get the species right first. identify used to throw it away.
+    """
+
+    def __init__(self, base: nn.Module, genus_head: nn.Module):
+        super().__init__()
+        self.base = base
+        self.genus_head = genus_head
+
+    def _shared_features(self, x, geo):
+        if isinstance(self.base, _GeoModel):
+            feats = self.base.backbone(x)
+            if geo is None:
+                geo = torch.zeros(feats.shape[0], 4, device=feats.device)
+            return torch.cat([feats, self.base.geo_mlp(geo)], dim=1)
+        # Plain timm classifier: pooled pre-logit features.
+        return self.base.forward_head(self.base.forward_features(x), pre_logits=True)
+
+    def forward(self, x, geo=None):
+        z = self._shared_features(x, geo)
+        head = self.base.head if isinstance(self.base, _GeoModel) else self.base.get_classifier()
+        return head(z), self.genus_head(z)
+
+
+def build_genus_head(genus_head_sd: dict, feat_dim: int) -> nn.Module:
+    """Rebuild the trained genus classifier from its saved weights."""
+    n_genus, in_dim = genus_head_sd["weight"].shape
+    head = nn.Linear(in_dim, n_genus)
+    head.load_state_dict(genus_head_sd)
+    if in_dim != feat_dim:
+        raise SystemExit(
+            f"ERROR: genus head expects {in_dim} input features but the model "
+            f"produces {feat_dim}. Checkpoint is inconsistent.")
+    return head.eval()
+
+
 def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
     """Load a TimmModel from a Lightning checkpoint.
 
@@ -292,10 +354,12 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     # Extract nameslist embedded by on_save_checkpoint (preferred over external file)
+    genus_nameslist: list[str] = []
     if "nameslist" in ckpt:
         embedded = ckpt["nameslist"]
         if isinstance(embedded, dict):
             nameslist = embedded.get("species") or max(embedded.values(), key=len)
+            genus_nameslist = list(embedded.get("genus") or [])
         else:
             nameslist = embedded
         num_classes = len(nameslist)
@@ -330,6 +394,10 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
     #   backbone.*     → *        (backbone weights match timm internals)
     #   head_species.* → head.*   (species head maps to timm's classification head)
     #   geo_mlp.*      → geo_mlp.* (preserved for geo-capable inference)
+    # A head_species/head_genus pair means the run was --hierarchical, which pins
+    # the class index to species no matter what --label-level said.
+    hierarchical = any(k.startswith(("head_species.", "head_genus.")) for k in cleaned)
+    genus_head_sd: dict = {}
     if any(k.startswith("backbone.") for k in cleaned):
         print("  (hierarchical/geo checkpoint detected; remapping backbone/head_species keys)")
         remapped = {}
@@ -340,11 +408,16 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
                 remapped["head." + k[len("head_species."):]] = v
             elif k.startswith("geo_mlp."):
                 remapped[k] = v  # preserve geo MLP weights
+            elif k.startswith("head_genus."):
+                # Kept, not discarded: a head trained directly on genus beats
+                # taking the first word of the species head's guess.
+                genus_head_sd[k[len("head_genus."):]] = v
             elif k.startswith("head."):
                 # Non-hierarchical geo checkpoint: head.* is already the
                 # species classifier, no rename needed.
                 remapped[k] = v
-            # head_genus / head_family discarded — species head is sufficient
+            # head_family still dropped — it is a coarser view of the same
+            # features, and pred_family is looked up from the predicted taxon.
         cleaned = remapped
 
     # Detect geo_dim from geo_mlp weights (geo_mlp.0 is Linear(4, geo_dim))
@@ -371,14 +444,24 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
     if not model_name:
         model_name = None  # caller must pass --model if needed
 
-    # What rank does this model classify at? Drives which columns get filled
-    # in the predictions CSV. Defaults to species for back-compat with old
-    # checkpoints that don't embed label_level.
-    label_level = (hparams.get("label_level")
-                   or hparams.get("config", {}).get("label_level")
-                   or "species")
-    if label_level not in ("species", "genus", "family"):
-        label_level = "species"
+    # What rank does this model classify at? Drives which columns get filled in
+    # the predictions CSV. Inferred from the nameslist, NOT taken on trust — see
+    # _infer_label_level for why the stored value lies on hierarchical runs.
+    stored_level = (hparams.get("label_level")
+                    or hparams.get("config", {}).get("label_level")
+                    or "species")
+    label_level = _infer_label_level(nameslist, hierarchical, stored_level)
+    if label_level != stored_level:
+        print(f"  NOTE: checkpoint records label_level='{stored_level}', but its class "
+              f"names are {label_level} — trusting the names. "
+              + ("(--hierarchical always indexes by species, whatever --label-level said.)"
+                 if hierarchical else ""))
+
+    genus_head = {"nameslist": genus_nameslist, "state_dict": genus_head_sd} \
+        if (genus_nameslist and genus_head_sd) else None
+    if genus_head:
+        print(f"  Genus head found ({len(genus_nameslist)} genera) — will predict genus "
+              f"directly instead of deriving it from the species head")
 
     # Softmax calibration temperature fitted at the end of training.
     # Absent on older checkpoints → 1.0 (no rescaling, original behaviour).
@@ -390,7 +473,7 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
         print(f"  Calibration temperature: {temperature:.3f}")
 
     return (cleaned, model_name, num_classes, nameslist, geo_dim, label_level,
-            temperature, excluded, class_counts)
+            temperature, excluded, class_counts, genus_head)
 
 
 def _ckpt_embed_dim(state_dict: dict) -> int | None:
@@ -481,8 +564,12 @@ def run_inference(
     temperature: float = 1.0,
     logit_adjust: float = 0.0,
     class_counts: list[int] | None = None,
-) -> tuple[list[list[int]], list[list[float]]]:
-    """Return (top_k_indices, top_k_probs) for each path.
+) -> tuple[list[list[int]], list[list[float]], list[int], list[float]]:
+    """Return (top_k_indices, top_k_probs, genus_idx, genus_prob) for each path.
+
+    The last two are empty lists unless the model is a _DualHead carrying a
+    trained genus head, in which case they are that head's top-1 genus and its
+    probability — more accurate than taking the first word of the species guess.
 
     geo_coords: optional float32 Tensor [N, 4] aligned with paths.
     Passed to the model when provided (geo-capable checkpoints).
@@ -512,12 +599,17 @@ def run_inference(
         )
 
     all_topk_preds, all_topk_probs = [], []
+    all_genus_preds, all_genus_probs = [], []
     for batch_tensors, _, batch_geo in tqdm(loader, desc="Inferring", unit="batch"):
         batch_tensors = batch_tensors.to(device)
-        if geo_coords is not None:
-            logits = model(batch_tensors, batch_geo.to(device))
+        geo_arg = batch_geo.to(device) if geo_coords is not None else None
+        out = model(batch_tensors, geo_arg) if geo_coords is not None else model(batch_tensors)
+        # _DualHead returns (species_logits, genus_logits); a plain model returns logits.
+        genus_logits = None
+        if isinstance(out, tuple):
+            logits, genus_logits = out
         else:
-            logits = model(batch_tensors)
+            logits = out
         # Undo the training-time class weighting before any calibration, since
         # that bias lives in the raw logits.
         if log_counts is not None:
@@ -530,7 +622,18 @@ def run_inference(
         all_topk_preds.extend(topk_preds.cpu().tolist())
         all_topk_probs.extend(topk_probs.cpu().tolist())
 
-    return all_topk_preds, all_topk_probs
+        if genus_logits is not None:
+            # The genus head is trained without class weighting (train_herbarium
+            # only weights the species criterion), so no logit adjustment here.
+            if temperature != 1.0:
+                genus_logits = genus_logits / temperature
+            g_probs = torch.softmax(genus_logits, dim=1)
+            g_top_p, g_top_i = torch.max(g_probs, dim=1)
+            all_genus_preds.extend(g_top_i.cpu().tolist())
+            all_genus_probs.extend(g_top_p.cpu().tolist())
+
+    # Genus lists are empty unless the model carries a genus head.
+    return all_topk_preds, all_topk_probs, all_genus_preds, all_genus_probs
 
 
 # ---------------------------------------------------------------------------
@@ -568,10 +671,14 @@ def identify(args):
 
     # Load model weights (may update nameslist + num_classes from embedded data)
     (state_dict, ckpt_model_name, num_classes, nameslist, geo_dim, label_level,
-     ckpt_temperature, excluded, class_counts) = load_model(
+     ckpt_temperature, excluded, class_counts, genus_head) = load_model(
         checkpoint_path, nameslist, args.image_sz
     )
     print(f"  Model rank: {label_level}")
+    if genus_head and args.no_genus_head:
+        print("  --no-genus-head: ignoring the trained genus head, "
+              "deriving genus from the species prediction instead")
+        genus_head = None
 
     # Cancel the class weighting the model was trained with (see run_inference).
     # class_counts may be empty on checkpoints predating their being embedded —
@@ -616,6 +723,16 @@ def identify(args):
     print(f"Building model: {model_name}  ({num_classes} classes)")
 
     base_model = build_model_from_state(state_dict, model_name, num_classes, geo_dim)
+
+    # Attach the trained genus head so genus is predicted directly rather than
+    # read off the first word of the species guess.
+    genus_nameslist: list[str] = []
+    if genus_head:
+        feat_dim = (base_model.head.in_features if isinstance(base_model, _GeoModel)
+                    else base_model.get_classifier().in_features)
+        base_model = _DualHead(base_model,
+                               build_genus_head(genus_head["state_dict"], feat_dim)).eval()
+        genus_nameslist = genus_head["nameslist"]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -671,19 +788,36 @@ def identify(args):
                 species_to_family[str(sp)] = str(fam)
                 genus_to_family.setdefault(str(sp).split()[0], str(fam))
 
-    def _level_columns(pred_name: str) -> dict:
+    def _level_columns(pred_name: str, genus_idx: int | None = None,
+                       genus_prob: float | None = None) -> dict:
         """Map a class-index name (whatever rank the model predicts at) to
-        the right pred_* / true_*-companion columns."""
+        the right pred_* / true_*-companion columns.
+
+        When the checkpoint carries a trained genus head, pred_genus comes from
+        that head rather than from the first word of the species guess — it is
+        optimised for genus directly and is measurably better at it. The two can
+        disagree; genus_agrees records that, and a disagreement is a useful
+        "this specimen is odd" signal.
+        """
         if label_level == "family":
             return {"pred_species": "", "pred_genus": "",
                     "pred_family":  pred_name}
         if label_level == "genus":
             return {"pred_species": "", "pred_genus": pred_name,
                     "pred_family":  genus_to_family.get(pred_name, "")}
-        # species (default)
-        return {"pred_species": pred_name,
-                "pred_genus":   pred_name.split()[0] if pred_name else "",
+        # species
+        from_species = pred_name.split()[0] if pred_name else ""
+        cols = {"pred_species": pred_name,
+                "pred_genus":   from_species,
                 "pred_family":  species_to_family.get(pred_name, "")}
+        if genus_nameslist and genus_idx is not None:
+            g = genus_nameslist[genus_idx] if genus_idx < len(genus_nameslist) else ""
+            cols["pred_genus"]    = g
+            cols["genus_conf"]    = round(float(genus_prob or 0.0), 4)
+            cols["genus_agrees"]  = (g == from_species)
+            cols["pred_family"]   = (species_to_family.get(pred_name, "")
+                                     or genus_to_family.get(g, ""))
+        return cols
 
     def _topk_columns(preds_k, probs_k) -> dict:
         """Per-rank top-k columns mirror the pred_* convention.
@@ -742,15 +876,19 @@ def identify(args):
     if len(df_indet) > 0:
         print(f"\nRunning inference on {len(df_indet):,} indeterminate specimens...")
         indet_paths = [Path(p) for p in df_indet["abs_path"]]
-        topk_preds, topk_probs = run_inference(base_model, indet_paths, args.image_sz,
-                                               args.batch_size, device,
-                                               geo_coords=_geo_for(df_indet),
-                                               temperature=temperature,
-                                               logit_adjust=logit_adjust,
-                                               class_counts=class_counts)
+        topk_preds, topk_probs, g_preds, g_probs = run_inference(
+            base_model, indet_paths, args.image_sz,
+            args.batch_size, device,
+            geo_coords=_geo_for(df_indet),
+            temperature=temperature,
+            logit_adjust=logit_adjust,
+            class_counts=class_counts)
         topk_preds, topk_probs = geo_rerank(topk_preds, topk_probs, df_indet,
                                              geo_index, args.geo_weight, args.geo_sigma)
-        for row, preds_k, probs_k in zip(df_indet.itertuples(), topk_preds, topk_probs):
+        g_preds = g_preds or [None] * len(topk_preds)
+        g_probs = g_probs or [None] * len(topk_preds)
+        for row, preds_k, probs_k, gi, gp in zip(df_indet.itertuples(), topk_preds,
+                                                 topk_probs, g_preds, g_probs):
             pred_name = nameslist[preds_k[0]] if preds_k[0] < len(nameslist) else "unknown"
             entry = {
                 "fname":          row.fname,
@@ -765,7 +903,7 @@ def identify(args):
                 "true_genus":     "",
                 "true_family":    getattr(row, "family", "") or "",
                 "sparse":         str(getattr(row, "sparse", "")).lower() in ("true", "1"),
-                **_level_columns(pred_name),
+                **_level_columns(pred_name, gi, gp),
                 "confidence":     round(probs_k[0], 4),
                 "indet":          True,
                 "flagged":        False,
@@ -778,16 +916,20 @@ def identify(args):
     if len(df_ident) > 0:
         print(f"\nRunning inference on {len(df_ident):,} identified specimens...")
         ident_paths = [Path(p) for p in df_ident["abs_path"]]
-        topk_preds, topk_probs = run_inference(base_model, ident_paths, args.image_sz,
-                                               args.batch_size, device,
-                                               geo_coords=_geo_for(df_ident),
-                                               temperature=temperature,
-                                               logit_adjust=logit_adjust,
-                                               class_counts=class_counts)
+        topk_preds, topk_probs, g_preds, g_probs = run_inference(
+            base_model, ident_paths, args.image_sz,
+            args.batch_size, device,
+            geo_coords=_geo_for(df_ident),
+            temperature=temperature,
+            logit_adjust=logit_adjust,
+            class_counts=class_counts)
         topk_preds, topk_probs = geo_rerank(topk_preds, topk_probs, df_ident,
                                              geo_index, args.geo_weight, args.geo_sigma)
+        g_preds = g_preds or [None] * len(topk_preds)
+        g_probs = g_probs or [None] * len(topk_preds)
         flagged_count = 0
-        for row, preds_k, probs_k in zip(df_ident.itertuples(), topk_preds, topk_probs):
+        for row, preds_k, probs_k, gi, gp in zip(df_ident.itertuples(), topk_preds,
+                                                 topk_probs, g_preds, g_probs):
             pred_name     = nameslist[preds_k[0]] if preds_k[0] < len(nameslist) else "unknown"
             conf          = probs_k[0]
             true_species  = getattr(row, "species", "")
@@ -822,7 +964,7 @@ def identify(args):
                 "true_genus":     true_genus,
                 "true_family":    true_family,
                 "sparse":         str(getattr(row, "sparse", "")).lower() in ("true", "1"),
-                **_level_columns(pred_name),
+                **_level_columns(pred_name, gi, gp),
                 "confidence":     round(conf, 4),
                 "indet":          False,
                 "flagged":        flagged,
@@ -870,6 +1012,12 @@ def parse_args():
                         "softmax). Default: use the value fitted during training and stored in "
                         "the checkpoint (1.0 if none). >1 softens over-confident predictions; "
                         "try 2-4 on an uncalibrated checkpoint to spread probability into the top-5.")
+    p.add_argument("--no-genus-head", action="store_true",
+                   help="Ignore the trained genus head on a hierarchical checkpoint and derive "
+                        "pred_genus from the first word of the species prediction (the old "
+                        "behaviour). The genus head is normally more accurate at genus, since "
+                        "it is trained for it directly and doesn't have to get the species right "
+                        "first — 93%% vs ~88%% on Rubiaceae.")
     p.add_argument("--logit-adjust", type=float, default=0.0, metavar="TAU",
                    help="Shift predictions along the common/rare axis by adding "
                         "TAU*log(class_count) to each logit. Two-way dial: "
