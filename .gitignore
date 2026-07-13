@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 .venv/
 .nicegui/
+.nicegui-*/
 
 # Portable-build output (regenerable via make_portable.py)
 dist/
