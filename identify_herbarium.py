@@ -22,6 +22,7 @@ Usage:
 
 import argparse
 import json
+import math
 import shutil
 import sys
 from pathlib import Path
@@ -225,6 +226,55 @@ def resolve_checkpoint(path: Path) -> Path:
     return path
 
 
+def derive_class_counts(df_all: pd.DataFrame, nameslist: list[str]) -> list[int]:
+    """Rebuild the per-class training image counts, aligned with nameslist.
+
+    Only needed for checkpoints saved before train_herbarium embedded them.
+    Reproduces HerbariumData's trainable-row mask (not indet, has a file, not
+    outlier/invalid) and then counts at whichever rank the nameslist is in —
+    detected by seeing which column's values actually cover the class names,
+    rather than trusting the checkpoint's label_level, which is unreliable on
+    hierarchical runs.
+
+    Returns [] if the rank cannot be identified, in which case the caller skips
+    the adjustment rather than applying a wrong correction.
+    """
+    if not nameslist or "species" not in df_all.columns:
+        return []
+
+    d = df_all
+    if "indet" in d.columns:
+        d = d[~d["indet"].astype(str).str.lower().isin(("true", "1"))]
+    for col in ("outlier", "invalid"):
+        if col in d.columns:
+            d = d[~d[col].astype(str).str.lower().isin(("true", "1"))]
+
+    sp = d["species"].astype(str)
+    candidates = {"species": sp, "genus": sp.str.split().str[0]}
+    if "family" in d.columns:
+        candidates["family"] = d["family"].astype(str)
+
+    want = set(nameslist)
+    best_rank, best_cov, best_counts = None, 0.0, None
+    for rank, series in candidates.items():
+        vc = series.value_counts()
+        cov = sum(1 for n in nameslist if n in vc.index) / len(nameslist)
+        if cov > best_cov:
+            best_rank, best_cov, best_counts = rank, cov, vc
+
+    # Require near-total coverage: a partial match means we guessed the rank wrong,
+    # and a wrong correction is worse than none.
+    if best_counts is None or best_cov < 0.95:
+        print(f"  [warn] could not match nameslist to a rank in specsin "
+              f"(best: {best_rank} at {100 * best_cov:.0f}% coverage)")
+        return []
+    missing = len(want) - sum(1 for n in nameslist if n in best_counts.index)
+    print(f"  Matched nameslist to '{best_rank}' ({100 * best_cov:.1f}% coverage"
+          + (f", {missing} classes absent from specsin → count 1" if missing else "") + ")")
+    # Absent classes get 1 (not 0): log(1)=0, i.e. no adjustment, and it keeps log() finite.
+    return [int(best_counts.get(n, 1)) for n in nameslist]
+
+
 def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
     """Load a TimmModel from a Lightning checkpoint.
 
@@ -253,6 +303,13 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
     # Taxa the training run dropped as too sparse — embedded by on_save_checkpoint.
     # Older checkpoints won't have it; default to an empty payload.
     excluded = ckpt.get("excluded_species") or {"rank": "species", "taxa": {}}
+    # Training images per class, aligned with nameslist (empty for older
+    # checkpoints). Used by --logit-adjust to undo class weighting post-hoc.
+    class_counts = list(ckpt.get("class_counts") or [])
+    if class_counts and len(class_counts) != num_classes:
+        print(f"  [warn] class_counts length {len(class_counts)} != {num_classes} classes "
+              f"— ignoring (cannot align for logit adjustment)")
+        class_counts = []
     state_dict = ckpt["state_dict"]
 
     # Strip Lightning / torch.compile prefixes.
@@ -332,7 +389,8 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
     if temperature != 1.0:
         print(f"  Calibration temperature: {temperature:.3f}")
 
-    return cleaned, model_name, num_classes, nameslist, geo_dim, label_level, temperature, excluded
+    return (cleaned, model_name, num_classes, nameslist, geo_dim, label_level,
+            temperature, excluded, class_counts)
 
 
 def _ckpt_embed_dim(state_dict: dict) -> int | None:
@@ -421,6 +479,8 @@ def run_inference(
     top_k: int = 5,
     geo_coords: torch.Tensor | None = None,
     temperature: float = 1.0,
+    logit_adjust: float = 0.0,
+    class_counts: list[int] | None = None,
 ) -> tuple[list[list[int]], list[list[float]]]:
     """Return (top_k_indices, top_k_probs) for each path.
 
@@ -429,11 +489,27 @@ def run_inference(
     temperature: divides the logits before softmax (temperature scaling,
     Guo et al. 2017). T>1 softens over-confident predictions; T=1 is a
     no-op. Does not change the ranking, only the reported probabilities.
+
+    logit_adjust (tau): adds tau * log(class_counts) to the logits, which DOES
+    change the ranking. Training with class weights w_c makes the network learn
+        p_model(c|x) ∝ w_c · p_true(c|x)
+    so with w_c ∝ (1/n_c)**beta the fitted logits carry a -beta*log(n_c) bias
+    toward rare classes. Adding tau*log(n_c) back cancels it exactly at
+    tau = beta, restoring predictions under the true class prior. Set tau to the
+    --class-weight-beta the model was trained with (1.0 for checkpoints from
+    before the weighting was made configurable — those were hardcoded to full
+    inverse-frequency). tau = 0 leaves the model as trained.
     """
     ds = InferenceDataset(paths, image_sz, geo_coords)
     loader = DataLoader(ds, batch_size=batch_size, num_workers=4,
                         pin_memory=True, shuffle=False)
     model.eval().to(device)
+
+    log_counts = None
+    if logit_adjust and class_counts:
+        log_counts = torch.log(
+            torch.tensor(class_counts, dtype=torch.float32, device=device).clamp(min=1.0)
+        )
 
     all_topk_preds, all_topk_probs = [], []
     for batch_tensors, _, batch_geo in tqdm(loader, desc="Inferring", unit="batch"):
@@ -442,6 +518,10 @@ def run_inference(
             logits = model(batch_tensors, batch_geo.to(device))
         else:
             logits = model(batch_tensors)
+        # Undo the training-time class weighting before any calibration, since
+        # that bias lives in the raw logits.
+        if log_counts is not None:
+            logits = logits + logit_adjust * log_counts
         if temperature != 1.0:
             logits = logits / temperature
         probs  = torch.softmax(logits, dim=1)
@@ -487,10 +567,16 @@ def identify(args):
         print(f"Loaded {len(nameslist)} class names from {args.nameslist}")
 
     # Load model weights (may update nameslist + num_classes from embedded data)
-    state_dict, ckpt_model_name, num_classes, nameslist, geo_dim, label_level, ckpt_temperature, excluded = load_model(
+    (state_dict, ckpt_model_name, num_classes, nameslist, geo_dim, label_level,
+     ckpt_temperature, excluded, class_counts) = load_model(
         checkpoint_path, nameslist, args.image_sz
     )
     print(f"  Model rank: {label_level}")
+
+    # Cancel the class weighting the model was trained with (see run_inference).
+    # class_counts may be empty on checkpoints predating their being embedded —
+    # they are re-derived from specsin below, once df_all is loaded.
+    logit_adjust = float(args.logit_adjust or 0.0)
 
     # Tell the end user which taxa the model can't predict (dropped as too
     # sparse at train time). Write a sidecar into the review dir so the webui /
@@ -555,6 +641,24 @@ def identify(args):
         print(f"  WARNING: {n_missing} rows have hasfile=True but file is missing on disk — skipping")
     df_all = df_all[exists].copy()
     print(f"Total images with files: {len(df_all):,}")
+
+    # Logit adjustment needs one training-image count per class. Newer checkpoints
+    # embed them; for older ones, rebuild from specsin (same rows train_herbarium
+    # would have used) so the fix works without retraining.
+    if logit_adjust and not class_counts:
+        class_counts = derive_class_counts(df_all, nameslist)
+        if class_counts:
+            print(f"  Class counts re-derived from specsin ({len(class_counts)} classes) "
+                  f"— checkpoint predates embedded counts")
+    if logit_adjust and not class_counts:
+        print(f"  [warn] --logit-adjust {logit_adjust} requested but per-class counts could not "
+              f"be determined — skipping adjustment.")
+        logit_adjust = 0.0
+    elif logit_adjust:
+        lo, hi = min(class_counts), max(class_counts)
+        print(f"  Logit adjustment tau={logit_adjust}: rebalancing toward the true class prior "
+              f"(class sizes {lo}–{hi}; up to "
+              f"{logit_adjust * math.log(max(hi, 1) / max(lo, 1)):.1f} logits of correction)")
 
     # Build species → family and genus → family lookups from specsin metadata
     # (may be absent in older CSVs). Used to fill pred_family when the model
@@ -641,7 +745,9 @@ def identify(args):
         topk_preds, topk_probs = run_inference(base_model, indet_paths, args.image_sz,
                                                args.batch_size, device,
                                                geo_coords=_geo_for(df_indet),
-                                               temperature=temperature)
+                                               temperature=temperature,
+                                               logit_adjust=logit_adjust,
+                                               class_counts=class_counts)
         topk_preds, topk_probs = geo_rerank(topk_preds, topk_probs, df_indet,
                                              geo_index, args.geo_weight, args.geo_sigma)
         for row, preds_k, probs_k in zip(df_indet.itertuples(), topk_preds, topk_probs):
@@ -675,7 +781,9 @@ def identify(args):
         topk_preds, topk_probs = run_inference(base_model, ident_paths, args.image_sz,
                                                args.batch_size, device,
                                                geo_coords=_geo_for(df_ident),
-                                               temperature=temperature)
+                                               temperature=temperature,
+                                               logit_adjust=logit_adjust,
+                                               class_counts=class_counts)
         topk_preds, topk_probs = geo_rerank(topk_preds, topk_probs, df_ident,
                                              geo_index, args.geo_weight, args.geo_sigma)
         flagged_count = 0
@@ -762,6 +870,18 @@ def parse_args():
                         "softmax). Default: use the value fitted during training and stored in "
                         "the checkpoint (1.0 if none). >1 softens over-confident predictions; "
                         "try 2-4 on an uncalibrated checkpoint to spread probability into the top-5.")
+    p.add_argument("--logit-adjust", type=float, default=0.0, metavar="TAU",
+                   help="Shift predictions along the common/rare axis by adding "
+                        "TAU*log(class_count) to each logit. Two-way dial: "
+                        "TAU > 0 favours commoner taxa — set it to the --class-weight-beta the "
+                        "model was trained with to cancel that weighting exactly (use 1.0 for "
+                        "checkpoints predating --class-weight-beta, which hardcoded full "
+                        "inverse-frequency and let near-empty classes swamp the commonest taxa). "
+                        "TAU < 0 favours rarer taxa — this is the cheap, tunable way to get a "
+                        "rare-class boost: train with --class-weight-beta 0 and sweep TAU here, "
+                        "rather than baking a guess into the loss and paying for a GPU run per "
+                        "guess. TAU=-0.25 ≈ training at beta=0.25. 0 = model as trained. "
+                        "Counts come from the checkpoint, or are re-derived from specsin.")
     p.add_argument("--geo-weight", type=float, default=0.0,
                    help="Weight for geographic reranking (0=off, 0.3 is a good starting point). "
                         "Blends model probability with a kernel density score from training "

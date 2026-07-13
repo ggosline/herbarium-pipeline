@@ -251,8 +251,8 @@ def main() -> int:
           f"hierarchical={hierarchical} max_per_species={max_per_sp}")
 
     # --- 2. Reconstruct the model (weights + geo/plain arch) ---------------
-    state_dict, ckpt_model_name, num_classes, ck_nameslist, geo_dim, _lvl, cur_T, _excluded = \
-        load_model(ckpt_path, [], 640)
+    (state_dict, ckpt_model_name, num_classes, ck_nameslist, geo_dim, _lvl, cur_T,
+     _excluded, _class_counts) = load_model(ckpt_path, [], 640)
     image_sz = args.image_sz or int(_hp_get(hp, "image_sz", 640))
     use_location = geo_dim > 0
     print(f"   model={ckpt_model_name} classes={num_classes} geo_dim={geo_dim} "

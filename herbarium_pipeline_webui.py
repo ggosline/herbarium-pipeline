@@ -342,8 +342,8 @@ def _qi_infer(ckpt_path: str, image_path: str,
 
     cache = _quick_id_cache
     if cache.get("ckpt") != ckpt_path:
-        state_dict, model_name, num_classes, nameslist, geo_dim, _label_level, temperature, _excluded = load_model(
-            Path(ckpt_path), [], 640)
+        (state_dict, model_name, num_classes, nameslist, geo_dim, _label_level,
+         temperature, _excluded, _class_counts) = load_model(Path(ckpt_path), [], 640)
         if not model_name:
             model_name = model_name_hint.strip()
         if not model_name:
@@ -940,8 +940,38 @@ def _build_train() -> tuple:
                 ui.label("GPUs:").classes("text-sm")
                 tr_gpus = ui.input(value="2").classes("w-16").props("dense outlined").bind_value(gs, "tr_gpus")
             with ui.row().classes("items-center gap-1"):
-                ui.label("Max per species (0=all):").classes("text-sm")
-                tr_max_per_sp = ui.input(value="0").classes("w-20").props("dense outlined").bind_value(gs, "tr_max_per_sp")
+                ui.label("Max images per class (0=all):").classes("text-sm")
+                tr_max_per_sp = (ui.input(value="0").classes("w-20").props("dense outlined")
+                                 .tooltip("Caps images per CLASS at the rank you are training. "
+                                          "On a genus model this caps each genus (a big genus is "
+                                          "sampled round-robin across its species, so it keeps its "
+                                          "morphological breadth). This is the best way to tame a "
+                                          "long tail — it balances the data instead of distorting "
+                                          "the loss, and cuts training time in proportion. "
+                                          "For Rubiaceae genera, 300 takes the imbalance from 552x "
+                                          "to 15x and trains 3x faster.")
+                                 .bind_value(gs, "tr_max_per_sp"))
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Min images per class:").classes("text-sm")
+                tr_sparse = (ui.input(value="20").classes("w-16").props("dense outlined")
+                             .tooltip("Taxa with fewer images than this are dropped from training "
+                                      "(listed in excluded_species.csv). A class with only a handful "
+                                      "of images cannot be learned, but still competes for every "
+                                      "prediction. 20-30 is a sane floor; 5 lets near-empty classes in.")
+                             .bind_value(gs, "tr_sparse"))
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Rare-class boost (beta):").classes("text-sm")
+                tr_cw_beta = (ui.input(value="0.0").classes("w-16").props("dense outlined")
+                              .tooltip("How hard to up-weight rare taxa in the loss. "
+                                       "0 = off (recommended). Leave it at 0 and get your "
+                                       "rare-taxa boost on the Identify tab instead ('Common/rare "
+                                       "bias' — negative values), which is the same dial but free "
+                                       "and tunable after training, and doesn't distort what the "
+                                       "backbone learns. "
+                                       "1.0 = full inverse-frequency: on a long-tailed flora this "
+                                       "backfires badly — near-empty classes soak up predictions "
+                                       "from your commonest genera.")
+                              .bind_value(gs, "tr_cw_beta"))
             nccl_p2p_disable = (ui.checkbox(
                 "NCCL_P2P_DISABLE (only for multi-GPU without NVLink)", value=False)
                 .tooltip("Sets NCCL_P2P_DISABLE=1 — do NOT enable if NVLink is present")
@@ -1124,7 +1154,11 @@ def _build_train() -> tuple:
         if use_location.value:
             cmd += ["--use-location", "--geo-dim", geo_dim.value]
         mps = _v(tr_max_per_sp)
-        if mps and mps != "0": cmd += ["--max-per-species", mps]
+        if mps and mps != "0": cmd += ["--max-per-class", mps]
+        spq = _v(tr_sparse)
+        if spq: cmd += ["--sparse-threshold", spq]
+        cwb = _v(tr_cw_beta)
+        if cwb: cmd += ["--class-weight-beta", cwb]
 
         return cmd
 
@@ -1463,6 +1497,19 @@ def _build_identify(tr_model=None) -> tuple:
                                 .bind_value(gs, "id_geo_sigma"))
                 ui.tooltip("Kernel bandwidth for geographic scoring. Larger = broader range influence. "
                            "500 km suits most plant families; use 200–300 for highly localised taxa.").props("max-width=320px")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Common/rare bias (tau):").classes("text-sm")
+                id_logit_adjust = (ui.input(value="0.0").classes("w-20").props("dense outlined")
+                                   .bind_value(gs, "id_logit_adjust"))
+                ui.tooltip("Two-way dial, applied without retraining. "
+                           "POSITIVE favours commoner taxa: set it to the 'Rare-class boost (beta)' "
+                           "the model was trained with to cancel it out — use 1.0 for any model "
+                           "trained before that setting existed, which fixes near-empty taxa "
+                           "hoovering up predictions from your commonest genus. "
+                           "NEGATIVE favours rarer taxa: this is the cheap way to get a rare-class "
+                           "boost — train with beta 0, then try -0.25 or -0.5 here and compare, "
+                           "instead of paying for a retrain per guess. "
+                           "0 = leave the model as trained.").props("max-width=360px")
 
     ui.button("Run Identify", icon="manage_search",
               on_click=lambda: _run_step_mode_aware(
@@ -1491,6 +1538,8 @@ def _build_identify(tr_model=None) -> tuple:
                "--geo-weight",           id_geo_weight.value,
                "--geo-sigma",            id_geo_sigma.value,
         ]
+        la = _v(id_logit_adjust)
+        if la: cmd += ["--logit-adjust", la]
         nl = _v(id_nl)
         if nl: cmd += ["--nameslist", nl]
         m = _v(id_model) or (_v(tr_model) if tr_model else "")
@@ -3917,8 +3966,10 @@ def _cloud_env_train() -> dict[str, str]:
         "COOLDOWN_LR":          "tr_cd_lr",
         "COOLDOWN_BATCH_SIZE":  "tr_cd_batch",
         "COOLDOWN_ACCUM":       "tr_cd_accum",
+        "SPARSE_THRESHOLD":     "tr_sparse",
+        "CLASS_WEIGHT_BETA":    "tr_cw_beta",
         "NUM_GPUS":             "tr_gpus",
-        "MAX_PER_SP":           "tr_max_per_sp",
+        "MAX_PER_CLASS":        "tr_max_per_sp",
         "LABEL_LEVEL":          "tr_label_level",
         "GEO_DIM":              "tr_geo_dim",
         "SPECIES_WEIGHT":       "tr_w_sp",
@@ -3945,6 +3996,7 @@ def _cloud_env_identify() -> dict[str, str]:
         "THRESHOLD":           "id_thresh",
         "LOW_CONF_THRESHOLD":  "id_lowconf",
         "GEO_WEIGHT":          "id_geo_weight",
+        "LOGIT_ADJUST":        "id_logit_adjust",
         "GEO_SIGMA":           "id_geo_sigma",
     })
 
