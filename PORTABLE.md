@@ -21,6 +21,27 @@ heavier ML stack (`uv sync --extra local-ml`). You only need it once.
 If uv isn't already installed and isn't bundled in the zip, the launcher
 installs it automatically on first run (needs internet that once).
 
+## Working on two projects at once
+
+If you want to run a second project **at the same time** as the first (for
+example, two plant families training on two cloud pods in parallel):
+
+1. Keep your first project running — that's the `start.bat` window at
+   <http://localhost:8765>.
+2. Double-click **`start-second.bat`**. A second window opens at
+   <http://localhost:8766>.
+3. In that second window, type a **different Project name** than the first, then
+   use it normally.
+
+The two windows remember their projects and settings separately, so they never
+overwrite each other. Close either window when you're done with that project.
+
+> **Heads-up on cost:** each project runs its own cloud pod, so two projects
+> open at once means **two pods billing at the same time**. Close a window to
+> stop paying for that one. Want a third project in parallel? Copy
+> `start-second.bat`, and in the copy change `8766` to `8767` and `.nicegui-2`
+> to `.nicegui-3`.
+
 ## For whoever builds the zip
 
 ```bash

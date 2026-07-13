@@ -32,6 +32,7 @@ _ROOT_FILES = [
     "pyproject.toml",
     "uv.lock",
     "start.bat",
+    "start-second.bat",
     "start.sh",
     "README.md",
     "cloud_setup.md",
