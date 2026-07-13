@@ -85,6 +85,36 @@ def _encode_coords(df: pd.DataFrame) -> torch.Tensor:
     return torch.from_numpy(coords.astype(np.float32))
 
 
+def make_early_stop(config: dict, patience: int) -> EarlyStopping:
+    """Early stopping on the metric we actually select checkpoints by.
+
+    It used to monitor valid_loss, which never fired: late in training the model
+    grows more confident and the loss drifts up on the few hard examples while
+    accuracy is flat or still improving. So the loss keeps twitching, patience
+    keeps resetting, and the run goes to max_epochs. On the 16-epoch Rubiaceae run
+    it never fired once — and epochs 12-15 bought 0.0 accuracy.
+
+    Monitoring val_Accuracy instead (mode="max") tracks what identify actually
+    picks (the acc-*.ckpt), and min_delta stops noise-level wobbles from resetting
+    the counter. Across past runs (Rubiaceae, Opiliaceae, Icacinales) accuracy
+    reaches ~99% of its peak by roughly epoch 8-9 and then flatlines, so this
+    typically saves 3-5 epochs.
+
+    Set --early-stop-metric valid_loss to restore the old behaviour.
+    """
+    metric = config.get("early_stop_metric") or "val_Accuracy"
+    mode = "min" if "loss" in metric else "max"
+    # 0 = use this stage's own default patience; anything else overrides it.
+    pat = int(config.get("early_stop_patience", 0) or 0) or patience
+    return EarlyStopping(
+        monitor=metric,
+        patience=pat,
+        min_delta=float(config.get("early_stop_min_delta", 0.002)),
+        mode=mode,
+        verbose=True,
+    )
+
+
 def getweights(series, beta: float = 0.0):
     """Per-class loss weights, ordered to match the sorted nameslist.
 
@@ -1111,9 +1141,12 @@ def train(config: dict):
         print(f"\n{'='*50}\n"
               f"STAGE 1: frozen backbone, {stage1_epochs} epochs, lr={config['stage1_lr']}\n"
               f"{'='*50}")
+        # Stage 1 is a short frozen-backbone warm-up; patience 5 means this
+        # effectively never fires, which is what we want — the big jump comes at
+        # the first stage-2 epoch, right after this.
         s1_trainer = build_trainer(config, output_dir, logger,
                                    [s1_ckpt_cb, s1_acc_cb,
-                                    EarlyStopping(monitor="valid_loss", patience=5, mode="min")],
+                                    make_early_stop(config, patience=5)],
                                    stage1_epochs, num_gpus)
         s1_trainer.fit(lit)
         last_trainer = s1_trainer
@@ -1165,9 +1198,12 @@ def train(config: dict):
         if hasattr(model_module, "unfreeze_all"):
             model_module.unfreeze_all()
 
+        # Patience 2 on val_Accuracy. Replayed against the real curves of the last
+        # three runs (Rubiaceae, Opiliaceae, Icacinales) this stops 2-3 epochs
+        # early and still captures each run's exact peak — the tail buys nothing.
         s2_trainer = build_trainer(config, output_dir, logger,
                                    [checkpoint_cb, acc_ckpt_cb,
-                                    EarlyStopping(monitor="valid_loss", patience=5, mode="min")],
+                                    make_early_stop(config, patience=2)],
                                    stage2_epochs, num_gpus)
         s2_trainer.fit(lit, ckpt_path=fit_ckpt)
         last_trainer = s2_trainer
@@ -1212,7 +1248,7 @@ def train(config: dict):
         cooldown_trainer = build_trainer(
             config, output_dir, logger,
             [cooldown_ckpt_cb, cooldown_acc_cb,
-             EarlyStopping(monitor="valid_loss", patience=3, mode="min")],
+             make_early_stop(config, patience=2)],
             cooldown_epochs, num_gpus,
         )
         cooldown_trainer.fit(lit)
@@ -1345,6 +1381,9 @@ DEFAULT_CONFIG = dict(
     resume=None,
     max_per_class=0,
     class_weight_beta=0.0,
+    early_stop_metric="val_Accuracy",
+    early_stop_patience=0,       # 0 = per-stage default (s1 5, s2 2, cool-down 2)
+    early_stop_min_delta=0.005,  # swept on real curves: saves ~2.3 epochs, costs 0.0
 )
 
 
@@ -1386,6 +1425,24 @@ def parse_args():
                         "0.5 = sqrt inverse-frequency, a mild nudge toward rare taxa. "
                         "1.0 = full inverse-frequency (the old hardcoded behaviour): on "
                         "long-tailed data this lets 5-image classes swamp the commonest ones.")
+    p.add_argument("--early-stop-metric", default=DEFAULT_CONFIG["early_stop_metric"],
+                   choices=["val_Accuracy", "valid_loss"],
+                   help="Metric early stopping watches. Default val_Accuracy — the same metric "
+                        "identify selects the best checkpoint by. valid_loss (the old default) "
+                        "barely ever fires: late on, the model gets more confident and the loss "
+                        "drifts up on hard examples while accuracy holds, so patience keeps "
+                        "resetting and the run goes to max_epochs.")
+    p.add_argument("--early-stop-patience", type=int,
+                   default=DEFAULT_CONFIG["early_stop_patience"], metavar="N",
+                   help="Epochs without improvement before stopping. 0 = per-stage default "
+                        "(stage1 5, stage2 2, cool-down 2). Raise it if you'd rather pay for a "
+                        "few extra epochs than risk stopping on a plateau that would have broken.")
+    p.add_argument("--early-stop-min-delta", type=float,
+                   default=DEFAULT_CONFIG["early_stop_min_delta"], metavar="D",
+                   help="Improvement smaller than this doesn't count (default 0.005). Stops "
+                        "noise-level wobble from resetting patience forever. Swept against past "
+                        "runs: 0.005 saves ~2.3 epochs at zero accuracy cost; 0.010 starts costing "
+                        "real accuracy.")
     p.add_argument("--max-per-class", type=int, default=0, metavar="N",
                    help="Cap training images per CLASS, at the rank being trained (0 = no cap). "
                         "On a genus model this caps each genus; on a species (or hierarchical) "
@@ -1474,6 +1531,9 @@ if __name__ == "__main__":
         seed=args.seed,
         sparse_threshold=args.sparse_threshold,
         class_weight_beta=args.class_weight_beta,
+        early_stop_metric=args.early_stop_metric,
+        early_stop_patience=args.early_stop_patience,
+        early_stop_min_delta=args.early_stop_min_delta,
         max_per_class=args.max_per_class or args.max_per_species,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
