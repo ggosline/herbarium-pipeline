@@ -954,11 +954,14 @@ def _build_train() -> tuple:
                 ui.label("Rare-class boost (beta):").classes("text-sm")
                 tr_cw_beta = (ui.input(value="0.0").classes("w-16").props("dense outlined")
                               .tooltip("How hard to up-weight rare taxa in the loss. "
-                                       "0 = off (recommended): the model predicts against the true "
-                                       "class prior, so a common genus stays common. "
-                                       "0.5 = mild boost. 1.0 = full inverse-frequency — on a "
-                                       "long-tailed flora this backfires badly: near-empty classes "
-                                       "soak up predictions from your commonest genera.")
+                                       "0 = off (recommended). Leave it at 0 and get your "
+                                       "rare-taxa boost on the Identify tab instead ('Common/rare "
+                                       "bias' — negative values), which is the same dial but free "
+                                       "and tunable after training, and doesn't distort what the "
+                                       "backbone learns. "
+                                       "1.0 = full inverse-frequency: on a long-tailed flora this "
+                                       "backfires badly — near-empty classes soak up predictions "
+                                       "from your commonest genera.")
                               .bind_value(gs, "tr_cw_beta"))
             nccl_p2p_disable = (ui.checkbox(
                 "NCCL_P2P_DISABLE (only for multi-GPU without NVLink)", value=False)
@@ -1486,14 +1489,18 @@ def _build_identify(tr_model=None) -> tuple:
                 ui.tooltip("Kernel bandwidth for geographic scoring. Larger = broader range influence. "
                            "500 km suits most plant families; use 200–300 for highly localised taxa.").props("max-width=320px")
             with ui.row().classes("items-center gap-1"):
-                ui.label("Undo rare-class boost:").classes("text-sm")
+                ui.label("Common/rare bias (tau):").classes("text-sm")
                 id_logit_adjust = (ui.input(value="0.0").classes("w-20").props("dense outlined")
                                    .bind_value(gs, "id_logit_adjust"))
-                ui.tooltip("Corrects a model trained with a rare-class boost, without retraining. "
-                           "Set this to the same 'Rare-class boost (beta)' the model was trained with "
-                           "— use 1.0 for any model trained before that setting existed. "
-                           "Fixes the case where near-empty taxa hoover up predictions from your "
-                           "commonest genus. 0 = leave the model as trained.").props("max-width=340px")
+                ui.tooltip("Two-way dial, applied without retraining. "
+                           "POSITIVE favours commoner taxa: set it to the 'Rare-class boost (beta)' "
+                           "the model was trained with to cancel it out — use 1.0 for any model "
+                           "trained before that setting existed, which fixes near-empty taxa "
+                           "hoovering up predictions from your commonest genus. "
+                           "NEGATIVE favours rarer taxa: this is the cheap way to get a rare-class "
+                           "boost — train with beta 0, then try -0.25 or -0.5 here and compare, "
+                           "instead of paying for a retrain per guess. "
+                           "0 = leave the model as trained.").props("max-width=360px")
 
     ui.button("Run Identify", icon="manage_search",
               on_click=lambda: _run_step_mode_aware(

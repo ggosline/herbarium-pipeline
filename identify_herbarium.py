@@ -871,12 +871,17 @@ def parse_args():
                         "the checkpoint (1.0 if none). >1 softens over-confident predictions; "
                         "try 2-4 on an uncalibrated checkpoint to spread probability into the top-5.")
     p.add_argument("--logit-adjust", type=float, default=0.0, metavar="TAU",
-                   help="Cancel the class weighting the model was trained with by adding "
-                        "TAU*log(class_count) to each logit. Set TAU to the --class-weight-beta "
-                        "used at training (1.0 for older checkpoints, which hardcoded full "
-                        "inverse-frequency weighting). Fixes the failure mode where near-empty "
-                        "classes soak up predictions from the commonest taxa. 0 = model as trained. "
-                        "Requires a checkpoint with embedded class_counts.")
+                   help="Shift predictions along the common/rare axis by adding "
+                        "TAU*log(class_count) to each logit. Two-way dial: "
+                        "TAU > 0 favours commoner taxa — set it to the --class-weight-beta the "
+                        "model was trained with to cancel that weighting exactly (use 1.0 for "
+                        "checkpoints predating --class-weight-beta, which hardcoded full "
+                        "inverse-frequency and let near-empty classes swamp the commonest taxa). "
+                        "TAU < 0 favours rarer taxa — this is the cheap, tunable way to get a "
+                        "rare-class boost: train with --class-weight-beta 0 and sweep TAU here, "
+                        "rather than baking a guess into the loss and paying for a GPU run per "
+                        "guess. TAU=-0.25 ≈ training at beta=0.25. 0 = model as trained. "
+                        "Counts come from the checkpoint, or are re-derived from specsin.")
     p.add_argument("--geo-weight", type=float, default=0.0,
                    help="Weight for geographic reranking (0=off, 0.3 is a good starting point). "
                         "Blends model probability with a kernel density score from training "
