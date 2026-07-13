@@ -1008,8 +1008,14 @@ def _build_train() -> tuple:
         ui.label("Cool-down runs after stage 2 with reduced batch/LR — helps settle into flatter minima"
                  ).classes("text-caption text-grey-7")
 
-    with _accordion("Loss & hierarchy (species / genus / family)", opened=False):
+    # This determines WHAT THE MODEL IS, so it is open by default and states the
+    # outcome in plain words. Ticking Hierarchical silently overrides the rank
+    # radio (train_herbarium: rank_col = "species" if hierarchical else label_level),
+    # which is easy to get wrong — the radio used to sit here unlabelled next to a
+    # caption saying hierarchical merely "adds" heads.
+    with _accordion("What the model classifies (rank & hierarchy)", opened=True):
         with ui.row().classes("w-full items-center gap-4 flex-wrap"):
+            ui.label("Classify at:").classes("text-sm font-medium")
             label_level = (ui.radio(
                 {"species": "Species", "genus": "Genus", "family": "Family"},
                 value="species").props("inline dense")
@@ -1024,10 +1030,36 @@ def _build_train() -> tuple:
             with ui.row().classes("items-center gap-1"):
                 ui.label("Family w:").classes("text-sm")
                 w_fa = ui.input(value="0.0").classes("w-16").props("dense outlined").bind_value(gs, "tr_w_fa")
-        ui.label("Hierarchical multi-head adds genus + family classifiers; weights "
-                 "blend the three losses. Off by default — only useful when the "
-                 "checkpoint will be queried at multiple ranks."
-                 ).classes("text-caption text-grey-7")
+
+        # Live, unambiguous statement of what will actually be trained.
+        rank_note = ui.label().classes("text-caption")
+
+        def _sync_rank_note() -> None:
+            hierarchical = bool(hier.value)
+            # The rank radio is meaningless under hierarchical — disable it rather
+            # than let it look like it still applies.
+            (label_level.disable if hierarchical else label_level.enable)()
+            for w in (w_sp, w_ge, w_fa):
+                (w.enable if hierarchical else w.disable)()
+            if hierarchical:
+                rank_note.set_text(
+                    "→ The model's classes are SPECIES. 'Classify at' is IGNORED. "
+                    "Genus and family become auxiliary heads that sharpen species accuracy "
+                    "(and identify reads genus from the genus head, which is usually the more "
+                    "accurate one). Careful: 'Min images per class' and 'Max images per class' "
+                    "then apply PER SPECIES — a genus whose species are each individually thin "
+                    "gets dropped entirely.")
+                rank_note.classes(replace="text-caption text-orange-9")
+            else:
+                rank = str(label_level.value or "species")
+                rank_note.set_text(
+                    f"→ One flat classifier over {rank.upper()}. The loss weights on the right "
+                    f"are unused. 'Min/Max images per class' apply per {rank}.")
+                rank_note.classes(replace="text-caption text-grey-7")
+
+        hier.on_value_change(lambda _: _sync_rank_note())
+        label_level.on_value_change(lambda _: _sync_rank_note())
+        _sync_rank_note()
 
     with _accordion("Geo features (lat/lon)", opened=False):
         with ui.row().classes("w-full items-center gap-4 flex-wrap"):
