@@ -85,11 +85,38 @@ def _encode_coords(df: pd.DataFrame) -> torch.Tensor:
     return torch.from_numpy(coords.astype(np.float32))
 
 
-def getweights(series):
+def getweights(series, beta: float = 0.0):
+    """Per-class loss weights, ordered to match the sorted nameslist.
+
+        w_c  ∝  (1 / n_c) ** beta,  normalised to mean 1
+
+    beta = 0.0  no weighting (plain cross-entropy). Optimises overall accuracy
+                against the true class prior — for curation this is usually what
+                you want: a specimen that looks like the commonest genus most
+                likely *is* the commonest genus.
+    beta = 0.5  square-root inverse frequency — a mild nudge toward rare taxa.
+    beta = 1.0  full inverse frequency. Optimises *balanced* accuracy, and on a
+                long-tailed herbarium it is a trap.
+
+    Weighted CE makes the model learn p(c|x) ∝ w_c · p_true(c|x), so the ratio
+    between the largest and smallest weight is a straight logit bias at
+    prediction time. At beta=1 on Rubiaceae that ratio was 11050/5 = 2210x: the
+    loss valued one image of a 5-image genus as much as 2210 images of
+    Psychotria. The tail ate the head — Psychotria recall fell to 11% while six
+    5-image genera absorbed 12% of all predictions. Keep the ratio small.
+
+    Normalising to mean 1 also keeps the loss value comparable across beta and
+    stops a single rare, high-weight sample from dominating a batch's gradient.
+    """
     namescount = Counter(series)
-    counts = [v for (n, v) in sorted(namescount.items(), key=lambda x: x[0])]
-    weights = torch.ones(1) / torch.FloatTensor(counts)
-    return weights
+    counts = torch.tensor(
+        [v for (_, v) in sorted(namescount.items(), key=lambda x: x[0])],
+        dtype=torch.float32,
+    )
+    if beta <= 0:
+        return torch.ones_like(counts)
+    w = counts.pow(-float(beta))
+    return w / w.mean()
 
 
 class HerbariumData:
@@ -106,7 +133,7 @@ class HerbariumData:
                  label_level: str = "species",
                  hierarchical: bool = False,
                  sparse_threshold: int = 5, train_val_split: float = 0.2, seed: int = 42,
-                 max_per_species: int = 0):
+                 max_per_species: int = 0, class_weight_beta: float = 0.0):
         keep_cols = {"fname", "species"}
         coord_cols = {"decimalLatitude", "decimalLongitude"}
         frames = []
@@ -155,6 +182,16 @@ class HerbariumData:
               f"{len(combined):,} rows, {combined[rank_col].nunique():,} classes "
               f"({len(self.excluded_species)} taxa dropped as too sparse)")
 
+        # Classes that clear the threshold but are still far too sparse to learn.
+        # They cost a class slot and — if class weighting is on — become attractors
+        # that soak up predictions from the commonest taxa.
+        kept_counts = rank_counts[rank_counts >= sparse_threshold]
+        tiny = kept_counts[kept_counts < 20]
+        if len(tiny):
+            print(f"  [warn] {len(tiny)} {rank_col} classes kept with <20 images "
+                  f"(smallest: {int(kept_counts.min())}). Too sparse to actually learn, "
+                  f"but they still occupy a class slot. Raise --sparse-threshold to drop them.")
+
         # Cap images per species (applied before split so stratification still works)
         if max_per_species and max_per_species > 0:
             combined = (combined.groupby("species", group_keys=False)
@@ -171,7 +208,23 @@ class HerbariumData:
         self.nameslist = sorted(combined[index_col].unique())
         self.namesdict = {n: i for i, n in enumerate(self.nameslist)}
         self.num_classes = len(self.nameslist)
-        self.weights = getweights(combined[index_col])
+        self.weights = getweights(combined[index_col], class_weight_beta)
+
+        # Per-class image counts aligned with nameslist. Embedded in every
+        # checkpoint so identify can undo the training-time class weighting
+        # post-hoc (--logit-adjust) without re-deriving counts from specsin.
+        _idx_counts = combined[index_col].value_counts()
+        self.class_counts = [int(_idx_counts[n]) for n in self.nameslist]
+
+        w_max, w_min = float(self.weights.max()), float(self.weights.min())
+        ratio = w_max / max(w_min, 1e-12)
+        print(f"  Class weights: beta={class_weight_beta} "
+              f"(ratio rarest:commonest = {ratio:,.0f}x)")
+        if ratio > 20:
+            print(f"  [warn] A {ratio:,.0f}x weight ratio is a {math.log(ratio):.1f}-logit "
+                  f"bias toward the rarest class at prediction time. On long-tailed data "
+                  f"this makes the tail swamp the head. Consider --class-weight-beta 0.")
+
         self.imagepath = ""  # DALI uses absolute paths; file_root must be ""
         self.hierarchical = hierarchical
         self.label_level = label_level
@@ -431,6 +484,12 @@ class LitHerbarium(pl.LightningModule):
             "taxa": getattr(data, "excluded_species", {}),
         }
 
+        # Training image count per class, aligned with nameslist. Lets identify
+        # cancel the training-time class weighting at inference (--logit-adjust)
+        # and lets any consumer see how thin a predicted class actually is.
+        self._class_counts_payload = list(getattr(data, "class_counts", []))
+        self._class_weight_beta = float(config.get("class_weight_beta", 0.0))
+
         num_classes = data.num_classes
 
         def _metrics(n, prefix):
@@ -479,6 +538,8 @@ class LitHerbarium(pl.LightningModule):
     def on_save_checkpoint(self, checkpoint):
         checkpoint["nameslist"] = self._nameslist_payload
         checkpoint["excluded_species"] = self._excluded_payload
+        checkpoint["class_counts"] = self._class_counts_payload
+        checkpoint["class_weight_beta"] = self._class_weight_beta
         checkpoint["use_location"] = self.use_location
         checkpoint["geo_dim"] = self.config.get("geo_dim", 0)
         # 1.0 while training; patched to the fitted value after the run so
@@ -867,6 +928,7 @@ def train(config: dict):
         train_val_split=config.get("train_val_split", 0.2),
         seed=config["seed"],
         max_per_species=config.get("max_per_species", 0),
+        class_weight_beta=config.get("class_weight_beta", 0.0),
     )
     config["num_classes"] = data.num_classes
 
@@ -1259,6 +1321,7 @@ DEFAULT_CONFIG = dict(
     no_wandb=False,
     resume=None,
     max_per_species=0,
+    class_weight_beta=0.0,
 )
 
 
@@ -1293,6 +1356,13 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=DEFAULT_CONFIG["num_workers"])
     p.add_argument("--seed", type=int, default=DEFAULT_CONFIG["seed"])
     p.add_argument("--sparse-threshold", type=int, default=DEFAULT_CONFIG["sparse_threshold"])
+    p.add_argument("--class-weight-beta", type=float,
+                   default=DEFAULT_CONFIG["class_weight_beta"], metavar="BETA",
+                   help="Class-weight exponent: w_c ∝ (1/count_c)**BETA, normalised to mean 1. "
+                        "0 = no weighting (plain CE; best overall accuracy — the default). "
+                        "0.5 = sqrt inverse-frequency, a mild nudge toward rare taxa. "
+                        "1.0 = full inverse-frequency (the old hardcoded behaviour): on "
+                        "long-tailed data this lets 5-image classes swamp the commonest ones.")
     p.add_argument("--max-per-species", type=int, default=0, metavar="N",
                    help="Cap training images per species (0 = no cap)")
     p.add_argument("--wandb-project", default=None)
@@ -1371,6 +1441,7 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         seed=args.seed,
         sparse_threshold=args.sparse_threshold,
+        class_weight_beta=args.class_weight_beta,
         max_per_species=args.max_per_species,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,

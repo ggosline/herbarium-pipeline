@@ -1433,6 +1433,8 @@ train() {
   [ -n "${RESUME:-}" ] && EXTRA+=(--resume "$RESUME")
   [ "${RESET_OPTIMIZER:-0}" = "1" ] && EXTRA+=(--reset-optimizer)
   [ "${MAX_PER_SP}" != "0" ] && EXTRA+=(--max-per-species "$MAX_PER_SP")
+  [ -n "${SPARSE_THRESHOLD:-}" ] && EXTRA+=(--sparse-threshold "$SPARSE_THRESHOLD")
+  [ -n "${CLASS_WEIGHT_BETA:-}" ] && EXTRA+=(--class-weight-beta "$CLASS_WEIGHT_BETA")
   [ "${NO_GRAD_CKPT:-0}" = "1" ] && EXTRA+=(--no-grad-checkpoint)
   [ -n "${PREFETCH_QUEUE:-}" ] && EXTRA+=(--prefetch-queue "$PREFETCH_QUEUE")
 
@@ -1522,6 +1524,7 @@ identify() {
   : "${LOW_CONF_THRESHOLD:=}"
   : "${GEO_WEIGHT:=}"
   : "${GEO_SIGMA:=}"
+  : "${LOGIT_ADJUST:=}"
 
   args=(--checkpoint "$CKPT_FILE"
         --model      "$MODEL"
@@ -1533,6 +1536,7 @@ identify() {
   [ -n "$LOW_CONF_THRESHOLD" ] && args+=(--low-conf-threshold "$LOW_CONF_THRESHOLD")
   [ -n "$GEO_WEIGHT" ]         && args+=(--geo-weight         "$GEO_WEIGHT")
   [ -n "$GEO_SIGMA" ]          && args+=(--geo-sigma          "$GEO_SIGMA")
+  [ -n "$LOGIT_ADJUST" ]       && args+=(--logit-adjust       "$LOGIT_ADJUST")
 
   echo "Identify: model=$MODEL image_sz=$IMAGE_SZ batch=$BATCH_SIZE ckpt=$CKPT_FILE"
   python -u "$REPO/identify_herbarium.py" "${args[@]}"
