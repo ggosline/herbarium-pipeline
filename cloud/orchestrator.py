@@ -1165,12 +1165,12 @@ class CloudOrchestrator:
     ) -> int:
         """Run a ``pod_bootstrap.sh`` step, streaming logs back live.
 
-        Valid steps: setup, download, prep, train, identify, backup, restore.
+        Valid steps: setup, download, prep, train, identify, ood, backup, restore.
         ``env`` (e.g. ``{"LIMIT": "500", "MAX_PER_SP": "30"}``) is exported
         for the bash invocation so the bootstrap script's per-step overrides
         kick in. Returns the script's exit code (0 = success).
         """
-        valid = {"setup", "download", "prep", "train", "identify",
+        valid = {"setup", "download", "prep", "train", "identify", "ood",
                  "backup", "restore", "publish"}
         if step not in valid:
             raise ValueError(f"unknown step {step!r}; expected one of {sorted(valid)}")

@@ -513,14 +513,32 @@ class LitHerbarium(pl.LightningModule):
         self.t_max  = config["stage1_epochs"]
         self.hierarchical = config.get("hierarchical", False)
         self.use_location = config.get("use_location", False)
+        self.aum = bool(config.get("aum", True))
 
-        if self.use_location:
+        # DALI hands us the sample INDEX rather than the class whenever anything
+        # needs to be attributed back to an individual specimen — the geo lookup,
+        # or AUM. _step() then reads the real label out of train_labels_t.
+        self._index_batches = self.use_location or self.aum
+
+        if self._index_batches:
             self.register_buffer("train_labels_t",
                                  torch.tensor(data.train_labels, dtype=torch.long))
             self.register_buffer("valid_labels_t",
                                  torch.tensor(data.valid_labels, dtype=torch.long))
+        if self.use_location:
             self.register_buffer("train_coords_t", data.train_coords)
             self.register_buffer("valid_coords_t", data.valid_coords)
+
+        if self.aum:
+            # Running total of each training specimen's margin, and how many
+            # epochs it has been seen. persistent=False: the per-epoch running
+            # state does not belong in state_dict; the finished AUM is embedded
+            # by on_save_checkpoint instead.
+            n_train = len(data.train_files)
+            self.register_buffer("_aum_sum", torch.zeros(n_train), persistent=False)
+            self.register_buffer("_aum_n",
+                                 torch.zeros(n_train, dtype=torch.long),
+                                 persistent=False)
 
         # Store nameslist so it can be embedded in every checkpoint
         if data.hierarchical:
@@ -542,6 +560,23 @@ class LitHerbarium(pl.LightningModule):
         # and lets any consumer see how thin a predicted class actually is.
         self._class_counts_payload = list(getattr(data, "class_counts", []))
         self._class_weight_beta = float(config.get("class_weight_beta", 0.0))
+
+        # WHICH SPECIMENS THE MODEL ACTUALLY SAW. Without this, every downstream
+        # metric silently mixes in training images — and the model memorises them
+        # (100% accuracy, mean confidence 0.9985, vs 88.7% / 0.887 held out), so
+        # any accuracy or novelty score computed over "all specimens" is inflated.
+        #
+        # It lives HERE and not in specsin.csv on purpose: the split is a function
+        # of the training config (seed, sparse_threshold, max_per_class,
+        # hierarchical, and the exact set of files present on disk), not a property
+        # of the specimen. A column in the shared specsin would be silently stale
+        # after any retrain with different settings — worse than absent, because
+        # the numbers derived from it still look plausible.
+        self._split_payload = {
+            "train": sorted(Path(p).name for p in getattr(data, "train_files", [])),
+            "valid": sorted(Path(p).name for p in getattr(data, "valid_files", [])),
+            "seed": int(config.get("seed", 42)),
+        }
 
         num_classes = data.num_classes
 
@@ -588,11 +623,36 @@ class LitHerbarium(pl.LightningModule):
             else:
                 self.species_to_family = None
 
+    def _aum_payload(self) -> dict:
+        """Mean margin per training specimen, for mislabel triage.
+
+        Under DDP each rank only ever sees its own shard, so the running totals
+        must be summed across ranks before they mean anything.
+        """
+        if not self.aum:
+            return {}
+        s = self._aum_sum.clone()
+        n = self._aum_n.clone()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(s)
+            torch.distributed.all_reduce(n)
+        seen = n.clamp(min=1)
+        aum = (s / seen).cpu()
+        return {
+            "fname": [Path(p).name for p in self.data.train_files],
+            "aum": [round(float(v), 4) for v in aum],
+            "epochs_seen": n.cpu().tolist(),
+            "note": "mean margin over training epochs; LOW/NEGATIVE = candidate "
+                    "mislabel. Ranks training specimens only.",
+        }
+
     def on_save_checkpoint(self, checkpoint):
         checkpoint["nameslist"] = self._nameslist_payload
         checkpoint["excluded_species"] = self._excluded_payload
         checkpoint["class_counts"] = self._class_counts_payload
         checkpoint["class_weight_beta"] = self._class_weight_beta
+        checkpoint["split"] = self._split_payload
+        checkpoint["aum"] = self._aum_payload()
         checkpoint["use_location"] = self.use_location
         checkpoint["geo_dim"] = self.config.get("geo_dim", 0)
         # 1.0 while training; patched to the fitted value after the run so
@@ -778,29 +838,61 @@ class LitHerbarium(pl.LightningModule):
     def _step(self, batch, is_train: bool = True):
         image = batch[0]["data"]
         raw   = batch[0]["label"].squeeze(-1).long()
-        if self.use_location:
+        idx   = None
+        if self._index_batches:
             labels_t = self.train_labels_t if is_train else self.valid_labels_t
-            coords_t = self.train_coords_t if is_train else self.valid_coords_t
             target = labels_t[raw]
-            geo    = coords_t[raw]
+            idx    = raw                       # the specimen's row in train_files
+            geo    = ((self.train_coords_t if is_train else self.valid_coords_t)[raw]
+                      if self.use_location else None)
         else:
             target = raw
             geo    = None
         outputs = self.model(image, geo) if geo is not None else self.model(image)
         if self.hierarchical:
             loss = self._hierarchical_loss(outputs, target)
-            return loss, outputs, target
         else:
             loss = self.criterion(outputs, target)
-            return loss, outputs, target
+        return loss, outputs, target, idx
+
+    @torch.no_grad()
+    def _accumulate_aum(self, outputs, target, idx):
+        """Area Under the Margin (Pleiss et al. 2020) — a MISLABEL detector.
+
+            margin = logit[assigned label] - max(logit over every other class)
+
+        Purely observational. Detached, no gradient, no term in the loss: the run
+        is bit-for-bit what it would have been without this.
+
+        The idea: a correctly-labelled specimen is *supported* by every other
+        specimen of its class, so its margin goes positive early and stays there.
+        A MISLABELLED specimen is fought by all of them — the only way the network
+        can fit it is to memorise it individually, which happens late. Its margin
+        therefore sits low or negative for many epochs first. Averaging the margin
+        over training separates the two; the final epoch does not, because by then
+        memorisation has won and train accuracy is 100% (every specimen, right or
+        wrong, is confidently "correct"). That is exactly why the mismatch flag in
+        predictions.csv finds no mis-IDs among training specimens, and why this is
+        measured across epochs rather than at the end.
+        """
+        logits = outputs["species"] if isinstance(outputs, dict) else outputs
+        logits = logits.detach().float()
+        tgt = target.view(-1, 1)
+        assigned = logits.gather(1, tgt).squeeze(1)
+        # Largest logit among the OTHER classes (mask the assigned one out).
+        other = logits.scatter(1, tgt, float("-inf")).max(dim=1).values
+        self._aum_sum.index_add_(0, idx, assigned - other)
+        self._aum_n.index_add_(0, idx, torch.ones_like(idx))
 
     def training_step(self, batch, batch_idx):
         try:
-            loss, outputs, target = self._step(batch, is_train=True)
+            loss, outputs, target, idx = self._step(batch, is_train=True)
         except Exception as exc:
             self._log(f"ERROR in training_step epoch {self.current_epoch} "
                       f"batch {batch_idx}: {exc}")
             raise
+        if self.aum and idx is not None:
+            self._accumulate_aum(outputs, target, idx)
         if self.hierarchical:
             self._update_hierarchical_metrics(outputs, target,
                 self.train_metrics,
@@ -814,7 +906,7 @@ class LitHerbarium(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         try:
-            loss, outputs, target = self._step(batch, is_train=False)
+            loss, outputs, target, _idx = self._step(batch, is_train=False)
         except Exception as exc:
             self._log(f"ERROR in validation_step epoch {self.current_epoch} "
                       f"batch {batch_idx}: {exc}")
@@ -1381,6 +1473,7 @@ DEFAULT_CONFIG = dict(
     resume=None,
     max_per_class=0,
     class_weight_beta=0.0,
+    aum=True,                    # free, and it is the only way to find mis-IDs in train
     early_stop_metric="val_Accuracy",
     early_stop_patience=0,       # 0 = per-stage default (s1 5, s2 2, cool-down 2)
     early_stop_min_delta=0.005,  # swept on real curves: saves ~2.3 epochs, costs 0.0
@@ -1486,6 +1579,16 @@ def parse_args():
                    help="Loss weight for genus head (hierarchical mode, default: 0.5)")
     p.add_argument("--family-weight", type=float, default=0.0,
                    help="Loss weight for family head (hierarchical mode, default: 0.0)")
+    p.add_argument("--no-aum", dest="aum", action="store_false",
+                   help="Disable AUM (Area Under the Margin) mislabel scoring. AUM is on by "
+                        "default: it is purely observational — detached, no gradient, no loss "
+                        "term, so the run is unchanged — and it is the ONLY thing that can find "
+                        "mis-identified TRAINING specimens. The model memorises its training set "
+                        "(100%% accuracy), so it agrees with a wrong label rather than flagging "
+                        "it; predictions.csv therefore reports zero mis-IDs among training rows. "
+                        "AUM works because a mislabelled sheet is fought by every correctly "
+                        "labelled sheet of its class, so its margin stays low for many epochs "
+                        "before memorisation wins. Cost: one 4-byte float per training image.")
     p.add_argument("--use-location", action="store_true",
                    help="Fuse lat/lon (sphere-encoded) with image features during training")
     p.add_argument("--geo-dim", type=int, default=64, metavar="N",
@@ -1531,6 +1634,7 @@ if __name__ == "__main__":
         seed=args.seed,
         sparse_threshold=args.sparse_threshold,
         class_weight_beta=args.class_weight_beta,
+        aum=args.aum,
         early_stop_metric=args.early_stop_metric,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,

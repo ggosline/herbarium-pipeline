@@ -252,7 +252,7 @@ def main() -> int:
 
     # --- 2. Reconstruct the model (weights + geo/plain arch) ---------------
     (state_dict, ckpt_model_name, num_classes, ck_nameslist, geo_dim, _lvl, cur_T,
-     _excluded, _class_counts, _genus_head) = load_model(ckpt_path, [], 640)
+     _excluded, _class_counts, _genus_head, _split) = load_model(ckpt_path, [], 640)
     image_sz = args.image_sz or int(_hp_get(hp, "image_sz", 640))
     use_location = geo_dim > 0
     print(f"   model={ckpt_model_name} classes={num_classes} geo_dim={geo_dim} "

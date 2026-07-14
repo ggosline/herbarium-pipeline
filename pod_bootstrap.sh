@@ -827,7 +827,16 @@ run_detached() {
     touch "$ACTIVITY_FILE" 2>/dev/null || true
     sleep 60
   done
-  wait "$pid"; local code=$?
+  # `wait` MUST be guarded. The script runs under `set -e`, so a bare
+  #     wait "$pid"; local code=$?
+  # aborts this shell the moment the step exits non-zero — before the .rc is
+  # written. The orchestrator then polls for an exit code that never arrives and
+  # the step appears to run forever. Every FAILING step hung the UI this way.
+  # (`if ! wait; then code=$?; fi` looks equivalent but is NOT: inside the
+  # branch $? is the status of the negation, i.e. always 0, so every failure
+  # would be recorded as success. `|| code=$?` captures the real code.)
+  local code=0
+  wait "$pid" || code=$?
   touch "$ACTIVITY_FILE" 2>/dev/null || true
   echo "$code" >"$rc.tmp" && mv "$rc.tmp" "$rc"
 }
@@ -1618,6 +1627,45 @@ identify() {
   python -u "$REPO/identify_herbarium.py" "${args[@]}"
 }
 
+# ─── step 5: OOD / novelty scoring ────────────────────────────────────────
+# Which specimens does the model not recognise? Same GPU pass as identify (one
+# forward per image), but it keeps the penultimate embedding rather than only the
+# logits, so it can measure distance to the training distribution. Writes
+# $DATA/ood/{features.npy,ood_scores.csv,ood_report.json}.
+#
+# REUSE_FEATURES=1 skips the GPU pass entirely and re-scores from the cached
+# features.npy — tuning knn-k or the shrinkage takes seconds, not 40 minutes.
+ood() {
+  mirror_venv_local || echo "⚠ venv mirror skipped — imports will be slower."
+  activate
+  _check_cuda_compat || exit 3
+  # Same checkpoint choice as identify: best val_Accuracy, then last.ckpt.
+  if [ -z "${CKPT_FILE:-}" ]; then
+    CKPT_FILE=$(ls "$CKPT"/*val_Accuracy=*.ckpt 2>/dev/null \
+      | sed -E 's/.*val_Accuracy=([0-9]+\.[0-9]+).*/\1 &/' | sort -rn | head -1 | cut -d' ' -f2-)
+    [ -z "$CKPT_FILE" ] && [ -f "$CKPT/last.ckpt" ] && CKPT_FILE="$CKPT/last.ckpt"
+  fi
+  if [ -z "${CKPT_FILE:-}" ]; then
+    echo "✗ no checkpoint found in $CKPT" >&2; return 1
+  fi
+  : "${IMAGE_SZ:=640}"
+  : "${BATCH_SIZE:=32}"
+  : "${KNN_K:=10}"
+  : "${SHRINKAGE:=0.01}"
+
+  args=(--checkpoint  "$CKPT_FILE"
+        --sources     "$SPECSIN:$IMG_1024"
+        --output-dir  "$DATA/ood"
+        --image-sz    "$IMAGE_SZ"
+        --batch-size  "$BATCH_SIZE"
+        --knn-k       "$KNN_K"
+        --shrinkage   "$SHRINKAGE")
+  [ "${REUSE_FEATURES:-0}" = "1" ] && args+=(--reuse-features)
+
+  echo "OOD: ckpt=$CKPT_FILE image_sz=$IMAGE_SZ batch=$BATCH_SIZE k=$KNN_K"
+  python -u "$REPO/score_ood.py" "${args[@]}"
+}
+
 # ─── publish: push the best checkpoint to the Hugging Face Hub ─────────────
 # push_model.py points at the whole checkpoints dir, auto-picks the best by
 # valid_loss, and reads the embedded nameslist — so this just supplies the
@@ -1791,13 +1839,14 @@ repair_cache() {
 # (the webui sources this file to call individual functions like start_watchdog,
 # and an unguarded ${1:?...} aborts the source with no positional args).
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-  case "${1:?usage: $0 [setup|download|prep|stage_images|train|identify|publish|backup|restore|cache_pull|cache_push|cache_push_bg|venv_pull|venv_push|venv_push_bg|mirror_venv_local|image_set_push|image_set_push_bg|repair_cache|start_watchdog]}" in
+  case "${1:?usage: $0 [setup|download|prep|stage_images|train|identify|ood|publish|backup|restore|cache_pull|cache_push|cache_push_bg|venv_pull|venv_push|venv_push_bg|mirror_venv_local|image_set_push|image_set_push_bg|repair_cache|start_watchdog]}" in
     setup)              setup ;;
     download)           download ;;
     prep)               prep ;;
     stage_images)       stage_images ;;
     train)              train ;;
     identify)           identify ;;
+    ood)                ood ;;
     publish)            publish ;;
     backup)             backup ;;
     restore)            restore ;;

@@ -341,7 +341,7 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
     """Load a TimmModel from a Lightning checkpoint.
 
     Returns (state_dict, model_name, num_classes, nameslist, geo_dim,
-    label_level, temperature, excluded).
+    label_level, temperature, excluded, class_counts, genus_head, split).
     nameslist may be updated from the checkpoint if embedded there.
     excluded is {"rank": str, "taxa": {name: n_images}} — taxa the training
     run dropped as too sparse (empty for older checkpoints).
@@ -349,9 +349,20 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
     contain geo_mlp.* keys in addition to backbone internals and head.*.
     temperature is the fitted softmax calibration temperature (Guo et al.
     2017); 1.0 for older checkpoints that were never calibrated.
+    split is {"train": [fname...], "valid": [fname...]} — which specimens the
+    model actually saw. Empty for checkpoints written before this was recorded;
+    consumers must then treat every metric as train-contaminated.
     """
     num_classes = len(nameslist)
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+    # Which specimens the model trained on. It memorises them (100% accurate,
+    # mean confidence 0.9985, vs 88.7% / 0.887 held out), so any metric that
+    # averages them in reads far too well.
+    split = ckpt.get("split") or {}
+    if split.get("valid"):
+        print(f"  Split embedded: {len(split.get('train', [])):,} train / "
+              f"{len(split['valid']):,} held-out")
 
     # Extract nameslist embedded by on_save_checkpoint (preferred over external file)
     genus_nameslist: list[str] = []
@@ -473,7 +484,7 @@ def load_model(checkpoint_path: Path, nameslist: list[str], image_sz: int):
         print(f"  Calibration temperature: {temperature:.3f}")
 
     return (cleaned, model_name, num_classes, nameslist, geo_dim, label_level,
-            temperature, excluded, class_counts, genus_head)
+            temperature, excluded, class_counts, genus_head, split)
 
 
 def _ckpt_embed_dim(state_dict: dict) -> int | None:
@@ -671,7 +682,7 @@ def identify(args):
 
     # Load model weights (may update nameslist + num_classes from embedded data)
     (state_dict, ckpt_model_name, num_classes, nameslist, geo_dim, label_level,
-     ckpt_temperature, excluded, class_counts, genus_head) = load_model(
+     ckpt_temperature, excluded, class_counts, genus_head, ckpt_split) = load_model(
         checkpoint_path, nameslist, args.image_sz
     )
     print(f"  Model rank: {label_level}")
@@ -976,6 +987,30 @@ def identify(args):
 
     # Save predictions CSV
     results_df = pd.DataFrame(results)
+
+    # Mark which specimens the model trained on, so nobody has to reconstruct the
+    # split to get an honest number. A model scores 100% on its own training
+    # images; averaging those in with held-out ones inflates every accuracy and
+    # every novelty score. Anything not in the split was dropped by the sparse
+    # filter — it is neither train nor held-out, it is a taxon the model cannot
+    # predict at all, which is a third thing again.
+    train_f = set(ckpt_split.get("train") or [])
+    valid_f = set(ckpt_split.get("valid") or [])
+    if valid_f:
+        base = results_df["fname"].map(lambda p: Path(str(p)).name)
+        results_df["split"] = np.where(
+            base.isin(train_f), "train",
+            np.where(base.isin(valid_f), "held-out", "excluded"))
+        counts = results_df["split"].value_counts()
+        print(f"\n  split: " + "  ".join(f"{k}={v:,}" for k, v in counts.items()))
+        print("         (report accuracy on held-out only — the model scores "
+              "100% on its own training images)")
+    else:
+        results_df["split"] = "unknown"
+        print("\n  NOTE: this checkpoint predates split recording, so predictions.csv "
+              "cannot tell\n        train from held-out. Any accuracy computed over "
+              "all rows is inflated.")
+
     csv_path = output_dir / "predictions.csv"
     results_df.to_csv(csv_path, index=False)
     print(f"\nPredictions saved → {csv_path}")
