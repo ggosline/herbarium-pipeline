@@ -186,6 +186,17 @@ class HerbariumData:
 
         combined = pd.concat(frames, ignore_index=True)
 
+        # Genus-only determinations ("Psychotria sp.") name a genus but no
+        # species, and must never become a species class. Review writes them with
+        # indet=True so the mask above already drops them; this is an explicit
+        # guard so the invariant does not depend on that flag surviving.
+        sp_only = combined["species"].astype(str).str.match(
+            r"^\s*\S+\s+spp?\.?\s*$", case=False, na=False)
+        if sp_only.any():
+            print(f"  Dropping {int(sp_only.sum()):,} genus-only determinations "
+                  f"(e.g. 'Psychotria sp.') — no species to learn")
+            combined = combined[~sp_only].reset_index(drop=True)
+
         # Derive genus from species (first word)
         combined["genus"] = combined["species"].str.split().str[0]
 

@@ -150,6 +150,18 @@ def _extract_nameslist(ckpt: dict, fallback: Path | None) -> list[str]:
              "no --nameslist file was given/found.")
 
 
+def _extract_genus_nameslist(ckpt: dict) -> list[str]:
+    """Genus class names, present only on hierarchical checkpoints.
+
+    The embedded nameslist is a dict of per-rank lists there; a flat list means
+    a single-rank model, which has no genus head to publish.
+    """
+    embedded = ckpt.get("nameslist")
+    if isinstance(embedded, dict):
+        return list(embedded.get("genus") or [])
+    return []
+
+
 def _resolve_token(explicit: str | None, token_file: Path | None) -> str | None:
     """HF write token: --token > $HF_TOKEN > --token-file > /workspace/.hf_token.
 
@@ -214,6 +226,9 @@ def _write_model_card(path: Path, *, display_name: str, repo: str,
         tags.append(family.lower())
     fm_tags = "\n".join(f"- {t}" for t in tags)
     sample = ", ".join(nameslist[:8]) + (" …" if len(nameslist) > 8 else "")
+    genus_line = (f"\n- **Genus head:** {config['genus_classes']} genera "
+                  f"(predicted directly, not derived from the species name)"
+                  if config.get("genus_classes") else "")
     metric = ""
     if config.get("val_accuracy") is not None:
         metric += f"\n- **Validation accuracy:** {config['val_accuracy']:.4f}"
@@ -234,7 +249,7 @@ Herbarium specimen classifier published by the
 
 - **Backbone:** `{config['model_name']}`
 - **Label rank:** {config['label_level']}
-- **Classes:** {config['num_classes']}
+- **Classes:** {config['num_classes']}{genus_line}
 - **Input size:** {config['image_sz']} px{metric}
 
 Classes (sample): {sample}
@@ -297,6 +312,23 @@ def main() -> int:
     fallback = args.nameslist or (ckpt_path.parent / "nameslist.json")
     nameslist = _extract_nameslist(ckpt, fallback)
 
+    # A hierarchical checkpoint also carries a trained genus head, which is the
+    # model's most accurate output (~97% vs ~89% at species). Publish its class
+    # names too so the Space can offer genus as a first-class answer instead of
+    # guessing one from the first word of the species prediction.
+    genus_nameslist = _extract_genus_nameslist(ckpt)
+    has_genus_head = bool(
+        genus_nameslist
+        and any(k.startswith(("model.head_genus.", "head_genus."))
+                for k in ckpt.get("state_dict", {}))
+    )
+    if genus_nameslist and not has_genus_head:
+        print("   [warn] genus names present but no head_genus.* weights — "
+              "publishing species only")
+        genus_nameslist = []
+    if has_genus_head:
+        print(f"   genus head: {len(genus_nameslist)} genera")
+
     # 4. Repo + display name.
     repo = args.repo or _default_repo(args.hf_user, args.family, args.region, label_level)
     display_name = args.display_name or _default_display_name(
@@ -321,6 +353,7 @@ def main() -> int:
         "region":       args.region or "",
         "display_name": display_name,
         "num_classes":  len(nameslist),
+        "genus_classes": len(genus_nameslist) if has_genus_head else 0,
         "temperature":  temperature,
         "valid_loss":   round(metrics["valid_loss"], 4) if metrics.get("valid_loss") is not None else None,
         "val_accuracy": round(metrics["val_accuracy"], 4) if metrics.get("val_accuracy") is not None else None,
@@ -338,6 +371,11 @@ def main() -> int:
 
     (workdir / "nameslist.json").write_text(json.dumps(nameslist, indent=2))
     (workdir / "config.json").write_text(json.dumps(config, indent=2))
+    upload_files = ["model.ckpt", "nameslist.json", "config.json", "README.md"]
+    if has_genus_head:
+        (workdir / "genus_nameslist.json").write_text(
+            json.dumps(genus_nameslist, indent=2))
+        upload_files.append("genus_nameslist.json")
 
     readme_path = workdir / "README.md"
     if args.readme and args.readme.exists():
@@ -352,8 +390,8 @@ def main() -> int:
     create_repo(repo, repo_type="model", private=args.private, exist_ok=True, token=token)
 
     api = HfApi(token=token)
-    print("→ Uploading model.ckpt, nameslist.json, config.json, README.md")
-    for fname in ("model.ckpt", "nameslist.json", "config.json", "README.md"):
+    print(f"→ Uploading {', '.join(upload_files)}")
+    for fname in upload_files:
         api.upload_file(
             path_or_fileobj=str(workdir / fname),
             path_in_repo=fname,

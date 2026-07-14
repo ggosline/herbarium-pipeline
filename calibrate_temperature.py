@@ -171,6 +171,115 @@ def patch_hub_temperature(repo: str, temperature: float, token: str | None) -> N
 # Main
 # ---------------------------------------------------------------------------
 
+def _valid_from_split(sources: list[tuple[Path, Path]], split: dict,
+                      nameslist: list[str], use_location: bool):
+    """Resolve the checkpoint's embedded held-out split to (paths, labels, coords).
+
+    The split stores bare file names; we match them against the specsin rows to
+    recover each specimen's species (→ class index) and coordinates.
+    """
+    # torch/pandas are imported lazily in main() to keep --set-temperature light,
+    # so they are not module-level names here.
+    import pandas as pd
+    import torch
+    from identify_herbarium import encode_coords
+
+    want = set(split.get("valid") or [])
+    idx_of = {n: i for i, n in enumerate(nameslist)}
+
+    frames = []
+    for csv, img_dir in sources:
+        df = pd.read_csv(csv)
+        df["abs_path"] = df["fname"].apply(lambda f: str(img_dir / f))
+        frames.append(df)
+    df = pd.concat(frames, ignore_index=True)
+
+    base = df["fname"].map(lambda f: Path(str(f)).name)
+    df = df[base.isin(want)].copy()
+    df["_label"] = df["species"].map(idx_of)
+    n_before = len(df)
+    df = df[df["_label"].notna()]
+    if len(df) < n_before:
+        print(f"   {n_before - len(df)} held-out rows dropped: species not in the "
+              f"checkpoint's nameslist")
+    on_disk = df["abs_path"].map(lambda p: Path(p).is_file())
+    if not on_disk.all():
+        print(f"   {int((~on_disk).sum())} held-out images missing on disk — skipped")
+        df = df[on_disk]
+
+    paths = [Path(p) for p in df["abs_path"]]
+    labels = torch.tensor(df["_label"].astype(int).tolist(), dtype=torch.long)
+    coords = None
+    if use_location:
+        if {"decimalLatitude", "decimalLongitude"} <= set(df.columns):
+            coords = encode_coords(df["decimalLatitude"].values,
+                                   df["decimalLongitude"].values)
+        else:
+            # A geo model fed all-zero coords is the "no location" case it was
+            # trained to handle, so this degrades rather than breaks.
+            print("   [warn] geo model but specsin has no coordinates — "
+                  "calibrating with empty location features")
+            coords = torch.zeros(len(paths), 4, dtype=torch.float32)
+    return paths, labels, coords
+
+
+def patch_checkpoint_temperature(ckpt_path: Path, T: float) -> int:
+    """Write the fitted T into the checkpoint(s), mirroring what
+    train_herbarium's post-fit block does.
+
+    T belongs to the model it was fitted on, so we are deliberately narrow about
+    what we touch. A checkpoint directory accumulates several runs, and a
+    temperature written into the wrong one is invisible — it looks exactly like a
+    genuine calibration. We patch a checkpoint only if all of these hold:
+
+      * it is the checkpoint we just calibrated, OR a sibling from the same run;
+      * it still carries the 1.0 placeholder (never overwrite a fitted T);
+      * it is not a stage-1 intermediate (`s1-*`), whose frozen-backbone logits
+        are nothing like the fine-tuned model this T was fitted on.
+
+    Same-run is judged by mtime: Lightning writes a run's checkpoints as it goes,
+    so siblings land within a few hours of the one we calibrated, and a previous
+    run's files sit well outside that window.
+    """
+    import torch  # lazily imported in main(); not a module-level name
+
+    SAME_RUN_WINDOW_S = 12 * 3600
+
+    ckpt_dir = ckpt_path.parent if ckpt_path.is_file() else ckpt_path
+    target = ckpt_path.resolve() if ckpt_path.is_file() else None
+    ref_mtime = target.stat().st_mtime if target else None
+    patched = 0
+    for p in sorted(ckpt_dir.glob("*.ckpt")):
+        is_target = target is not None and p.resolve() == target
+        try:
+            if not is_target:
+                if p.name.startswith("s1-"):
+                    print(f"   skipped {p.name}: stage-1 intermediate")
+                    continue
+                if ref_mtime is not None and \
+                        abs(p.stat().st_mtime - ref_mtime) > SAME_RUN_WINDOW_S:
+                    print(f"   skipped {p.name}: from a different run")
+                    continue
+
+            ck = torch.load(p, map_location="cpu", weights_only=False)
+            existing = float(ck.get("temperature", 1.0) or 1.0)
+            if existing != 1.0 and not is_target:
+                print(f"   skipped {p.name}: already calibrated (T={existing:.3f})")
+                continue
+            ck["temperature"] = float(T)
+            torch.save(ck, p)
+            patched += 1
+            print(f"   patched {p.name}")
+        except Exception as exc:
+            print(f"   WARNING: could not patch {p.name}: {exc}")
+    try:
+        (ckpt_dir.parent / "temperature.json").write_text(
+            json.dumps({"temperature": float(T)}, indent=2))
+    except OSError as exc:
+        print(f"   WARNING: could not write temperature.json: {exc}")
+    return patched
+
+
 def main() -> int:
     # Windows consoles default to cp1252 and crash on the arrows/checkmarks
     # below; force UTF-8 so the script runs the same everywhere.
@@ -192,6 +301,10 @@ def main() -> int:
     p.add_argument("--set-temperature", type=float, default=None,
                    help="Skip fitting and write this fixed T to the Hub config "
                         "(heuristic fallback when validation data isn't available).")
+    p.add_argument("--patch-checkpoint", action="store_true",
+                   help="Embed the fitted T into every .ckpt in the checkpoint "
+                        "directory. Needed when training was cancelled before its "
+                        "own calibration step ran, which leaves T=1.0.")
     p.add_argument("--dry-run", action="store_true",
                    help="Fit/print the temperature but do not upload anything.")
     p.add_argument("--batch-size", type=int, default=32)
@@ -245,10 +358,16 @@ def main() -> int:
     val_split    = args.train_val_split if args.train_val_split is not None else float(_hp_get(hp, "train_val_split", 0.2))
     hierarchical = bool(_hp_get(hp, "hierarchical", False))
     label_level  = args.label_level     if args.label_level     is not None else str(_hp_get(hp, "label_level", "species"))
-    max_per_sp   = args.max_per_species if args.max_per_species is not None else int(_hp_get(hp, "max_per_species", 0))
+    # "max_per_species" was renamed to "max_per_class" when the cap moved to the
+    # training rank; read the new key first and fall back for old checkpoints.
+    # Getting this wrong is not loud: the cap changes which rows are in the split
+    # without changing the class count, so the nameslist check still passes.
+    max_per_class = (args.max_per_species if args.max_per_species is not None
+                     else int(_hp_get(hp, "max_per_class",
+                                      _hp_get(hp, "max_per_species", 0))))
     print(f"   split params: seed={seed} sparse_threshold={sparse} "
           f"train_val_split={val_split} label_level={label_level} "
-          f"hierarchical={hierarchical} max_per_species={max_per_sp}")
+          f"hierarchical={hierarchical} max_per_class={max_per_class}")
 
     # --- 2. Reconstruct the model (weights + geo/plain arch) ---------------
     (state_dict, ckpt_model_name, num_classes, ck_nameslist, geo_dim, _lvl, cur_T,
@@ -259,36 +378,52 @@ def main() -> int:
           f"image_sz={image_sz} current_T={cur_T}")
     model = build_model_from_state(state_dict, ckpt_model_name, num_classes, geo_dim)
 
-    # --- 3. Rebuild the exact held-out validation split --------------------
-    # Imported here (not at top) so --set-temperature stays DALI-free.
-    from train_herbarium import HerbariumData
-
+    # --- 3. Get the exact held-out validation split ------------------------
     sources = []
     for s in args.sources:
         csv, img = s.split(":", 1)
         sources.append((Path(csv), Path(img)))
-    print(f"→ Rebuilding validation split from {len(sources)} source(s)…")
-    data = HerbariumData(sources, label_level=label_level, hierarchical=hierarchical,
-                         sparse_threshold=sparse, train_val_split=val_split,
-                         seed=seed, max_per_species=max_per_sp)
 
-    # Integrity check: same classes ⇒ same `combined` ⇒ same split.
-    if list(data.nameslist) != list(ck_nameslist):
-        msg = (f"Reconstructed class list ({len(data.nameslist)}) does not match "
-               f"the checkpoint's embedded nameslist ({len(ck_nameslist)}). The "
-               f"specsin data has likely changed since training, so the held-out "
-               f"split cannot be reproduced exactly.")
-        if not args.allow_nameslist_mismatch:
-            sys.exit("ERROR: " + msg + "\n  Re-run with --allow-nameslist-mismatch to "
-                     "fit on an approximate split anyway (T may be biased low).")
-        print("  WARNING: " + msg)
+    if _split and _split.get("valid"):
+        # Preferred: the split the model was actually trained with, embedded in
+        # the checkpoint. Reconstruction (below) depends on the seed, sparse
+        # threshold, per-class cap, label rank AND which files were on disk —
+        # any drift silently yields a different split, and the nameslist check
+        # will not catch it (the per-class cap, for instance, changes the split
+        # without changing the class count).
+        print("→ Using the validation split embedded in the checkpoint")
+        valid_paths, valid_labels, geo_coords = _valid_from_split(
+            sources, _split, ck_nameslist, use_location)
     else:
-        print(f"   integrity OK: {len(data.nameslist)} classes match the checkpoint.")
+        # Imported here (not at top) so --set-temperature stays DALI-free.
+        from train_herbarium import HerbariumData
 
-    valid_paths  = [Path(p) for p in data.valid_files]
-    valid_labels = torch.tensor(data.valid_labels, dtype=torch.long)
-    geo_coords   = data.valid_coords if use_location else None
+        print(f"→ Checkpoint predates split recording — rebuilding the split "
+              f"from {len(sources)} source(s)…")
+        data = HerbariumData(sources, label_level=label_level, hierarchical=hierarchical,
+                             sparse_threshold=sparse, train_val_split=val_split,
+                             seed=seed, max_per_class=max_per_class)
+
+        # Integrity check: same classes ⇒ same `combined` ⇒ same split.
+        if list(data.nameslist) != list(ck_nameslist):
+            msg = (f"Reconstructed class list ({len(data.nameslist)}) does not match "
+                   f"the checkpoint's embedded nameslist ({len(ck_nameslist)}). The "
+                   f"specsin data has likely changed since training, so the held-out "
+                   f"split cannot be reproduced exactly.")
+            if not args.allow_nameslist_mismatch:
+                sys.exit("ERROR: " + msg + "\n  Re-run with --allow-nameslist-mismatch to "
+                         "fit on an approximate split anyway (T may be biased low).")
+            print("  WARNING: " + msg)
+        else:
+            print(f"   integrity OK: {len(data.nameslist)} classes match the checkpoint.")
+
+        valid_paths  = [Path(p) for p in data.valid_files]
+        valid_labels = torch.tensor(data.valid_labels, dtype=torch.long)
+        geo_coords   = data.valid_coords if use_location else None
+
     print(f"   held-out validation images: {len(valid_paths):,}")
+    if not len(valid_paths):
+        sys.exit("ERROR: no held-out images resolved — check --sources image dir.")
 
     # --- 4. Collect raw logits (Space preprocessing) -----------------------
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -324,7 +459,15 @@ def main() -> int:
         print(f"  WARNING: fitted T={T:.3f} is out of the sane range; not uploading.")
         return 1
 
-    # --- 6. Patch the Hub config.json --------------------------------------
+    # --- 6. Patch the local checkpoint(s) ----------------------------------
+    # train_herbarium normally fits T at the end of training and embeds it, but
+    # that block never runs if the run is cancelled — leaving the placeholder
+    # T=1.0 that identify/score_ood would then read as "already calibrated".
+    if args.patch_checkpoint and not args.dry_run:
+        n = patch_checkpoint_temperature(ckpt_path, T)
+        print(f"  Embedded T into {n} checkpoint(s) — identify/score_ood will use it.")
+
+    # --- 7. Patch the Hub config.json --------------------------------------
     if args.dry_run or not args.repo:
         print("  (dry-run / no --repo — not uploading. Re-run with --repo to patch.)")
         return 0

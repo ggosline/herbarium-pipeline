@@ -1827,12 +1827,31 @@ def _build_review() -> tuple:
             )
 
         if level == "genus":
+            # Prefer the trained genus head's own ranked list (gtop*). It is a
+            # different — and far better — answer than marginalising the species
+            # head: ~97% vs ~89% top-1. Only fall back to summing the species
+            # top-5 by first word for CSVs written before identify emitted these,
+            # and say so, because that fallback silently truncates at 5 species.
+            if "gtop1_name" in row.index and str(row.get("gtop1_name", "")) not in ("", "nan"):
+                items = []
+                for k in range(1, 6):
+                    raw = row.get(f"gtop{k}_name", "")
+                    name = "" if (raw != raw or raw is None) else str(raw)
+                    if not name or name == "nan":
+                        break
+                    items.append((name, float(row.get(f"gtop{k}_prob", 0) or 0)))
+                return _render(items, "Genus (genus head)", italic=True)
+
             agg: dict[str, float] = {}
             for name, prob in _top5_items(row):
                 g = name.split()[0] if name and name != "nan" else name
                 agg[g] = agg.get(g, 0) + prob
-            return _render(sorted(agg.items(), key=lambda x: x[1], reverse=True),
-                           "Genus", italic=True)
+            return (_render(sorted(agg.items(), key=lambda x: x[1], reverse=True),
+                            "Genus (from species head)", italic=True)
+                    + "<div style='font-size:11px;color:#888;padding:2px 6px'>"
+                      "Marginalised from the top-5 species — this CSV predates the "
+                      "genus-head columns. Re-run Identify for the genus head's own "
+                      "predictions.</div>")
 
         if level == "family":
             # Family-level CSV: top{k}_name already holds family names.
@@ -2061,7 +2080,27 @@ def _build_review() -> tuple:
                 return c
         return candidates[0] if candidates else ""
 
-    def _get_top5(row) -> list[str]:
+    def _get_top5(row, level: str = "species") -> list[str]:
+        """Candidate determinations for the dropdown, at the rank under review."""
+        if level == "genus":
+            # The genus head's own ranked list when identify wrote it; otherwise
+            # the distinct genera of the top-5 species, in order.
+            names = []
+            for k in range(1, 6):
+                v = row.get(f"gtop{k}_name", "")
+                s = "" if (v != v or v is None) else str(v)
+                if not s or s == "nan":
+                    break
+                names.append(s)
+            if names:
+                return names
+            seen: list[str] = []
+            for sp_name in _get_top5(row, "species"):
+                g = sp_name.split()[0] if sp_name else ""
+                if g and g not in seen:
+                    seen.append(g)
+            return seen
+
         if "top1_name" in row.index:
             names = []
             for k in range(1, 6):
@@ -2098,13 +2137,38 @@ def _build_review() -> tuple:
 
         # Level-specific predicted / true label
         if level == "genus":
-            pred_sp = str(row.get("pred_species", row.get("top1_name", "")))
-            pred_g  = pred_sp.split()[0] if pred_sp and pred_sp not in ("", "nan") else "?"
-            true_g  = true_sp.split()[0] if true_sp and true_sp not in ("", "nan") else ""
+            # pred_genus is written from the trained genus head when the
+            # checkpoint has one; the first-word split is only a fallback.
+            pred_g = str(row.get("pred_genus", "") or "").strip()
+            if not pred_g or pred_g == "nan":
+                pred_sp = str(row.get("pred_species", row.get("top1_name", "")))
+                pred_g  = (pred_sp.split()[0]
+                           if pred_sp and pred_sp not in ("", "nan") else "?")
+            true_g = str(row.get("true_genus", "") or "").strip()
+            if not true_g or true_g == "nan":
+                true_g = true_sp.split()[0] if true_sp and true_sp not in ("", "nan") else ""
             match   = (f" <span style='color:{'#388e3c' if pred_g==true_g else '#d32f2f'}'>"
                        f"{'✓' if pred_g==true_g else '✗'}</span>") if true_g else ""
+            # In genus mode the headline confidence must be the genus head's,
+            # not the species head's — they are different numbers and showing
+            # the species one next to a genus label is simply wrong.
+            g_conf = row.get("genus_conf", None)
+            try:
+                if g_conf is not None and g_conf == g_conf:
+                    conf_val = float(g_conf)
+            except (TypeError, ValueError):
+                pass
+            # Species and genus heads can disagree; that disagreement is itself
+            # a "look at this sheet" signal, so surface it rather than hide it.
+            agree = row.get("genus_agrees", None)
+            disagree_note = ""
+            if str(agree).lower() in ("false", "0"):
+                sp_g = str(row.get("pred_species", "")).split()[0] if row.get("pred_species") else ""
+                disagree_note = ("<span style='color:#f57c00'>⚠ genus head and species "
+                                 f"head disagree (species head says <i>{sp_g}</i>)</span><br>")
             level_line = (f"<b>Predicted genus:</b> <i>{pred_g}</i>{match}<br>"
-                          + (f"<b>True genus:</b> <i>{true_g}</i><br>" if true_g else ""))
+                          + (f"<b>True genus:</b> <i>{true_g}</i><br>" if true_g else "")
+                          + disagree_note)
         elif level == "family":
             pred_f = str(row.get("pred_family", ""))
             true_f = str(row.get("true_family", ""))
@@ -2142,7 +2206,7 @@ def _build_review() -> tuple:
         )
         bars_html.set_content(_bars_html(row, level=level))
 
-        top5 = _get_top5(row)
+        top5 = _get_top5(row, level)
         det_sel.set_options(top5, value=top5[0] if top5 else "")
         action_lbl.set_text("")
 
@@ -2154,6 +2218,11 @@ def _build_review() -> tuple:
         level = level_sel.value
         sp_col   = "pred_species" if "pred_species" in df.columns else "top1_name"
         conf_col = "confidence"   if "confidence"   in df.columns else "top1_prob"
+        # Sort/threshold on the confidence of the rank being reviewed. The genus
+        # head has its own — a specimen can be a confident genus and an
+        # uncertain species, which is exactly the case worth finding.
+        if level == "genus" and "genus_conf" in df.columns:
+            conf_col = "genus_conf"
 
         if filt == "indets":
             mask = df["indet"].astype(str).str.lower().isin(("true", "1"))
@@ -2171,10 +2240,22 @@ def _build_review() -> tuple:
                 pred = df["pred_family"].astype(str).str.strip()
                 true = df["true_family"].astype(str).str.strip()
                 mask = _has_label(df["true_family"]) & true.ne(pred)
-            elif level == "genus" and "true_species" in df.columns:
-                pred_g = df[sp_col].astype(str).str.split().str[0]
-                true_g = df["true_species"].astype(str).str.split().str[0]
-                mask   = _has_label(df["true_species"]) & true_g.ne(pred_g)
+            elif level == "genus" and ("pred_genus" in df.columns
+                                       or "true_species" in df.columns):
+                # Compare the genus head's answer to the recorded genus. Using
+                # the species head's first word instead (the old behaviour)
+                # flags disagreements the genus head gets right, so the misid
+                # list was mostly noise from the weaker of the two heads.
+                if "pred_genus" in df.columns:
+                    pred_g = df["pred_genus"].astype(str).str.strip()
+                else:
+                    pred_g = df[sp_col].astype(str).str.split().str[0]
+                if "true_genus" in df.columns:
+                    true_col, true_g = df["true_genus"], df["true_genus"].astype(str).str.strip()
+                else:
+                    true_col = df["true_species"]
+                    true_g = df["true_species"].astype(str).str.split().str[0]
+                mask = _has_label(true_col) & true_g.ne(pred_g)
             else:
                 if "true_species" in df.columns:
                     true_str = df["true_species"].astype(str).str.strip()
@@ -2206,7 +2287,10 @@ def _build_review() -> tuple:
             view = view.sort_values(conf_col, ascending=True)
         elif sort == "species":
             if level == "genus":
-                view = view.sort_values(sp_col, key=lambda s: s.str.split().str[0])
+                if "pred_genus" in view.columns:
+                    view = view.sort_values("pred_genus")
+                else:
+                    view = view.sort_values(sp_col, key=lambda s: s.str.split().str[0])
             elif level == "family" and "pred_family" in view.columns:
                 view = view.sort_values("pred_family")
             else:
@@ -2409,11 +2493,30 @@ def _build_review() -> tuple:
                 return False
             if op == "invalid":
                 sp.loc[mask, "invalid"] = True
-            else:  # determination
+            elif level_sel.value == "genus":
+                # A genus determination is a real curatorial act, not a
+                # half-finished species one: the sheet is placed in a genus but
+                # NOT to species. So it is recorded as "Psychotria sp." and stays
+                # indet — which also keeps it out of training, where a bare genus
+                # must never become a species class (train_herbarium drops these).
+                new_name = str(det_sel.value or "").split()[0]
+                if not new_name:
+                    return False
+                current = str(sp.loc[mask, "species"].iloc[0])
+                sp.loc[mask, "old_determination"] = current
+                sp.loc[mask, "species"] = f"{new_name} sp."
+                if "genus" in sp.columns:
+                    sp.loc[mask, "genus"] = new_name
+                if "verbatimName" in sp.columns:
+                    sp.loc[mask, "verbatimName"] = f"{new_name}_sp."
+                sp.loc[mask, "indet"] = True
+            else:  # species determination
                 new_name = det_sel.value
                 current  = str(sp.loc[mask, "species"].iloc[0])
                 sp.loc[mask, "old_determination"] = current
                 sp.loc[mask, "species"]           = new_name
+                if "genus" in sp.columns:
+                    sp.loc[mask, "genus"] = new_name.split()[0]
                 if "verbatimName" in sp.columns:
                     sp.loc[mask, "verbatimName"] = new_name.replace(" ", "_")
                 sp.loc[mask, "indet"] = False
@@ -2428,9 +2531,14 @@ def _build_review() -> tuple:
         new_name = det_sel.value
         if not new_name:
             return
+        # Show what actually lands in specsin, not what was clicked — a genus
+        # determination is written as "Psychotria sp.", and the reviewer should
+        # see that rather than discover it later in the CSV.
+        written = (f"{str(new_name).split()[0]} sp."
+                   if level_sel.value == "genus" else new_name)
         if _write_back("determine"):
-            action_lbl.set_text(f"Determined → {new_name}")
-            ui.notify(f"Determined: {new_name}", type="positive")
+            action_lbl.set_text(f"Determined → {written}")
+            ui.notify(f"Determined: {written}", type="positive")
 
     def _mark_invalid():
         if _write_back("invalid"):
@@ -5324,16 +5432,22 @@ def carousel_page():
         return candidates[0] if candidates else ""
 
     def _top5(row) -> list[tuple[str, float]]:
-        if "top1_name" in row.index:
+        # Honour the rank chosen in the Review tab. At genus, read the trained
+        # genus head's own list (gtop*) rather than the species head's.
+        prefix = "gtop" if level == "genus" else "top"
+        if f"{prefix}1_name" in row.index:
             items = []
             for k in range(1, 6):
-                n = row.get(f"top{k}_name", "")
+                n = row.get(f"{prefix}{k}_name", "")
                 n = "" if (n != n or n is None) else str(n)
                 if not n or n == "nan":
                     break
-                items.append((n, float(row.get(f"top{k}_prob", 0) or 0)))
-            return items or [(str(row.get("pred_species", "")),
-                              float(row.get("confidence", 0) or 0))]
+                items.append((n, float(row.get(f"{prefix}{k}_prob", 0) or 0)))
+            if items:
+                return items
+        if level == "genus":
+            return [(str(row.get("pred_genus", "")),
+                     float(row.get("genus_conf", 0) or 0))]
         return [(str(row.get("pred_species", "")),
                  float(row.get("confidence", 0) or 0))]
 
@@ -5374,9 +5488,14 @@ def carousel_page():
         img_el.set_source(_review_img_url(path) if path else "")
         counter_lbl.set_text(f"{idx + 1} / {len(view)}")
 
-        conf  = float(row.get("confidence", row.get("top1_prob", 0)) or 0)
-        pred  = str(row.get("pred_species", row.get("top1_name", "")))
-        true  = str(row.get("true_species", ""))
+        if level == "genus":
+            conf = float(row.get("genus_conf", row.get("gtop1_prob", 0)) or 0)
+            pred = str(row.get("pred_genus", row.get("gtop1_name", "")))
+            true = str(row.get("true_genus", ""))
+        else:
+            conf = float(row.get("confidence", row.get("top1_prob", 0)) or 0)
+            pred = str(row.get("pred_species", row.get("top1_name", "")))
+            true = str(row.get("true_species", ""))
         fname = str(row.get("fname", row.get("filename", "")))
         match = ""
         if true and true != "nan":
