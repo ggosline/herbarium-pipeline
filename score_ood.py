@@ -332,23 +332,41 @@ def main():
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from train_herbarium import HerbariumData
 
+        # Pre-PR#15 checkpoints carry none of these hyperparameters, so they must
+        # be defaulted to what the code did at the time — not to today's defaults.
+        seed = hp.get("seed", 42)
+        sparse = hp.get("sparse_threshold", 5)     # the old default, not 20
+        cap = hp.get("max_per_class", hp.get("max_per_species", 0))
+        beta = hp.get("class_weight_beta", 1.0)    # old runs were hardcoded 1/n
         print("\nCheckpoint has no embedded split — reconstructing "
-              f"(seed={hp['seed']}, sparse>={hp['sparse_threshold']}, "
-              f"cap={hp['max_per_class']}) ...")
+              f"(seed={seed}, sparse>={sparse}, cap={cap}) ...")
         data = HerbariumData(
             sources=sources,
-            label_level=hp["label_level"],
-            hierarchical=hp["hierarchical"],
-            sparse_threshold=hp["sparse_threshold"],
-            seed=hp["seed"],
-            max_per_class=hp["max_per_class"],
-            class_weight_beta=hp["class_weight_beta"],
+            label_level=hp.get("label_level", "species"),
+            hierarchical=hp.get("hierarchical", False),
+            sparse_threshold=sparse,
+            seed=seed,
+            max_per_class=cap,
+            class_weight_beta=beta,
         )
-        if list(data.class_counts) != list(raw["class_counts"]):
-            sys.exit("ABORT: reconstructed split does not match the checkpoint's "
-                     "class_counts — the held-out set would be wrong, and every "
-                     "AUROC below would be meaningless.")
-        print("  split reproduced exactly (class_counts match the checkpoint)")
+        # Verify before trusting it. class_counts is the strong check (it pins the
+        # exact row set); older checkpoints don't have it, so fall back to the
+        # nameslist — weaker, since two different row sets can yield the same
+        # class list — and say so rather than quietly implying the same rigour.
+        if raw.get("class_counts"):
+            if list(data.class_counts) != list(raw["class_counts"]):
+                sys.exit("ABORT: reconstructed split does not match the checkpoint's "
+                         "class_counts — the held-out set would be wrong, and every "
+                         "AUROC below would be meaningless.")
+            print("  split reproduced exactly (class_counts match the checkpoint)")
+        elif list(data.nameslist) == list(species_names):
+            print("  WARNING: this checkpoint predates class_counts, so the split can "
+                  "only be\n           checked against the nameslist. That matches, but "
+                  "it does NOT prove\n           the row set is identical — treat the "
+                  "AUROCs below as indicative.")
+        else:
+            sys.exit("ABORT: reconstructed nameslist does not match the checkpoint. "
+                     "The split, and every number derived from it, would be wrong.")
         train_f = {Path(p).name for p in data.train_files}
         val_f = {Path(p).name for p in data.valid_files}
 
