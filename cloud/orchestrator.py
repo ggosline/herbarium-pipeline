@@ -944,7 +944,35 @@ class CloudOrchestrator:
             f"sed -i 's/\\r//' {REMOTE_REPO}/pod_bootstrap.sh"
         )
         await self.push_wandb_key(handle, on_log=on_log)
+        await self.push_runpod_key(handle, on_log=on_log)
         await self.push_r2_config(handle, on_log=on_log)
+
+    async def push_runpod_key(
+        self, handle: PodHandle, *, on_log: LogFn = print,
+    ) -> bool:
+        """Write the RunPod API key to ``/workspace/.runpod_key`` (chmod 600).
+
+        The idle watchdog needs it to DELETE its own pod: RunPod has no
+        server-side idle timeout for pods (``idleTimeout`` exists only on
+        serverless endpoints), and our prebaked CUDA image carries no
+        ``runpodctl``, so the REST API is the only kill path available from
+        inside the container.
+
+        Note this is an account-scoped key sitting on rented hardware — the
+        same trust already extended to the R2 credentials and HF write token,
+        but the blast radius is larger (it can create and destroy pods). The
+        alternative is a pod that bills until a human notices, which is what
+        happened before this existed.
+        """
+        key = secrets.get_runpod_api_key()
+        if not key:
+            on_log("No RunPod key in keyring — watchdog cannot self-terminate the pod!")
+            return False
+        session = await self._ensure_session(handle, on_log=on_log)
+        await session.sftp_put_bytes(key.encode("utf-8"), "/workspace/.runpod_key")
+        await session.exec_capture("chmod 600 /workspace/.runpod_key")
+        on_log("Pushed RunPod key → /workspace/.runpod_key (chmod 600, for the idle watchdog)")
+        return True
 
     async def push_wandb_key(
         self, handle: PodHandle, *, on_log: LogFn = print,

@@ -671,7 +671,14 @@ BASHRC
     echo "Added herbarium env exports to /root/.bashrc"
   fi
 
-  start_watchdog
+  # Non-fatal: a missing watchdog must not block setup, but it must be SHOUTED
+  # about — a silently-absent watchdog is how a finished pod billed all evening.
+  start_watchdog || {
+    echo "!!"
+    echo "!! WATCHDOG NOT RUNNING — this pod will NOT self-terminate when idle."
+    echo "!! It will bill until you kill it by hand. See the errors above."
+    echo "!!"
+  }
 
   echo "Setup complete. Activate with: source $active_venv/bin/activate"
 }
@@ -679,38 +686,104 @@ BASHRC
 # Background watchdog that polls $ACTIVITY_FILE and self-terminates the pod
 # after IDLE_LIMIT_SECONDS of no bootstrap-step activity. Survives ssh
 # disconnect (setsid + nohup) and is idempotent (skips if already running).
+#
+# Terminates via the RunPod REST API, NOT runpodctl. runpodctl ships on RunPod's
+# own base images but NOT on our prebaked CUDA image — so the old runpodctl-only
+# watchdog started, polled, correctly noticed the pod was idle, then found it had
+# no way to kill anything and exited 0. A finished pod billed overnight until it
+# was killed by hand. Requires $RUNPOD_KEY_FILE (pushed by orchestrator.sync_code).
+RUNPOD_KEY_FILE="${RUNPOD_KEY_FILE:-$WS/.runpod_key}"
+RUNPOD_API="https://rest.runpod.io/v1"
+
+# Prove NOW that the watchdog could actually terminate the pod — an unauthenticated
+# or misconfigured watchdog must fail at start, loudly, not an hour later in a log
+# nobody reads. Echoes the mechanism it will use; non-zero if it has none.
+_watchdog_can_terminate() {
+  if [ -s "$RUNPOD_KEY_FILE" ]; then
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' \
+             --connect-timeout 15 --max-time 30 --retry 2 \
+             -H "Authorization: Bearer $(cat "$RUNPOD_KEY_FILE")" \
+             "$RUNPOD_API/pods/$RUNPOD_POD_ID" 2>/dev/null || echo 000)
+    if [ "$code" = "200" ]; then
+      echo "Watchdog kill path: REST API (key valid, pod $RUNPOD_POD_ID visible)."
+      return 0
+    fi
+    echo "Watchdog: REST preflight failed (HTTP $code) using $RUNPOD_KEY_FILE." >&2
+  else
+    echo "Watchdog: no RunPod API key at $RUNPOD_KEY_FILE." >&2
+  fi
+  if command -v runpodctl >/dev/null 2>&1; then
+    echo "Watchdog kill path: runpodctl (REST unavailable)."
+    return 0
+  fi
+  return 1
+}
+
 start_watchdog() {
   if pgrep -f herbarium-watchdog >/dev/null 2>&1; then
     echo "Watchdog already running."
-    return
+    return 0
   fi
   if [ -z "${RUNPOD_POD_ID:-}" ]; then
-    echo "RUNPOD_POD_ID not set — watchdog disabled."
-    return
+    echo "ERROR: RUNPOD_POD_ID not set — watchdog cannot terminate the pod." >&2
+    return 1
   fi
+  if ! _watchdog_can_terminate; then
+    echo "ERROR: watchdog has NO working way to terminate pod $RUNPOD_POD_ID." >&2
+    echo "       It will not be started. The pod bills until killed by hand." >&2
+    return 1
+  fi
+
   cat >/usr/local/bin/herbarium-watchdog <<'EOF'
 #!/usr/bin/env bash
-# Polls $ACTIVITY_FILE; runpodctl-removes self when idle exceeds limit.
+# Polls $ACTIVITY_FILE; terminates the pod once idle exceeds the limit.
+# Keeps retrying on failure — giving up would leave a GPU billing indefinitely,
+# which is the exact harm this exists to prevent.
 ACTIVITY_FILE="${ACTIVITY_FILE:-/workspace/.last_activity}"
 IDLE_LIMIT_SECONDS="${IDLE_LIMIT_SECONDS:-3600}"
+RUNPOD_KEY_FILE="${RUNPOD_KEY_FILE:-/workspace/.runpod_key}"
+RUNPOD_API="https://rest.runpod.io/v1"
 [ -f "$ACTIVITY_FILE" ] || touch "$ACTIVITY_FILE"
+
+log() { echo "[watchdog $(date -Iseconds)] $*"; }
+
+terminate() {
+  local code rc
+  if [ -s "$RUNPOD_KEY_FILE" ]; then
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+             --connect-timeout 15 --max-time 60 \
+             -H "Authorization: Bearer $(cat "$RUNPOD_KEY_FILE")" \
+             "$RUNPOD_API/pods/$RUNPOD_POD_ID" 2>/dev/null || echo 000)
+    case "$code" in
+      200|204|404) log "DELETE /pods/$RUNPOD_POD_ID -> $code — pod terminated."; return 0 ;;
+      *)           log "DELETE /pods/$RUNPOD_POD_ID -> HTTP $code" ;;
+    esac
+  fi
+  if command -v runpodctl >/dev/null 2>&1; then
+    if runpodctl remove pod "$RUNPOD_POD_ID"; then
+      log "runpodctl removed pod $RUNPOD_POD_ID."
+      return 0
+    fi
+    rc=$?
+    log "runpodctl failed (rc=$rc)"
+  fi
+  return 1
+}
+
 while :; do
   sleep 60
   age=$(( $(date +%s) - $(stat -c %Y "$ACTIVITY_FILE" 2>/dev/null || echo 0) ))
-  if [ "$age" -gt "$IDLE_LIMIT_SECONDS" ]; then
-    echo "[watchdog $(date -Iseconds)] idle ${age}s > ${IDLE_LIMIT_SECONDS}s — terminating pod $RUNPOD_POD_ID"
-    if command -v runpodctl >/dev/null 2>&1; then
-      runpodctl remove pod "$RUNPOD_POD_ID" || echo "[watchdog] runpodctl failed (rc=$?)"
-    else
-      echo "[watchdog] runpodctl not on PATH — cannot self-terminate"
-    fi
-    exit 0
-  fi
+  [ "$age" -gt "$IDLE_LIMIT_SECONDS" ] || continue
+  log "idle ${age}s > ${IDLE_LIMIT_SECONDS}s — terminating pod $RUNPOD_POD_ID"
+  terminate && exit 0
+  log "TERMINATION FAILED — pod is still billing; retrying in 60s"
 done
 EOF
   chmod +x /usr/local/bin/herbarium-watchdog
   ACTIVITY_FILE="$ACTIVITY_FILE" \
   IDLE_LIMIT_SECONDS="$IDLE_LIMIT_SECONDS" \
+  RUNPOD_KEY_FILE="$RUNPOD_KEY_FILE" \
   RUNPOD_POD_ID="$RUNPOD_POD_ID" \
     nohup setsid /usr/local/bin/herbarium-watchdog \
     >>"$WS/watchdog.log" 2>&1 </dev/null &

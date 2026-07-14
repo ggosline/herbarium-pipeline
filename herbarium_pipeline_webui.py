@@ -4137,7 +4137,11 @@ async def _do_attach() -> None:
             f"RUNPOD_POD_ID={pod_id} bash /workspace/Pipeline/pod_bootstrap.sh start_watchdog"
         )
         if rc != 0:
-            _cloud_warn(f"Watchdog start failed (rc={rc}): {out.strip() or '(no output)'}")
+            _cloud_warn(
+                "IDLE WATCHDOG IS NOT RUNNING — this pod will NOT stop itself and "
+                "will bill until you terminate it by hand. "
+                f"(rc={rc}) {out.strip() or '(no output)'}"
+            )
         elif out.strip():
             _cloud_log(out.rstrip())
         # Reset the idle clock so the watchdog doesn't fire on history.
