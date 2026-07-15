@@ -475,22 +475,41 @@ def _reset_wandb() -> None:
         except RuntimeError:
             pass  # client navigated away
 
-# Static-file routes registered for the Review image carousel.
-# Keyed by directory path so each dir is mounted only once per server session.
-_img_routes: dict[str, str] = {}
+# Review images are served through ONE route registered at import (below), not
+# by mounting each folder on demand. NiceGUI 3.x's app.add_static_files() adds
+# an ASGI mount, which must happen before the server starts; calling it lazily
+# while showing the first image (after startup) raised at the ASGI layer, dropped
+# the socket, and reloaded the page to the start tab. A pre-registered endpoint
+# that streams a file by path sidesteps that and handles large scans by streaming.
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".tif", ".tiff", ".bmp"}
+# Directories the review flow has explicitly surfaced — the serve route refuses
+# anything outside them, so this isn't an open read-any-file endpoint.
+_review_roots: set[str] = set()
+
+
+@app.get("/review_file")
+def _serve_review_file(p: str):
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+    try:
+        rp = Path(p).resolve()
+    except OSError:
+        raise HTTPException(status_code=404)
+    if rp.suffix.lower() not in _IMG_EXTS or not rp.is_file():
+        raise HTTPException(status_code=404)
+    if not any(rp.is_relative_to(root) for root in _review_roots):
+        raise HTTPException(status_code=403)
+    return FileResponse(str(rp))
 
 
 def _review_img_url(abs_path: str) -> str:
-    """Return a served URL for abs_path, mounting its parent dir if needed."""
+    """Return a served URL for abs_path via the /review_file endpoint."""
+    from urllib.parse import quote
     p = Path(abs_path)
     if not p.is_file():
         return ""
-    parent = str(p.parent)
-    if parent not in _img_routes:
-        route = f"/review_img/{len(_img_routes)}"
-        app.add_static_files(route, parent)
-        _img_routes[parent] = route
-    return f"{_img_routes[parent]}/{p.name}"
+    _review_roots.add(str(p.parent.resolve()))
+    return f"/review_file?p={quote(str(p.resolve()))}"
 
 
 def _merge_aum(df, review_dir: Path) -> None:
