@@ -425,6 +425,11 @@ def _topk_dict(probs: torch.Tensor, names: list[str]) -> dict[str, float]:
 # fitted on that model's own held-out split.
 _OOD_SPECIES_THR_DEFAULT = 0.60
 _OOD_GENUS_THR_DEFAULT = 0.50
+# A genus head narrower than this can't represent "some other genus", so its
+# confidence saturates and is useless as a novelty signal — the verdict then
+# uses species max-softmax alone. Heuristic; the family-scoped Rubiaceae model
+# has 164 genera and clears it comfortably.
+_OOD_MIN_GENERA = 5
 
 
 def _novelty_md(species_conf: float, genus_conf: float | None,
@@ -507,14 +512,23 @@ def identify(image: Image.Image, model_choice: str,
 
     notice = _excluded_md(bundle.get("excluded") or {})
     genus_names = bundle.get("genus_nameslist") or []
-    if genus_probs is None or not genus_names:
-        novelty = _novelty_md(species_conf, None, None, cfg)
-        return preds, blank, gr.update(value=novelty, visible=True), notice
-    genus_preds = _topk_dict(genus_probs.squeeze(0), genus_names)
-    top_genus, genus_conf = next(iter(genus_preds.items()))
+    has_genus = genus_probs is not None and bool(genus_names)
+
+    genus_panel = blank
+    top_genus = genus_conf = None
+    if has_genus:
+        genus_preds = _topk_dict(genus_probs.squeeze(0), genus_names)
+        genus_panel = gr.update(value=genus_preds, visible=True)
+        # Genus confidence is a novelty signal ONLY when the head can represent
+        # "some other genus". A model trained on one or a few genera has a genus
+        # softmax pinned near 1.0 for every input — including a non-plant — so
+        # using it would falsely reassure. Below the breadth floor, fall back to
+        # species max-softmax alone (which degrades gracefully rather than
+        # lying). See docs/novelty_and_mislabel_detection.md §4.3.
+        if len(genus_names) >= _OOD_MIN_GENERA:
+            top_genus, genus_conf = next(iter(genus_preds.items()))
     novelty = _novelty_md(species_conf, genus_conf, top_genus, cfg)
-    return (preds, gr.update(value=genus_preds, visible=True),
-            gr.update(value=novelty, visible=True), notice)
+    return preds, genus_panel, gr.update(value=novelty, visible=True), notice
 
 
 def _model_info(model_choice: str) -> str:
