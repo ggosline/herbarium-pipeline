@@ -504,6 +504,7 @@ def _merge_aum(df, review_dir: Path) -> None:
     ``aum_candidates.py`` straight from the checkpoint. Merging on the file
     basename keeps it robust to differing path prefixes between the two files.
     """
+    import pandas as _pd  # lazy, matching the rest of this module (slim install)
     if "aum" in df.columns:
         return
     sidecar = review_dir / "aum.csv"
@@ -2409,7 +2410,7 @@ def _build_review() -> tuple:
             ui.notify("Select a valid predictions CSV.", type="warning")
             return
         try:
-            df = _pd.read_csv(path)
+            df = _pd.read_csv(path, low_memory=False)
             if "indet"   not in df.columns: df["indet"]   = False
             if "flagged" not in df.columns: df["flagged"] = False
             _merge_aum(df, Path(path).parent)
