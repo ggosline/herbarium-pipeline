@@ -7,7 +7,7 @@ A RunPod network volume is a resource in its own right; it outlives the pods
 that mount it. RunPod fronts it with an S3-compatible endpoint
 (``s3api-<datacenter>.runpod.io``), so once a training/identify run has written
 its results to the volume you can terminate the (expensive) GPU pod and still
-pull ``predictions.csv``, the AUM sheets, or a checkpoint down for free.
+pull ``predictions.csv``, the AUM sheets, or the images down for free.
 
 This authenticates with the **S3 API key pair** (console -> Settings -> S3 API
 Keys), which is separate from the REST API key. Store it once:
@@ -20,38 +20,32 @@ the RunPod REST API so you never have to hand-type the endpoint.
 
 Usage
 -----
-    # What's on the volume under review/ and the checkpoints dir?
-    uv run python pull_from_volume.py --project Rubiaceae-genera --list review/
-    uv run python pull_from_volume.py --list checkpoints/
+    # What's on the volume under review/ and the images dir? (keys are relative
+    # to the volume root, i.e. what was mounted at /workspace on the pod)
+    uv run --with boto3 python pull_from_volume.py --list data/images/
+    uv run --with boto3 python pull_from_volume.py --list data/predictions/
 
-    # Pull one file, or everything under a prefix, into ./pulled/
-    uv run python pull_from_volume.py --get predictions/predictions.csv --dest ./pulled
-    uv run python pull_from_volume.py --get review/ --dest ./review_aum
+    # Pull one object, or everything under a prefix, into a local dir. Files
+    # already present with the same size are skipped, so an interrupted pull
+    # just resumes on re-run.
+    uv run --with boto3 python pull_from_volume.py --get data/predictions/predictions.csv --dest ./pulled
+    uv run --with boto3 python pull_from_volume.py --get data/images/ --dest /path/to/images
 
-    # Point at a volume explicitly (skips the state-file lookup)
-    uv run python pull_from_volume.py --volume cte9steisi --datacenter EUR-IS-1 --list ""
+    # Pull only a named subset (one filename per line) — e.g. the AUM candidates.
+    uv run --with boto3 python pull_from_volume.py --get data/images/ --dest ./imgs --files-from cands.txt
 
-Transfers run through rclone (already used by this project for R2), which
-handles SigV4, path-style addressing, and multipart. Only reads (list/get) are
-exposed - that's what RunPod's S3 layer does reliably.
+Uses boto3 (RunPod's documented S3 client — rclone's request signing is rejected
+by their gateway). It is pulled in on the fly by ``uv run --with boto3`` so
+nothing needs adding to pyproject. Read-only: list and get.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import shutil
-import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-
-# Windows consoles default to cp1252; our own output uses a few non-ASCII marks.
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
-    except (AttributeError, ValueError):
-        pass
 
 # Repo root is on sys.path when run from here; cloud is a package.
 from cloud import secrets as cloud_secrets
@@ -60,7 +54,6 @@ STATE_DIR = Path.home() / ".herbarium-cloud"
 
 
 def _resolve_volume(project: str | None, volume: str | None) -> str:
-    """Return the volume id, from --volume or the project's state file."""
     if volume:
         return volume
     if not project:
@@ -76,7 +69,6 @@ def _resolve_volume(project: str | None, volume: str | None) -> str:
 
 
 def _resolve_datacenter(volume: str, given: str | None) -> str:
-    """Return the volume's datacenter, from --datacenter or the REST API."""
     if given:
         return given
     key = cloud_secrets.get_runpod_api_key()
@@ -91,37 +83,32 @@ def _resolve_datacenter(volume: str, given: str | None) -> str:
     vols = data if isinstance(data, list) else data.get("networkVolumes", [])
     for v in vols:
         if v.get("id") == volume:
-            dc = v.get("dataCenterId")
-            if dc:
-                return dc
+            if v.get("dataCenterId"):
+                return v["dataCenterId"]
     sys.exit(f"Volume {volume} not found via REST - pass --datacenter explicitly.")
 
 
-def _rclone_env(endpoint: str, dc: str,
-                creds: cloud_secrets.RunPodS3Credentials) -> dict[str, str]:
-    """Environment for an on-the-fly ``:s3:`` remote pointed at RunPod.
-
-    Passing the keys via ``RCLONE_S3_*`` env keeps them out of the process
-    argument list (where any user could read them from ``ps``).
-    """
-    env = dict(os.environ)
-    env.update(
-        RCLONE_S3_PROVIDER="Other",
-        RCLONE_S3_ACCESS_KEY_ID=creds.access_key_id,
-        RCLONE_S3_SECRET_ACCESS_KEY=creds.secret_access_key,
-        RCLONE_S3_ENDPOINT=endpoint,
-        RCLONE_S3_REGION=dc,
-        RCLONE_S3_FORCE_PATH_STYLE="true",
+def _client(endpoint: str, dc: str, creds: cloud_secrets.RunPodS3Credentials):
+    import boto3
+    from botocore.config import Config
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        region_name=dc,                       # RunPod uses the DC id as region
+        aws_access_key_id=creds.access_key_id,
+        aws_secret_access_key=creds.secret_access_key,
+        # Bucket is the volume id; path-style addressing avoids DNS games.
+        config=Config(signature_version="s3v4",
+                      s3={"addressing_style": "path"}),
     )
-    return env
 
 
-def _rclone() -> str:
-    exe = shutil.which("rclone")
-    if not exe:
-        sys.exit("rclone is not on PATH. Install it (https://rclone.org/downloads/) "
-                 "- this project already uses it for R2.")
-    return exe
+def _iter_objects(s3, bucket: str, prefix: str):
+    """Yield (key, size) under prefix, paging through the listing."""
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            yield obj["Key"], obj["Size"]
 
 
 def _human(n: int) -> str:
@@ -133,35 +120,82 @@ def _human(n: int) -> str:
     return f"{n} B"
 
 
-def _list(rclone: str, env: dict, bucket: str, prefix: str) -> int:
-    src = f":s3:{bucket}/{prefix}" if prefix else f":s3:{bucket}"
-    proc = subprocess.run([rclone, "lsjson", "--recursive", src],
-                          env=env, capture_output=True, text=True)
-    if proc.returncode != 0:
-        sys.exit(f"rclone lsjson failed:\n{proc.stderr.strip()}")
-    items = [o for o in json.loads(proc.stdout or "[]") if not o.get("IsDir")]
-    items.sort(key=lambda o: o["Path"])
-    total = 0
-    for o in items:
-        print(f"  {_human(o['Size']):>12}  {prefix.rstrip('/') + '/' if prefix else ''}{o['Path']}")
-        total += o["Size"]
-    print(f"\n{len(items):,} object(s), {_human(total)} under {prefix!r}")
+def _local_for(key: str, target: str, dest: Path) -> Path:
+    """Where a key lands locally: strip the prefix for a folder pull so the
+    subtree mirrors under dest; a single-object pull lands as its basename."""
+    rel = key[len(target):].lstrip("/") if target.endswith("/") else Path(key).name
+    return dest / rel
+
+
+def _do_list(s3, bucket: str, prefix: str) -> int:
+    n = total = 0
+    for key, size in _iter_objects(s3, bucket, prefix):
+        print(f"  {_human(size):>12}  {key}")
+        n += 1
+        total += size
+    print(f"\n{n:,} object(s), {_human(total)} under {prefix!r}")
     return 0
 
 
-def _get(rclone: str, env: dict, bucket: str, target: str, dest: Path) -> int:
+def _do_get(s3, bucket: str, target: str, dest: Path,
+            only: set[str] | None, workers: int) -> int:
     dest.mkdir(parents=True, exist_ok=True)
-    src = f":s3:{bucket}/{target}"
-    # `rclone copy` auto-detects a single object vs a prefix: an object lands as
-    # its basename in dest; a prefix mirrors its subtree under dest.
-    cmd = [rclone, "copy", src, str(dest),
-           "--progress", "--stats-one-line", "--transfers", "8"]
-    print(f"rclone copy {src} -> {dest}")
-    proc = subprocess.run(cmd, env=env)
-    if proc.returncode != 0:
-        sys.exit(f"rclone copy failed (exit {proc.returncode}). "
-                 f"If nothing exists at {target!r}, check the prefix with --list.")
-    print(f"\n✓ pulled into {dest}")
+    todo: list[tuple[str, int, Path]] = []
+    skipped = skip_bytes = 0
+    print(f"Listing {target!r} ...")
+    for key, size in _iter_objects(s3, bucket, target):
+        if only is not None and Path(key).name not in only:
+            continue
+        local = _local_for(key, target, dest)
+        # Skip files already present at the same size — makes the pull resumable
+        # and lets it complete a partial download without re-fetching the rest.
+        if local.is_file() and local.stat().st_size == size:
+            skipped += 1
+            skip_bytes += size
+            continue
+        todo.append((key, size, local))
+
+    if only is not None:
+        print(f"  matched {len(todo) + skipped:,} of the {len(only):,} names requested")
+    print(f"  {skipped:,} already present ({_human(skip_bytes)}), "
+          f"{len(todo):,} to download ({_human(sum(s for _, s, _ in todo))})")
+    if not todo:
+        print("\nNothing to download — everything is already local.")
+        return 0
+
+    done = [0]
+    failed: list[tuple[str, str]] = []
+
+    def _pull(item):
+        key, size, local = item
+        local.parent.mkdir(parents=True, exist_ok=True)
+        tmp = local.with_suffix(local.suffix + ".part")
+        try:
+            s3.download_file(bucket, key, str(tmp))
+            tmp.replace(local)          # atomic: a killed pull never leaves a half file
+        except Exception as e:          # noqa: BLE001 - report, keep going
+            tmp.unlink(missing_ok=True)
+            return key, str(e)
+        return None
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(_pull, it) for it in todo]
+        for f in as_completed(futs):
+            err = f.result()
+            if err:
+                failed.append(err)
+            done[0] += 1
+            if done[0] % 200 == 0 or done[0] == len(todo):
+                print(f"  … {done[0]:,}/{len(todo):,} "
+                      f"({len(failed)} failed)", flush=True)
+
+    if failed:
+        print(f"\n⚠ {len(failed)} file(s) failed; first few:")
+        for key, err in failed[:5]:
+            print(f"    {key}: {err[:100]}")
+        print("Re-run the same command to retry just the ones still missing.")
+        return 1
+    print(f"\n✓ pulled {len(todo):,} file(s) into {dest}")
     return 0
 
 
@@ -180,6 +214,11 @@ def main() -> int:
                    help="Download one object, or everything under a prefix.")
     p.add_argument("--dest", type=Path, default=Path("./pulled"),
                    help="Local directory for --get (default ./pulled).")
+    p.add_argument("--files-from", type=Path,
+                   help="Only pull objects whose basename is listed in this file "
+                        "(one per line) — e.g. the AUM candidate images.")
+    p.add_argument("--workers", type=int, default=16,
+                   help="Parallel downloads for --get (default 16).")
     args = p.parse_args()
 
     if args.save_keys:
@@ -201,12 +240,16 @@ def main() -> int:
     dc = _resolve_datacenter(bucket, args.datacenter)
     endpoint = cloud_secrets.RunPodS3Credentials.endpoint_for(dc)
     print(f"volume {bucket} @ {dc}  ({endpoint})")
-    rclone = _rclone()
-    env = _rclone_env(endpoint, dc, creds)
+    s3 = _client(endpoint, dc, creds)
 
     if args.list_prefix is not None:
-        return _list(rclone, env, bucket, args.list_prefix)
-    return _get(rclone, env, bucket, args.get, args.dest)
+        return _do_list(s3, bucket, args.list_prefix)
+
+    only: set[str] | None = None
+    if args.files_from:
+        only = {ln.strip() for ln in args.files_from.read_text().splitlines() if ln.strip()}
+        print(f"restricting to {len(only):,} named files from {args.files_from}")
+    return _do_get(s3, bucket, args.get, args.dest, only, max(1, args.workers))
 
 
 if __name__ == "__main__":
