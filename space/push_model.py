@@ -255,7 +255,8 @@ Herbarium specimen classifier published by the
 Classes (sample): {sample}
 
 Loaded automatically by the herbarium-id Space — no code change needed.
-"""
+""",
+        encoding="utf-8",
     )
 
 
@@ -284,6 +285,14 @@ def main() -> int:
     p.add_argument("--image-sz", type=int, default=None,
                    help="Image size used at training time. Defaults to the "
                         "checkpoint's hyper_parameters, then 640.")
+    p.add_argument("--temperature", type=float, default=None,
+                   help="Override the calibration temperature (else read from the "
+                        "checkpoint; 1.0 if absent). Use when the fitted T lives in "
+                        "a sidecar temperature.json rather than embedded.")
+    p.add_argument("--val-accuracy", type=float, default=None,
+                   help="Stamp the validation accuracy into config.json when the "
+                        "filename carries no metric (e.g. publishing a `last` "
+                        "checkpoint). The Space shows it in the model description.")
     p.add_argument("--token", help="HF write token (else $HF_TOKEN / token file).")
     p.add_argument("--token-file", type=Path,
                    help="File holding an HF write token (default /workspace/.hf_token).")
@@ -308,6 +317,11 @@ def main() -> int:
     image_sz = args.image_sz or hp.get("image_sz") or 640
     print(f"   model_name={model_name}  label_level={label_level}  image_sz={image_sz}")
 
+    # A `last` checkpoint's filename carries no metric; let the caller stamp the
+    # accuracy they know (e.g. from the sibling acc-* checkpoint of the same epoch).
+    if args.val_accuracy is not None:
+        metrics["val_accuracy"] = args.val_accuracy
+
     # 3. Class names (embedded → sidecar fallback).
     fallback = args.nameslist or (ckpt_path.parent / "nameslist.json")
     nameslist = _extract_nameslist(ckpt, fallback)
@@ -317,10 +331,14 @@ def main() -> int:
     # names too so the Space can offer genus as a first-class answer instead of
     # guessing one from the first word of the species prediction.
     genus_nameslist = _extract_genus_nameslist(ckpt)
+    # Match the genus head by substring, not a fixed prefix: a torch.compile'd
+    # checkpoint carries it as `model._orig_mod.head_genus.*`, which the old
+    # prefix check ("model.head_genus."/"head_genus.") missed — so a perfectly
+    # good hierarchical model would have been published species-only. The Space's
+    # loader strips these prefixes anyway.
     has_genus_head = bool(
         genus_nameslist
-        and any(k.startswith(("model.head_genus.", "head_genus."))
-                for k in ckpt.get("state_dict", {}))
+        and any("head_genus." in k for k in ckpt.get("state_dict", {}))
     )
     if genus_nameslist and not has_genus_head:
         print("   [warn] genus names present but no head_genus.* weights — "
@@ -338,11 +356,18 @@ def main() -> int:
 
     # Calibration temperature fitted at end of training (train_herbarium
     # embeds it in the checkpoint). The Space applies softmax(logits / T);
-    # 1.0 for older checkpoints trained before calibration existed.
+    # 1.0 for older checkpoints trained before calibration existed. --temperature
+    # overrides, for when the calibrated value lives in a sidecar temperature.json
+    # rather than embedded (e.g. publishing a `last` checkpoint whose T wasn't
+    # patched in) — the Space's novelty thresholds assume calibrated confidence,
+    # so shipping T=1.0 by accident quietly skews them.
     try:
         temperature = round(float(ckpt.get("temperature", 1.0)) or 1.0, 4)
     except (TypeError, ValueError):
         temperature = 1.0
+    if args.temperature is not None:
+        print(f"   temperature: overriding embedded {temperature} → {args.temperature}")
+        temperature = round(args.temperature, 4)
     print(f"   temperature={temperature}")
 
     config = {
@@ -369,17 +394,20 @@ def main() -> int:
     slim_mb = slim_path.stat().st_size / 1e6
     print(f"   {orig_mb:,.0f} MB → {slim_mb:,.0f} MB")
 
-    (workdir / "nameslist.json").write_text(json.dumps(nameslist, indent=2))
-    (workdir / "config.json").write_text(json.dumps(config, indent=2))
+    (workdir / "nameslist.json").write_text(json.dumps(nameslist, indent=2),
+                                            encoding="utf-8")
+    (workdir / "config.json").write_text(json.dumps(config, indent=2),
+                                         encoding="utf-8")
     upload_files = ["model.ckpt", "nameslist.json", "config.json", "README.md"]
     if has_genus_head:
         (workdir / "genus_nameslist.json").write_text(
-            json.dumps(genus_nameslist, indent=2))
+            json.dumps(genus_nameslist, indent=2), encoding="utf-8")
         upload_files.append("genus_nameslist.json")
 
     readme_path = workdir / "README.md"
     if args.readme and args.readme.exists():
-        readme_path.write_text(args.readme.read_text())
+        readme_path.write_text(args.readme.read_text(encoding="utf-8"),
+                               encoding="utf-8")
     else:
         _write_model_card(readme_path, display_name=display_name, repo=repo,
                           config=config, nameslist=nameslist)

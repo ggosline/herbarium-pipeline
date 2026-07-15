@@ -171,7 +171,13 @@ def _do_get(s3, bucket: str, target: str, dest: Path,
         local.parent.mkdir(parents=True, exist_ok=True)
         tmp = local.with_suffix(local.suffix + ".part")
         try:
-            s3.download_file(bucket, key, str(tmp))
+            # get_object, not download_file: the latter issues a HeadObject first,
+            # which RunPod's gateway 403s under bulk/concurrency (and 404s on keys
+            # containing '='). Streaming the body is one request and sidesteps both.
+            resp = s3.get_object(Bucket=bucket, Key=key)
+            with open(tmp, "wb") as f:
+                for chunk in resp["Body"].iter_chunks(1 << 20):
+                    f.write(chunk)
             tmp.replace(local)          # atomic: a killed pull never leaves a half file
         except Exception as e:          # noqa: BLE001 - report, keep going
             tmp.unlink(missing_ok=True)
