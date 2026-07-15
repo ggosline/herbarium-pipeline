@@ -493,6 +493,33 @@ def _review_img_url(abs_path: str) -> str:
     return f"{_img_routes[parent]}/{p.name}"
 
 
+def _merge_aum(df, review_dir: Path) -> None:
+    """Attach an ``aum`` column to the predictions frame, in place.
+
+    AUM (Area Under the Margin) ranks *training* specimens by how likely their
+    recorded label is wrong — the lower, the more suspect. It is embedded in the
+    checkpoint, not the predictions, so it reaches the Review tab one of two
+    ways: baked into predictions.csv by a recent identify run (nothing to do
+    here), or as a sibling ``aum.csv`` (fname, aum, …) produced cheaply by
+    ``aum_candidates.py`` straight from the checkpoint. Merging on the file
+    basename keeps it robust to differing path prefixes between the two files.
+    """
+    if "aum" in df.columns:
+        return
+    sidecar = review_dir / "aum.csv"
+    if not sidecar.is_file():
+        return
+    try:
+        aum = _pd.read_csv(sidecar, usecols=lambda c: c in ("fname", "aum"))
+        if "fname" not in aum.columns or "aum" not in aum.columns:
+            return
+        aum["_base"] = aum["fname"].map(lambda f: Path(str(f)).name)
+        aum = aum.drop_duplicates("_base").set_index("_base")["aum"]
+        df["aum"] = df["fname"].map(lambda f: Path(str(f)).name).map(aum)
+    except Exception as exc:  # a malformed sidecar must not break loading
+        print(f"[review] could not merge aum.csv: {exc}")
+
+
 async def _launch(cmd: list[str], on_done=None, extra_env: dict | None = None) -> None:
     global _proc
     if not cmd:
@@ -1968,12 +1995,14 @@ def _build_review() -> tuple:
         filter_sel = ui.select(
             {"all": "All", "indets": "Indets only",
              "flagged": "Flagged only", "misid": "Misidentified (pred ≠ true)",
+             "mislabels": "Possible mislabels (low AUM)",
              "high_conf": "High confidence (≥ 90%)",
              "sparse": "Sparse only (true species below threshold)"},
             value="all", label="Show"
         ).classes("w-52").props("dense outlined")
         sort_sel = ui.select(
             {"conf_desc": "Confidence ↓", "conf_asc": "Confidence ↑",
+             "aum_asc": "AUM ↑ (most suspect first)",
              "species": "Predicted name A–Z"},
             value="conf_desc", label="Sort by"
         ).classes("w-52").props("dense outlined")
@@ -2192,9 +2221,24 @@ def _build_review() -> tuple:
         except (TypeError, ValueError):
             geo_str = ""
 
+        # AUM: present only for training specimens. Low/negative = the label is
+        # a mislabel candidate; colour it as a warning so the eye lands on it.
+        aum_line = ""
+        aum_raw = row.get("aum", None)
+        try:
+            if aum_raw is not None and float(aum_raw) == float(aum_raw):  # not NaN
+                av = float(aum_raw)
+                colour = "#d32f2f" if av < 0 else ("#f57c00" if av < 2 else "#888")
+                hint = " — possible mislabel" if av < 2 else ""
+                aum_line = (f"<b>AUM:</b> <span style='color:{colour}'>{av:+.2f}"
+                            f"{hint}</span><br>")
+        except (TypeError, ValueError):
+            pass
+
         info_html.set_content(
             f"<div style='font-size:13px;line-height:1.6'>"
             f"<b>Confidence:</b> {conf_val:.1%}{flag_badge}<br>"
+            + aum_line
             + level_line
             + (f"<small style='color:#888'>{source}"
                + (f" | {cat}" if cat and cat != "nan" else "")
@@ -2263,8 +2307,16 @@ def _build_review() -> tuple:
                             true_str.ne(df[sp_col].astype(str).str.strip()))
                 else:
                     mask = _pd.Series(False, index=df.index)
-        elif filt == "high_conf":
-            mask = df[conf_col].astype(float) >= 0.90
+        elif filt == "mislabels":
+            # Candidate mis-determinations: training specimens whose recorded
+            # label the model could only fit by memorising it (low/negative
+            # AUM). Only training specimens carry an AUM value, so notna() is
+            # the whole selector; the ascending sort below puts the most
+            # suspect first.
+            if "aum" in df.columns:
+                mask = df["aum"].notna()
+            else:
+                mask = _pd.Series(False, index=df.index)
         elif filt == "sparse":
             if "sparse" in df.columns:
                 mask = df["sparse"].astype(str).str.lower().isin(("true", "1"))
@@ -2281,7 +2333,13 @@ def _build_review() -> tuple:
 
         view = df[mask].copy()
         sort = sort_sel.value
-        if sort == "conf_desc":
+        # The mislabels view is only meaningful ordered by AUM, so default it
+        # there even if the sort dropdown is still on its confidence default.
+        if filt == "mislabels" and sort in ("conf_desc", "conf_asc"):
+            sort = "aum_asc"
+        if sort == "aum_asc" and "aum" in view.columns:
+            view = view.sort_values("aum", ascending=True, na_position="last")
+        elif sort == "conf_desc":
             view = view.sort_values(conf_col, ascending=False)
         elif sort == "conf_asc":
             view = view.sort_values(conf_col, ascending=True)
@@ -2354,6 +2412,7 @@ def _build_review() -> tuple:
             df = _pd.read_csv(path)
             if "indet"   not in df.columns: df["indet"]   = False
             if "flagged" not in df.columns: df["flagged"] = False
+            _merge_aum(df, Path(path).parent)
             _st["df"] = df
             n_total = len(df)
             n_indet = df["indet"].astype(str).str.lower().isin(("true", "1")).sum()
@@ -5520,6 +5579,18 @@ def carousel_page():
             match = (f" <span style='color:{'#66bb6a' if ok else '#ef5350'}'>"
                      f"{'✓' if ok else '✗'}</span>")
 
+        aum_line = ""
+        aum_raw = row.get("aum", None)
+        try:
+            if aum_raw is not None and float(aum_raw) == float(aum_raw):
+                av = float(aum_raw)
+                colour = "#ef5350" if av < 0 else ("#ffa726" if av < 2 else "#888")
+                hint = " — possible mislabel" if av < 2 else ""
+                aum_line = (f"<div style='font-size:16px'><b>AUM:</b> "
+                            f"<span style='color:{colour}'>{av:+.2f}{hint}</span></div>")
+        except (TypeError, ValueError):
+            pass
+
         info_html.set_content(
             f"<div style='line-height:1.8'>"
             f"<div style='font-size:22px;font-weight:700;font-style:italic;"
@@ -5527,6 +5598,7 @@ def carousel_page():
             f"<div style='font-size:16px'><b>Confidence:</b> {conf:.1%}{match}</div>"
             + (f"<div style='font-size:16px'><b>True:</b> <i>{true}</i></div>"
                if true and true != "nan" else "")
+            + aum_line
             + f"<div style='color:#888;font-size:13px;margin-top:4px'>"
             f"{Path(fname).name}</div>"
             f"</div>"

@@ -416,21 +416,84 @@ def _topk_dict(probs: torch.Tensor, names: list[str]) -> dict[str, float]:
             if i < len(names)}
 
 
+# Novelty thresholds on the *calibrated* top-1 confidence. On the African
+# Rubiaceae run, held-out (in-distribution) species confidence averaged 0.887,
+# vs 0.51 for a novel species and 0.40 for a novel genus — so a species cut
+# near 0.6 cleanly separates "known" from "novel", and a genus cut near 0.5
+# does the same at genus rank (see docs/novelty_and_mislabel_detection.md §3-4).
+# Overridable per model via config.json so a future push can inject values
+# fitted on that model's own held-out split.
+_OOD_SPECIES_THR_DEFAULT = 0.60
+_OOD_GENUS_THR_DEFAULT = 0.50
+
+
+def _novelty_md(species_conf: float, genus_conf: float | None,
+                top_genus: str | None, cfg: dict[str, Any]) -> str:
+    """A plain-language novelty verdict from the two free signals the write-up
+    validates (§4.3): max-softmax and the trained genus head's confidence.
+
+    The logic mirrors the paper's set-A / set-B split. A new *Psychotria* still
+    IS a *Psychotria*: the genus head is right to be confident, and only the
+    species head has nowhere to put it. So high-genus/low-species reads as a
+    likely *novel species in a known genus*, while low genus confidence reads
+    as a genuinely out-of-distribution taxon.
+    """
+    sp_thr = float(cfg.get("ood_species_conf_thr", _OOD_SPECIES_THR_DEFAULT))
+    ge_thr = float(cfg.get("ood_genus_conf_thr", _OOD_GENUS_THR_DEFAULT))
+
+    if genus_conf is not None and top_genus:
+        if genus_conf < ge_thr:
+            return (
+                f"### 🔶 Possibly out-of-distribution\n"
+                f"Even the **genus** is uncertain (top genus *{top_genus}*, "
+                f"{genus_conf:.0%}). This may be a taxon — or a family — the model "
+                f"has never seen. Treat every prediction here with caution."
+            )
+        if species_conf < sp_thr:
+            return (
+                f"### 🟡 Possibly a novel species\n"
+                f"The **genus is recognised** (*{top_genus}*, {genus_conf:.0%}), but "
+                f"species confidence is low ({species_conf:.0%}) — this may be a "
+                f"species not represented in the model. **The genus is the more "
+                f"trustworthy answer.**"
+            )
+        return (
+            f"### ✅ Recognised taxon\n"
+            f"Confident at both ranks (genus *{top_genus}* {genus_conf:.0%}, "
+            f"species {species_conf:.0%}). Consistent with a taxon the model was "
+            f"trained on."
+        )
+
+    # No genus head — fall back to species max-softmax alone.
+    if species_conf < sp_thr:
+        return (
+            f"### 🟡 Low confidence ({species_conf:.0%})\n"
+            f"This may be a taxon the model has not seen — the top species is a "
+            f"best guess, not a recognition."
+        )
+    return (f"### ✅ Recognised ({species_conf:.0%})\n"
+            f"Consistent with a taxon the model was trained on.")
+
+
 def identify(image: Image.Image, model_choice: str,
              lat: float | None, lon: float | None):
-    """Returns (species predictions, genus panel update, excluded-taxa notice).
+    """Returns (species preds, genus panel, novelty verdict, excluded notice).
 
     Both ranks come from one backbone pass, so there is no reason to make the
     user choose: a specimen can be a confident genus and an uncertain species,
     and seeing both at once is the whole point. The genus panel stays hidden
     for models without a genus head.
+
+    The novelty verdict answers the question a softmax classifier otherwise
+    hides — "is this even a taxon I know?" — since it must file every input
+    under some trained class, however alien.
     """
     blank = gr.update(visible=False)
     if image is None:
-        return {}, blank, ""
+        return {}, blank, blank, ""
     entry = MODELS.get(model_choice)
     if entry is None:
-        return {}, blank, ""
+        return {}, blank, blank, ""
     repo = entry["repo"]
     bundle = _load_from_hub(repo)
     cfg = bundle["config"]
@@ -440,13 +503,18 @@ def identify(image: Image.Image, model_choice: str,
     geo = _encode_coords(lat, lon) if bundle["use_location"] else None
     probs, genus_probs = _infer_on_gpu(repo, x, geo)
     preds = _topk_dict(probs.squeeze(0), bundle["nameslist"])
+    species_conf = float(probs.squeeze(0).max())
 
     notice = _excluded_md(bundle.get("excluded") or {})
     genus_names = bundle.get("genus_nameslist") or []
     if genus_probs is None or not genus_names:
-        return preds, blank, notice
+        novelty = _novelty_md(species_conf, None, None, cfg)
+        return preds, blank, gr.update(value=novelty, visible=True), notice
     genus_preds = _topk_dict(genus_probs.squeeze(0), genus_names)
-    return preds, gr.update(value=genus_preds, visible=True), notice
+    top_genus, genus_conf = next(iter(genus_preds.items()))
+    novelty = _novelty_md(species_conf, genus_conf, top_genus, cfg)
+    return (preds, gr.update(value=genus_preds, visible=True),
+            gr.update(value=novelty, visible=True), notice)
 
 
 def _model_info(model_choice: str) -> str:
@@ -548,6 +616,10 @@ with gr.Blocks(title="Herbarium ID", js=_CAPTURE_JS) as demo:
                                        minimum=-180, maximum=180)
             run = gr.Button("Identify", variant="primary")
         with gr.Column(scale=1):
+            # Novelty verdict first: whether to trust the lists below at all is
+            # the thing to read before the ranked names themselves. Hidden until
+            # an identification produces one.
+            novelty_out = gr.Markdown(visible=False)
             out = gr.Label(num_top_classes=TOPK, label="Species — top 5")
             # Hidden until a model with a trained genus head produces a result.
             # Genus is the model's most reliable answer, so it is shown beside
@@ -561,7 +633,7 @@ with gr.Blocks(title="Herbarium ID", js=_CAPTURE_JS) as demo:
     search.change(fn=_filter_models, inputs=[search, model_dd], outputs=model_dd)
     refresh.click(fn=_refresh_models, outputs=[model_dd, info, search])
     run.click(fn=identify, inputs=[img, model_dd, lat_in, lon_in],
-              outputs=[out, genus_out, excluded_note])
+              outputs=[out, genus_out, novelty_out, excluded_note])
 
 
 # ---------------------------------------------------------------------------

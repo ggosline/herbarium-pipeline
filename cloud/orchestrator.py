@@ -1282,6 +1282,10 @@ class CloudOrchestrator:
         wishlist: list[tuple[str, Path]] = [
             (f"{REMOTE_DATA}/nameslist.json",            local_dir / "nameslist.json"),
             (f"{REMOTE_DATA}/predictions/predictions.csv", local_dir / "predictions.csv"),
+            # AUM ranking sidecar (aum_candidates.py --top 0). Sits next to
+            # predictions.csv so the Review tab merges it for the "possible
+            # mislabels" view; quietly skipped on runs that didn't produce one.
+            (f"{REMOTE_DATA}/predictions/aum.csv",       local_dir / "aum.csv"),
             (f"{REMOTE_DATA}/specsin.csv",               local_dir / "specsin.csv"),
         ]
 
