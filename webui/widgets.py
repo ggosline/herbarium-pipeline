@@ -8,9 +8,15 @@ what a file picker has to do.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from nicegui import app, ui
+
+# A single directory can hold ~100k files here (the review images folder). We
+# never render that many list items, and we must not stat every entry: cap the
+# files shown and lean on os.scandir's cached dir/file type.
+_MAX_FILES_SHOWN = 500
 
 
 # ── tiny helpers ──────────────────────────────────────────────────────────
@@ -150,12 +156,29 @@ class FilePicker(ui.dialog):
 
     def _render(self) -> None:
         self._loc.value = str(self._cur)
-        entries: list[Path] = []
+        # os.scandir carries each entry's dir/file type from the directory read,
+        # so entry.is_dir() is (almost always) free — unlike Path.is_dir(), which
+        # stats. Sorting Path objects by a .is_dir() key over a 100k-file folder
+        # fired 100k stats on the event-loop thread and dropped the connection.
+        want_files = self.mode in ("file", "save")
+        dirs: list[os.DirEntry] = []
+        files: list[os.DirEntry] = []
         try:
-            entries = sorted(self._cur.iterdir(),
-                             key=lambda p: (not p.is_dir(), p.name.lower()))
+            with os.scandir(self._cur) as it:
+                for e in it:
+                    try:
+                        if e.is_dir():
+                            dirs.append(e)
+                        elif want_files:
+                            files.append(e)
+                    except OSError:
+                        continue
         except OSError:
             pass
+        dirs.sort(key=lambda e: e.name.lower())
+        files.sort(key=lambda e: e.name.lower())
+        hidden = max(0, len(files) - _MAX_FILES_SHOWN)
+        files = files[:_MAX_FILES_SHOWN]
 
         self._area.clear()
         # Build the list inside the scroll area's own slot explicitly.
@@ -164,23 +187,30 @@ class FilePicker(ui.dialog):
         with self._area:
             lst = ui.list().props("dense separator").classes("w-full")
         with lst:
-            for e in entries:
-                if e.is_dir():
-                    with ui.item(on_click=lambda d=e: self._into(d)).props("clickable v-ripple"):
-                        with ui.item_section().props("avatar"):
-                            ui.icon("folder").classes("text-amber-6")
-                        with ui.item_section():
-                            ui.item_label(e.name)
-                elif e.is_file() and self.mode in ("file", "save"):
-                    if self.mode == "save":
-                        action = lambda f=e: setattr(self._fname_inp, "value", f.name)
-                    else:
-                        action = lambda f=e: self.submit(str(f))
-                    with ui.item(on_click=action).props("clickable v-ripple"):
-                        with ui.item_section().props("avatar"):
-                            ui.icon("description").classes("text-blue-grey-4")
-                        with ui.item_section():
-                            ui.item_label(e.name)
+            for e in dirs:
+                with ui.item(on_click=lambda p=e.path: self._into(Path(p))
+                             ).props("clickable v-ripple"):
+                    with ui.item_section().props("avatar"):
+                        ui.icon("folder").classes("text-amber-6")
+                    with ui.item_section():
+                        ui.item_label(e.name)
+            for e in files:
+                if self.mode == "save":
+                    action = lambda n=e.name: setattr(self._fname_inp, "value", n)
+                else:
+                    action = lambda p=e.path: self.submit(p)
+                with ui.item(on_click=action).props("clickable v-ripple"):
+                    with ui.item_section().props("avatar"):
+                        ui.icon("description").classes("text-blue-grey-4")
+                    with ui.item_section():
+                        ui.item_label(e.name)
+            if hidden:
+                with ui.item():
+                    with ui.item_section():
+                        ui.item_label(
+                            f"… {hidden:,} more files not shown — type the full "
+                            f"path above and press Enter"
+                        ).classes("text-grey-6 italic")
 
     def _up(self) -> None:
         self._cur = self._cur.parent
