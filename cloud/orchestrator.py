@@ -1286,6 +1286,12 @@ class CloudOrchestrator:
             # predictions.csv so the Review tab merges it for the "possible
             # mislabels" view; quietly skipped on runs that didn't produce one.
             (f"{REMOTE_DATA}/predictions/aum.csv",       local_dir / "aum.csv"),
+            # Taxa dropped as too sparse to train — the Review tab lists them
+            # (any specimen of these is forced to the nearest trained class).
+            (f"{REMOTE_DATA}/predictions/excluded_species.json",
+             local_dir / "excluded_species.json"),
+            (f"{REMOTE_DATA}/predictions/excluded_species.csv",
+             local_dir / "excluded_species.csv"),
             (f"{REMOTE_DATA}/specsin.csv",               local_dir / "specsin.csv"),
         ]
 

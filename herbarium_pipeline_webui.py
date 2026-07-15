@@ -1985,10 +1985,19 @@ def _build_review() -> tuple:
         ).classes("text-caption text-grey-6 ml-48")
     summary_lbl = ui.label("").classes("text-caption text-grey-7 mt-1")
     # Notice: taxa the model can't predict (dropped as too sparse at train time).
-    # identify writes excluded_species.json next to predictions.csv.
+    # identify writes excluded_species.json next to predictions.csv. The one-line
+    # caption is the summary; the expansion holds the *whole* list — on a long
+    # tail that's ~1,300 taxa, so "+N more" would hide nearly all of it, and the
+    # desktop review is exactly where a curator wants to see which taxa the model
+    # can't predict (any specimen of these is forced to the nearest trained class).
     excluded_lbl = (ui.label("").classes("text-caption text-orange-9 mt-1")
                     .style("white-space:normal;line-height:1.3"))
     excluded_lbl.set_visibility(False)
+    excluded_exp = (ui.expansion("Show all excluded taxa", icon="list")
+                    .props("dense").classes("w-full"))
+    excluded_exp.set_visibility(False)
+    with excluded_exp:
+        excluded_body = ui.html("")
 
     def _show_excluded(review_dir: Path) -> None:
         f = review_dir / "excluded_species.json"
@@ -2000,15 +2009,23 @@ def _build_review() -> tuple:
             taxa, rank = {}, "species"
         if not taxa:
             excluded_lbl.set_visibility(False)
+            excluded_exp.set_visibility(False)
             return
         names = sorted(taxa, key=lambda n: taxa[n])   # rarest first
-        shown = ", ".join(f"{n} ({taxa[n]})" for n in names[:12])
-        more  = f"  +{len(names) - 12} more" if len(names) > 12 else ""
         excluded_lbl.set_text(
             f"⚠ {len(taxa)} {rank} not in this model — too few images to train, "
-            f"so their specimens are forced to the nearest trained class: "
-            f"{shown}{more}")
+            f"so their specimens are forced to the nearest trained class.")
+        rows = "".join(
+            f"<div style='break-inside:avoid'><i>{n}</i> "
+            f"<span style='color:#9e9e9e'>({taxa[n]})</span></div>" for n in names)
+        excluded_body.set_content(
+            "<div style='max-height:340px;overflow:auto;columns:3;column-gap:28px;"
+            "font-size:12px;line-height:1.6;padding:4px 2px'>" + rows + "</div>"
+            "<div style='font-size:11px;color:#9e9e9e;margin-top:6px'>"
+            "Rarest first; (n) = images available (below the sparse threshold). "
+            "Full export in excluded_species.csv beside predictions.csv.</div>")
         excluded_lbl.set_visibility(True)
+        excluded_exp.set_visibility(True)
 
     _section("Filter & Sort")
     with ui.row().classes("w-full items-center gap-4 flex-wrap"):
