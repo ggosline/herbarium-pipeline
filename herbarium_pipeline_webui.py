@@ -3924,17 +3924,30 @@ def _make_progress_cb(prefix: str):
     return cb
 
 
-def _wrap_cloud(coro_factory):
+def _wrap_cloud(coro_factory, *, force: bool = False):
     """Run an orchestrator coroutine as the single in-flight cloud task.
     ui.notify is unsafe inside a background task (no slot context); the body
     reports through _cloud_log instead.
+
+    ``force=True`` displaces whatever is in the in-flight slot instead of
+    refusing. Use it for deliberate "start over" actions (Provision, Attach):
+    the common reason the slot is occupied is a *follower* task wedged on a
+    dead pod's SSH channel — one that ``task.cancel()`` can't unstick because
+    it's blocked in a background thread read. Refusing then traps the user
+    ("a step is already running" when nothing is). Displacing is safe: pod-side
+    steps run detached and survive; we only stop *watching* an old one, and the
+    next Run re-attaches. The orphaned task errors out on its own dead socket.
     """
     if _cloud_running():
-        ui.notify("A cloud step is already running.", type="warning")
-        _cloud_log("⚠ A cloud step is already in flight — click 'Cancel step' to abort it, "
-                   "then retry. (If the server was not restarted, a browser refresh leaves "
-                   "the old task running in the background.)\n")
-        return
+        if not force:
+            ui.notify("A cloud step is already running.", type="warning")
+            _cloud_log("⚠ A cloud step is already in flight — click 'Cancel step' to abort it, "
+                       "then retry. (If the server was not restarted, a browser refresh leaves "
+                       "the old task running in the background.)\n")
+            return
+        _cloud["task"].cancel()
+        _cloud_log("• Displacing the previous in-flight task to start this one "
+                   "(a step already on the pod keeps running and can be re-attached).\n")
     async def _run():
         try:
             await coro_factory()
@@ -4164,6 +4177,10 @@ def _cloud_env_identify() -> dict[str, str]:
 
 async def _do_provision(purpose: str | None = None) -> None:
     """Provision (or reuse) a pod for the requested purpose, and sync code."""
+    # First visible line, before any slow network call — otherwise a successful
+    # Provision looks like a no-op until orch.provision() gets deep enough to log.
+    _cloud_log("Provisioning a pod (reuse if one is live, else create — "
+               "this can take 1–2 min)…")
     orch = _ensure_orch()
     if orch is None:
         return
@@ -4735,7 +4752,7 @@ def _build_pod_strip() -> None:
 
         # ── Primary action: Provision ────────────────────────────────────
         ui.button("Provision", icon="cloud_upload",
-                  on_click=lambda: _wrap_cloud(_do_provision))\
+                  on_click=lambda: _wrap_cloud(_do_provision, force=True))\
             .props("dense color=teal-3 unelevated")\
             .tooltip("Auto-provision a pod: offers RunPod the GPU fallback list "
                      "(first free one wins), creates/reuses the volume, syncs "
@@ -4771,7 +4788,7 @@ def _build_pod_strip() -> None:
                                      "and starts the idle watchdog — then every "
                                      "step works as with an auto-provisioned pod.")
                         ui.button("Attach", icon="link",
-                                  on_click=lambda: _wrap_cloud(_do_attach))\
+                                  on_click=lambda: _wrap_cloud(_do_attach, force=True))\
                             .props("dense color=teal unelevated")\
                             .tooltip("Connect to the pod whose ID is in the box.")
                     ui.separator()
