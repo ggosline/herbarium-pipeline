@@ -730,9 +730,13 @@ class LitHerbarium(pl.LightningModule):
         total = len(self.data.train_files)
         keep  = (total // (batch * world)) * (batch * world)
         train_files  = self.data.train_files[:keep]
-        # When use_location is on, pass sample indices as DALI "labels" so _step()
-        # can look up the real class label and coordinates from the registered buffers.
-        if self.use_location:
+        # Whenever _step() indexes by sample (geo lookup OR AUM), DALI must hand it
+        # the sample's ROW INDEX as the "label"; _step() then reads the real class
+        # out of *_labels_t. This must match _step()'s own condition exactly —
+        # gating on use_location alone silently fed class indices while _step()
+        # treated them as row indices (AUM-on/location-off), scrambling the
+        # class↔image mapping and collapsing validation accuracy to chance.
+        if self._index_batches:
             train_dali_labels = list(range(keep))
             valid_dali_labels = list(range(len(self.data.valid_files)))
         else:
