@@ -23,6 +23,7 @@ Usage:
 import argparse
 import json
 import math
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -215,15 +216,53 @@ class _GeoModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 def resolve_checkpoint(path: Path) -> Path:
-    """If path is a directory, return the most recently modified .ckpt inside it."""
-    if path.is_dir():
-        ckpts = sorted(path.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if not ckpts:
-            raise FileNotFoundError(f"No .ckpt files found in {path}")
-        chosen = ckpts[0]
-        print(f"  Auto-selected checkpoint: {chosen.name}")
+    """If path is a directory, pick the best checkpoint in it.
+
+    Preference order:
+      1. highest val_Accuracy among ``acc-*`` checkpoints (what we train for);
+      2. lowest valid_loss among ``epoch=*`` checkpoints;
+      3. most recently modified, as a last resort.
+
+    Stage-1 checkpoints (``s1-*``) are never auto-selected: they are
+    frozen-backbone intermediates at roughly half the final accuracy.
+
+    This used to be "most recently modified", which is unsafe — mtime records
+    when a file was last *written*, not how good it is. Anything that rewrites a
+    checkpoint in place (embedding a temperature, say) reorders the ranking, and
+    a stage-1 checkpoint could win. Nothing in the output would have said so.
+    """
+    if not path.is_dir():
+        return path
+
+    ckpts = [p for p in path.glob("*.ckpt") if not p.name.startswith("s1-")]
+    if not ckpts:
+        raise FileNotFoundError(f"No usable .ckpt files found in {path}")
+
+    def _metric(p: Path, key: str) -> float | None:
+        m = re.search(rf"{key}=([0-9.]+)", p.name)
+        if not m:
+            return None
+        try:
+            return float(m.group(1).rstrip("."))
+        except ValueError:
+            return None
+
+    by_acc = [(v, p) for p in ckpts if (v := _metric(p, "val_Accuracy")) is not None]
+    if by_acc:
+        v, chosen = max(by_acc, key=lambda t: t[0])
+        print(f"  Auto-selected checkpoint: {chosen.name} (best val_Accuracy={v})")
         return chosen
-    return path
+
+    by_loss = [(v, p) for p in ckpts if (v := _metric(p, "valid_loss")) is not None]
+    if by_loss:
+        v, chosen = min(by_loss, key=lambda t: t[0])
+        print(f"  Auto-selected checkpoint: {chosen.name} (lowest valid_loss={v})")
+        return chosen
+
+    chosen = max(ckpts, key=lambda p: p.stat().st_mtime)
+    print(f"  Auto-selected checkpoint: {chosen.name} (most recent; no metric in "
+          f"any filename)")
+    return chosen
 
 
 def derive_class_counts(df_all: pd.DataFrame, nameslist: list[str]) -> list[int]:
@@ -639,11 +678,17 @@ def run_inference(
             if temperature != 1.0:
                 genus_logits = genus_logits / temperature
             g_probs = torch.softmax(genus_logits, dim=1)
-            g_top_p, g_top_i = torch.max(g_probs, dim=1)
+            # Top-k, not top-1: the genus head is the model's most accurate
+            # output (~97% vs ~89% at species), so it deserves a ranked list of
+            # its own rather than being reduced to a single label. Note there
+            # are far fewer genera than species, so k may be clamped.
+            gk = min(top_k, g_probs.shape[1])
+            g_top_p, g_top_i = torch.topk(g_probs, k=gk, dim=1)
             all_genus_preds.extend(g_top_i.cpu().tolist())
             all_genus_probs.extend(g_top_p.cpu().tolist())
 
-    # Genus lists are empty unless the model carries a genus head.
+    # Genus lists are empty unless the model carries a genus head. When present
+    # each element is a top-k list, parallel to all_topk_preds/probs.
     return all_topk_preds, all_topk_probs, all_genus_preds, all_genus_probs
 
 
@@ -799,8 +844,13 @@ def identify(args):
                 species_to_family[str(sp)] = str(fam)
                 genus_to_family.setdefault(str(sp).split()[0], str(fam))
 
-    def _level_columns(pred_name: str, genus_idx: int | None = None,
-                       genus_prob: float | None = None) -> dict:
+    def _genus_name(idx: int | None) -> str:
+        if idx is None or not genus_nameslist or idx >= len(genus_nameslist):
+            return ""
+        return genus_nameslist[idx]
+
+    def _level_columns(pred_name: str, genus_k: list | None = None,
+                       genus_p: list | None = None) -> dict:
         """Map a class-index name (whatever rank the model predicts at) to
         the right pred_* / true_*-companion columns.
 
@@ -809,6 +859,9 @@ def identify(args):
         optimised for genus directly and is measurably better at it. The two can
         disagree; genus_agrees records that, and a disagreement is a useful
         "this specimen is odd" signal.
+
+        genus_k / genus_p are the genus head's top-k index / probability lists;
+        this uses only the head of each.
         """
         if label_level == "family":
             return {"pred_species": "", "pred_genus": "",
@@ -821,14 +874,30 @@ def identify(args):
         cols = {"pred_species": pred_name,
                 "pred_genus":   from_species,
                 "pred_family":  species_to_family.get(pred_name, "")}
-        if genus_nameslist and genus_idx is not None:
-            g = genus_nameslist[genus_idx] if genus_idx < len(genus_nameslist) else ""
+        if genus_nameslist and genus_k:
+            g = _genus_name(genus_k[0])
             cols["pred_genus"]    = g
-            cols["genus_conf"]    = round(float(genus_prob or 0.0), 4)
+            cols["genus_conf"]    = round(float((genus_p or [0.0])[0]), 4)
             cols["genus_agrees"]  = (g == from_species)
             cols["pred_family"]   = (species_to_family.get(pred_name, "")
                                      or genus_to_family.get(g, ""))
         return cols
+
+    def _genus_topk_columns(genus_k: list | None, genus_p: list | None) -> dict:
+        """gtop{k}_name / gtop{k}_prob — the genus head's own ranked list.
+
+        Distinct from top{k}_genus, which is the genus *of* the k-th species
+        guess. The two answer different questions: top{k}_genus marginalises the
+        species head (and only over its top 5), whereas these come from the head
+        actually trained to predict genus.
+        """
+        if not (genus_nameslist and genus_k):
+            return {}
+        out: dict = {}
+        for k, (gi, gp) in enumerate(zip(genus_k, genus_p or []), 1):
+            out[f"gtop{k}_name"] = _genus_name(gi)
+            out[f"gtop{k}_prob"] = round(float(gp), 4)
+        return out
 
     def _topk_columns(preds_k, probs_k) -> dict:
         """Per-rank top-k columns mirror the pred_* convention.
@@ -919,6 +988,7 @@ def identify(args):
                 "indet":          True,
                 "flagged":        False,
                 **_topk_columns(preds_k, probs_k),
+                **_genus_topk_columns(gi, gp),
             }
             results.append(entry)
         print(f"  → Wrote {len(df_indet):,} indet predictions to predictions.csv")
@@ -980,6 +1050,7 @@ def identify(args):
                 "indet":          False,
                 "flagged":        flagged,
                 **_topk_columns(preds_k, probs_k),
+                **_genus_topk_columns(gi, gp),
             }
             results.append(entry)
 

@@ -475,22 +475,69 @@ def _reset_wandb() -> None:
         except RuntimeError:
             pass  # client navigated away
 
-# Static-file routes registered for the Review image carousel.
-# Keyed by directory path so each dir is mounted only once per server session.
-_img_routes: dict[str, str] = {}
+# Review images are served through ONE route registered at import (below), not
+# by mounting each folder on demand. NiceGUI 3.x's app.add_static_files() adds
+# an ASGI mount, which must happen before the server starts; calling it lazily
+# while showing the first image (after startup) raised at the ASGI layer, dropped
+# the socket, and reloaded the page to the start tab. A pre-registered endpoint
+# that streams a file by path sidesteps that and handles large scans by streaming.
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".tif", ".tiff", ".bmp"}
+# Directories the review flow has explicitly surfaced — the serve route refuses
+# anything outside them, so this isn't an open read-any-file endpoint.
+_review_roots: set[str] = set()
+
+
+@app.get("/review_file")
+def _serve_review_file(p: str):
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+    try:
+        rp = Path(p).resolve()
+    except OSError:
+        raise HTTPException(status_code=404)
+    if rp.suffix.lower() not in _IMG_EXTS or not rp.is_file():
+        raise HTTPException(status_code=404)
+    if not any(rp.is_relative_to(root) for root in _review_roots):
+        raise HTTPException(status_code=403)
+    return FileResponse(str(rp))
 
 
 def _review_img_url(abs_path: str) -> str:
-    """Return a served URL for abs_path, mounting its parent dir if needed."""
+    """Return a served URL for abs_path via the /review_file endpoint."""
+    from urllib.parse import quote
     p = Path(abs_path)
     if not p.is_file():
         return ""
-    parent = str(p.parent)
-    if parent not in _img_routes:
-        route = f"/review_img/{len(_img_routes)}"
-        app.add_static_files(route, parent)
-        _img_routes[parent] = route
-    return f"{_img_routes[parent]}/{p.name}"
+    _review_roots.add(str(p.parent.resolve()))
+    return f"/review_file?p={quote(str(p.resolve()))}"
+
+
+def _merge_aum(df, review_dir: Path) -> None:
+    """Attach an ``aum`` column to the predictions frame, in place.
+
+    AUM (Area Under the Margin) ranks *training* specimens by how likely their
+    recorded label is wrong — the lower, the more suspect. It is embedded in the
+    checkpoint, not the predictions, so it reaches the Review tab one of two
+    ways: baked into predictions.csv by a recent identify run (nothing to do
+    here), or as a sibling ``aum.csv`` (fname, aum, …) produced cheaply by
+    ``aum_candidates.py`` straight from the checkpoint. Merging on the file
+    basename keeps it robust to differing path prefixes between the two files.
+    """
+    import pandas as _pd  # lazy, matching the rest of this module (slim install)
+    if "aum" in df.columns:
+        return
+    sidecar = review_dir / "aum.csv"
+    if not sidecar.is_file():
+        return
+    try:
+        aum = _pd.read_csv(sidecar, usecols=lambda c: c in ("fname", "aum"))
+        if "fname" not in aum.columns or "aum" not in aum.columns:
+            return
+        aum["_base"] = aum["fname"].map(lambda f: Path(str(f)).name)
+        aum = aum.drop_duplicates("_base").set_index("_base")["aum"]
+        df["aum"] = df["fname"].map(lambda f: Path(str(f)).name).map(aum)
+    except Exception as exc:  # a malformed sidecar must not break loading
+        print(f"[review] could not merge aum.csv: {exc}")
 
 
 async def _launch(cmd: list[str], on_done=None, extra_env: dict | None = None) -> None:
@@ -1827,12 +1874,31 @@ def _build_review() -> tuple:
             )
 
         if level == "genus":
+            # Prefer the trained genus head's own ranked list (gtop*). It is a
+            # different — and far better — answer than marginalising the species
+            # head: ~97% vs ~89% top-1. Only fall back to summing the species
+            # top-5 by first word for CSVs written before identify emitted these,
+            # and say so, because that fallback silently truncates at 5 species.
+            if "gtop1_name" in row.index and str(row.get("gtop1_name", "")) not in ("", "nan"):
+                items = []
+                for k in range(1, 6):
+                    raw = row.get(f"gtop{k}_name", "")
+                    name = "" if (raw != raw or raw is None) else str(raw)
+                    if not name or name == "nan":
+                        break
+                    items.append((name, float(row.get(f"gtop{k}_prob", 0) or 0)))
+                return _render(items, "Genus (genus head)", italic=True)
+
             agg: dict[str, float] = {}
             for name, prob in _top5_items(row):
                 g = name.split()[0] if name and name != "nan" else name
                 agg[g] = agg.get(g, 0) + prob
-            return _render(sorted(agg.items(), key=lambda x: x[1], reverse=True),
-                           "Genus", italic=True)
+            return (_render(sorted(agg.items(), key=lambda x: x[1], reverse=True),
+                            "Genus (from species head)", italic=True)
+                    + "<div style='font-size:11px;color:#888;padding:2px 6px'>"
+                      "Marginalised from the top-5 species — this CSV predates the "
+                      "genus-head columns. Re-run Identify for the genus head's own "
+                      "predictions.</div>")
 
         if level == "family":
             # Family-level CSV: top{k}_name already holds family names.
@@ -1919,10 +1985,19 @@ def _build_review() -> tuple:
         ).classes("text-caption text-grey-6 ml-48")
     summary_lbl = ui.label("").classes("text-caption text-grey-7 mt-1")
     # Notice: taxa the model can't predict (dropped as too sparse at train time).
-    # identify writes excluded_species.json next to predictions.csv.
+    # identify writes excluded_species.json next to predictions.csv. The one-line
+    # caption is the summary; the expansion holds the *whole* list — on a long
+    # tail that's ~1,300 taxa, so "+N more" would hide nearly all of it, and the
+    # desktop review is exactly where a curator wants to see which taxa the model
+    # can't predict (any specimen of these is forced to the nearest trained class).
     excluded_lbl = (ui.label("").classes("text-caption text-orange-9 mt-1")
                     .style("white-space:normal;line-height:1.3"))
     excluded_lbl.set_visibility(False)
+    excluded_exp = (ui.expansion("Show all excluded taxa", icon="list")
+                    .props("dense").classes("w-full"))
+    excluded_exp.set_visibility(False)
+    with excluded_exp:
+        excluded_body = ui.html("")
 
     def _show_excluded(review_dir: Path) -> None:
         f = review_dir / "excluded_species.json"
@@ -1934,27 +2009,37 @@ def _build_review() -> tuple:
             taxa, rank = {}, "species"
         if not taxa:
             excluded_lbl.set_visibility(False)
+            excluded_exp.set_visibility(False)
             return
         names = sorted(taxa, key=lambda n: taxa[n])   # rarest first
-        shown = ", ".join(f"{n} ({taxa[n]})" for n in names[:12])
-        more  = f"  +{len(names) - 12} more" if len(names) > 12 else ""
         excluded_lbl.set_text(
             f"⚠ {len(taxa)} {rank} not in this model — too few images to train, "
-            f"so their specimens are forced to the nearest trained class: "
-            f"{shown}{more}")
+            f"so their specimens are forced to the nearest trained class.")
+        rows = "".join(
+            f"<div style='break-inside:avoid'><i>{n}</i> "
+            f"<span style='color:#9e9e9e'>({taxa[n]})</span></div>" for n in names)
+        excluded_body.set_content(
+            "<div style='max-height:340px;overflow:auto;columns:3;column-gap:28px;"
+            "font-size:12px;line-height:1.6;padding:4px 2px'>" + rows + "</div>"
+            "<div style='font-size:11px;color:#9e9e9e;margin-top:6px'>"
+            "Rarest first; (n) = images available (below the sparse threshold). "
+            "Full export in excluded_species.csv beside predictions.csv.</div>")
         excluded_lbl.set_visibility(True)
+        excluded_exp.set_visibility(True)
 
     _section("Filter & Sort")
     with ui.row().classes("w-full items-center gap-4 flex-wrap"):
         filter_sel = ui.select(
             {"all": "All", "indets": "Indets only",
              "flagged": "Flagged only", "misid": "Misidentified (pred ≠ true)",
+             "mislabels": "Possible mislabels (low AUM)",
              "high_conf": "High confidence (≥ 90%)",
              "sparse": "Sparse only (true species below threshold)"},
             value="all", label="Show"
         ).classes("w-52").props("dense outlined")
         sort_sel = ui.select(
             {"conf_desc": "Confidence ↓", "conf_asc": "Confidence ↑",
+             "aum_asc": "AUM ↑ (most suspect first)",
              "species": "Predicted name A–Z"},
             value="conf_desc", label="Sort by"
         ).classes("w-52").props("dense outlined")
@@ -2061,7 +2146,27 @@ def _build_review() -> tuple:
                 return c
         return candidates[0] if candidates else ""
 
-    def _get_top5(row) -> list[str]:
+    def _get_top5(row, level: str = "species") -> list[str]:
+        """Candidate determinations for the dropdown, at the rank under review."""
+        if level == "genus":
+            # The genus head's own ranked list when identify wrote it; otherwise
+            # the distinct genera of the top-5 species, in order.
+            names = []
+            for k in range(1, 6):
+                v = row.get(f"gtop{k}_name", "")
+                s = "" if (v != v or v is None) else str(v)
+                if not s or s == "nan":
+                    break
+                names.append(s)
+            if names:
+                return names
+            seen: list[str] = []
+            for sp_name in _get_top5(row, "species"):
+                g = sp_name.split()[0] if sp_name else ""
+                if g and g not in seen:
+                    seen.append(g)
+            return seen
+
         if "top1_name" in row.index:
             names = []
             for k in range(1, 6):
@@ -2098,13 +2203,38 @@ def _build_review() -> tuple:
 
         # Level-specific predicted / true label
         if level == "genus":
-            pred_sp = str(row.get("pred_species", row.get("top1_name", "")))
-            pred_g  = pred_sp.split()[0] if pred_sp and pred_sp not in ("", "nan") else "?"
-            true_g  = true_sp.split()[0] if true_sp and true_sp not in ("", "nan") else ""
+            # pred_genus is written from the trained genus head when the
+            # checkpoint has one; the first-word split is only a fallback.
+            pred_g = str(row.get("pred_genus", "") or "").strip()
+            if not pred_g or pred_g == "nan":
+                pred_sp = str(row.get("pred_species", row.get("top1_name", "")))
+                pred_g  = (pred_sp.split()[0]
+                           if pred_sp and pred_sp not in ("", "nan") else "?")
+            true_g = str(row.get("true_genus", "") or "").strip()
+            if not true_g or true_g == "nan":
+                true_g = true_sp.split()[0] if true_sp and true_sp not in ("", "nan") else ""
             match   = (f" <span style='color:{'#388e3c' if pred_g==true_g else '#d32f2f'}'>"
                        f"{'✓' if pred_g==true_g else '✗'}</span>") if true_g else ""
+            # In genus mode the headline confidence must be the genus head's,
+            # not the species head's — they are different numbers and showing
+            # the species one next to a genus label is simply wrong.
+            g_conf = row.get("genus_conf", None)
+            try:
+                if g_conf is not None and g_conf == g_conf:
+                    conf_val = float(g_conf)
+            except (TypeError, ValueError):
+                pass
+            # Species and genus heads can disagree; that disagreement is itself
+            # a "look at this sheet" signal, so surface it rather than hide it.
+            agree = row.get("genus_agrees", None)
+            disagree_note = ""
+            if str(agree).lower() in ("false", "0"):
+                sp_g = str(row.get("pred_species", "")).split()[0] if row.get("pred_species") else ""
+                disagree_note = ("<span style='color:#f57c00'>⚠ genus head and species "
+                                 f"head disagree (species head says <i>{sp_g}</i>)</span><br>")
             level_line = (f"<b>Predicted genus:</b> <i>{pred_g}</i>{match}<br>"
-                          + (f"<b>True genus:</b> <i>{true_g}</i><br>" if true_g else ""))
+                          + (f"<b>True genus:</b> <i>{true_g}</i><br>" if true_g else "")
+                          + disagree_note)
         elif level == "family":
             pred_f = str(row.get("pred_family", ""))
             true_f = str(row.get("true_family", ""))
@@ -2128,9 +2258,24 @@ def _build_review() -> tuple:
         except (TypeError, ValueError):
             geo_str = ""
 
+        # AUM: present only for training specimens. Low/negative = the label is
+        # a mislabel candidate; colour it as a warning so the eye lands on it.
+        aum_line = ""
+        aum_raw = row.get("aum", None)
+        try:
+            if aum_raw is not None and float(aum_raw) == float(aum_raw):  # not NaN
+                av = float(aum_raw)
+                colour = "#d32f2f" if av < 0 else ("#f57c00" if av < 2 else "#888")
+                hint = " — possible mislabel" if av < 2 else ""
+                aum_line = (f"<b>AUM:</b> <span style='color:{colour}'>{av:+.2f}"
+                            f"{hint}</span><br>")
+        except (TypeError, ValueError):
+            pass
+
         info_html.set_content(
             f"<div style='font-size:13px;line-height:1.6'>"
             f"<b>Confidence:</b> {conf_val:.1%}{flag_badge}<br>"
+            + aum_line
             + level_line
             + (f"<small style='color:#888'>{source}"
                + (f" | {cat}" if cat and cat != "nan" else "")
@@ -2142,7 +2287,7 @@ def _build_review() -> tuple:
         )
         bars_html.set_content(_bars_html(row, level=level))
 
-        top5 = _get_top5(row)
+        top5 = _get_top5(row, level)
         det_sel.set_options(top5, value=top5[0] if top5 else "")
         action_lbl.set_text("")
 
@@ -2154,6 +2299,11 @@ def _build_review() -> tuple:
         level = level_sel.value
         sp_col   = "pred_species" if "pred_species" in df.columns else "top1_name"
         conf_col = "confidence"   if "confidence"   in df.columns else "top1_prob"
+        # Sort/threshold on the confidence of the rank being reviewed. The genus
+        # head has its own — a specimen can be a confident genus and an
+        # uncertain species, which is exactly the case worth finding.
+        if level == "genus" and "genus_conf" in df.columns:
+            conf_col = "genus_conf"
 
         if filt == "indets":
             mask = df["indet"].astype(str).str.lower().isin(("true", "1"))
@@ -2171,10 +2321,22 @@ def _build_review() -> tuple:
                 pred = df["pred_family"].astype(str).str.strip()
                 true = df["true_family"].astype(str).str.strip()
                 mask = _has_label(df["true_family"]) & true.ne(pred)
-            elif level == "genus" and "true_species" in df.columns:
-                pred_g = df[sp_col].astype(str).str.split().str[0]
-                true_g = df["true_species"].astype(str).str.split().str[0]
-                mask   = _has_label(df["true_species"]) & true_g.ne(pred_g)
+            elif level == "genus" and ("pred_genus" in df.columns
+                                       or "true_species" in df.columns):
+                # Compare the genus head's answer to the recorded genus. Using
+                # the species head's first word instead (the old behaviour)
+                # flags disagreements the genus head gets right, so the misid
+                # list was mostly noise from the weaker of the two heads.
+                if "pred_genus" in df.columns:
+                    pred_g = df["pred_genus"].astype(str).str.strip()
+                else:
+                    pred_g = df[sp_col].astype(str).str.split().str[0]
+                if "true_genus" in df.columns:
+                    true_col, true_g = df["true_genus"], df["true_genus"].astype(str).str.strip()
+                else:
+                    true_col = df["true_species"]
+                    true_g = df["true_species"].astype(str).str.split().str[0]
+                mask = _has_label(true_col) & true_g.ne(pred_g)
             else:
                 if "true_species" in df.columns:
                     true_str = df["true_species"].astype(str).str.strip()
@@ -2182,8 +2344,16 @@ def _build_review() -> tuple:
                             true_str.ne(df[sp_col].astype(str).str.strip()))
                 else:
                     mask = _pd.Series(False, index=df.index)
-        elif filt == "high_conf":
-            mask = df[conf_col].astype(float) >= 0.90
+        elif filt == "mislabels":
+            # Candidate mis-determinations: training specimens whose recorded
+            # label the model could only fit by memorising it (low/negative
+            # AUM). Only training specimens carry an AUM value, so notna() is
+            # the whole selector; the ascending sort below puts the most
+            # suspect first.
+            if "aum" in df.columns:
+                mask = df["aum"].notna()
+            else:
+                mask = _pd.Series(False, index=df.index)
         elif filt == "sparse":
             if "sparse" in df.columns:
                 mask = df["sparse"].astype(str).str.lower().isin(("true", "1"))
@@ -2200,13 +2370,22 @@ def _build_review() -> tuple:
 
         view = df[mask].copy()
         sort = sort_sel.value
-        if sort == "conf_desc":
+        # The mislabels view is only meaningful ordered by AUM, so default it
+        # there even if the sort dropdown is still on its confidence default.
+        if filt == "mislabels" and sort in ("conf_desc", "conf_asc"):
+            sort = "aum_asc"
+        if sort == "aum_asc" and "aum" in view.columns:
+            view = view.sort_values("aum", ascending=True, na_position="last")
+        elif sort == "conf_desc":
             view = view.sort_values(conf_col, ascending=False)
         elif sort == "conf_asc":
             view = view.sort_values(conf_col, ascending=True)
         elif sort == "species":
             if level == "genus":
-                view = view.sort_values(sp_col, key=lambda s: s.str.split().str[0])
+                if "pred_genus" in view.columns:
+                    view = view.sort_values("pred_genus")
+                else:
+                    view = view.sort_values(sp_col, key=lambda s: s.str.split().str[0])
             elif level == "family" and "pred_family" in view.columns:
                 view = view.sort_values("pred_family")
             else:
@@ -2267,9 +2446,10 @@ def _build_review() -> tuple:
             ui.notify("Select a valid predictions CSV.", type="warning")
             return
         try:
-            df = _pd.read_csv(path)
+            df = _pd.read_csv(path, low_memory=False)
             if "indet"   not in df.columns: df["indet"]   = False
             if "flagged" not in df.columns: df["flagged"] = False
+            _merge_aum(df, Path(path).parent)
             _st["df"] = df
             n_total = len(df)
             n_indet = df["indet"].astype(str).str.lower().isin(("true", "1")).sum()
@@ -2409,11 +2589,30 @@ def _build_review() -> tuple:
                 return False
             if op == "invalid":
                 sp.loc[mask, "invalid"] = True
-            else:  # determination
+            elif level_sel.value == "genus":
+                # A genus determination is a real curatorial act, not a
+                # half-finished species one: the sheet is placed in a genus but
+                # NOT to species. So it is recorded as "Psychotria sp." and stays
+                # indet — which also keeps it out of training, where a bare genus
+                # must never become a species class (train_herbarium drops these).
+                new_name = str(det_sel.value or "").split()[0]
+                if not new_name:
+                    return False
+                current = str(sp.loc[mask, "species"].iloc[0])
+                sp.loc[mask, "old_determination"] = current
+                sp.loc[mask, "species"] = f"{new_name} sp."
+                if "genus" in sp.columns:
+                    sp.loc[mask, "genus"] = new_name
+                if "verbatimName" in sp.columns:
+                    sp.loc[mask, "verbatimName"] = f"{new_name}_sp."
+                sp.loc[mask, "indet"] = True
+            else:  # species determination
                 new_name = det_sel.value
                 current  = str(sp.loc[mask, "species"].iloc[0])
                 sp.loc[mask, "old_determination"] = current
                 sp.loc[mask, "species"]           = new_name
+                if "genus" in sp.columns:
+                    sp.loc[mask, "genus"] = new_name.split()[0]
                 if "verbatimName" in sp.columns:
                     sp.loc[mask, "verbatimName"] = new_name.replace(" ", "_")
                 sp.loc[mask, "indet"] = False
@@ -2428,9 +2627,14 @@ def _build_review() -> tuple:
         new_name = det_sel.value
         if not new_name:
             return
+        # Show what actually lands in specsin, not what was clicked — a genus
+        # determination is written as "Psychotria sp.", and the reviewer should
+        # see that rather than discover it later in the CSV.
+        written = (f"{str(new_name).split()[0]} sp."
+                   if level_sel.value == "genus" else new_name)
         if _write_back("determine"):
-            action_lbl.set_text(f"Determined → {new_name}")
-            ui.notify(f"Determined: {new_name}", type="positive")
+            action_lbl.set_text(f"Determined → {written}")
+            ui.notify(f"Determined: {written}", type="positive")
 
     def _mark_invalid():
         if _write_back("invalid"):
@@ -3816,17 +4020,30 @@ def _make_progress_cb(prefix: str):
     return cb
 
 
-def _wrap_cloud(coro_factory):
+def _wrap_cloud(coro_factory, *, force: bool = False):
     """Run an orchestrator coroutine as the single in-flight cloud task.
     ui.notify is unsafe inside a background task (no slot context); the body
     reports through _cloud_log instead.
+
+    ``force=True`` displaces whatever is in the in-flight slot instead of
+    refusing. Use it for deliberate "start over" actions (Provision, Attach):
+    the common reason the slot is occupied is a *follower* task wedged on a
+    dead pod's SSH channel — one that ``task.cancel()`` can't unstick because
+    it's blocked in a background thread read. Refusing then traps the user
+    ("a step is already running" when nothing is). Displacing is safe: pod-side
+    steps run detached and survive; we only stop *watching* an old one, and the
+    next Run re-attaches. The orphaned task errors out on its own dead socket.
     """
     if _cloud_running():
-        ui.notify("A cloud step is already running.", type="warning")
-        _cloud_log("⚠ A cloud step is already in flight — click 'Cancel step' to abort it, "
-                   "then retry. (If the server was not restarted, a browser refresh leaves "
-                   "the old task running in the background.)\n")
-        return
+        if not force:
+            ui.notify("A cloud step is already running.", type="warning")
+            _cloud_log("⚠ A cloud step is already in flight — click 'Cancel step' to abort it, "
+                       "then retry. (If the server was not restarted, a browser refresh leaves "
+                       "the old task running in the background.)\n")
+            return
+        _cloud["task"].cancel()
+        _cloud_log("• Displacing the previous in-flight task to start this one "
+                   "(a step already on the pod keeps running and can be re-attached).\n")
     async def _run():
         try:
             await coro_factory()
@@ -4056,6 +4273,10 @@ def _cloud_env_identify() -> dict[str, str]:
 
 async def _do_provision(purpose: str | None = None) -> None:
     """Provision (or reuse) a pod for the requested purpose, and sync code."""
+    # First visible line, before any slow network call — otherwise a successful
+    # Provision looks like a no-op until orch.provision() gets deep enough to log.
+    _cloud_log("Provisioning a pod (reuse if one is live, else create — "
+               "this can take 1–2 min)…")
     orch = _ensure_orch()
     if orch is None:
         return
@@ -4627,7 +4848,7 @@ def _build_pod_strip() -> None:
 
         # ── Primary action: Provision ────────────────────────────────────
         ui.button("Provision", icon="cloud_upload",
-                  on_click=lambda: _wrap_cloud(_do_provision))\
+                  on_click=lambda: _wrap_cloud(_do_provision, force=True))\
             .props("dense color=teal-3 unelevated")\
             .tooltip("Auto-provision a pod: offers RunPod the GPU fallback list "
                      "(first free one wins), creates/reuses the volume, syncs "
@@ -4663,7 +4884,7 @@ def _build_pod_strip() -> None:
                                      "and starts the idle watchdog — then every "
                                      "step works as with an auto-provisioned pod.")
                         ui.button("Attach", icon="link",
-                                  on_click=lambda: _wrap_cloud(_do_attach))\
+                                  on_click=lambda: _wrap_cloud(_do_attach, force=True))\
                             .props("dense color=teal unelevated")\
                             .tooltip("Connect to the pod whose ID is in the box.")
                     ui.separator()
@@ -5324,16 +5545,22 @@ def carousel_page():
         return candidates[0] if candidates else ""
 
     def _top5(row) -> list[tuple[str, float]]:
-        if "top1_name" in row.index:
+        # Honour the rank chosen in the Review tab. At genus, read the trained
+        # genus head's own list (gtop*) rather than the species head's.
+        prefix = "gtop" if level == "genus" else "top"
+        if f"{prefix}1_name" in row.index:
             items = []
             for k in range(1, 6):
-                n = row.get(f"top{k}_name", "")
+                n = row.get(f"{prefix}{k}_name", "")
                 n = "" if (n != n or n is None) else str(n)
                 if not n or n == "nan":
                     break
-                items.append((n, float(row.get(f"top{k}_prob", 0) or 0)))
-            return items or [(str(row.get("pred_species", "")),
-                              float(row.get("confidence", 0) or 0))]
+                items.append((n, float(row.get(f"{prefix}{k}_prob", 0) or 0)))
+            if items:
+                return items
+        if level == "genus":
+            return [(str(row.get("pred_genus", "")),
+                     float(row.get("genus_conf", 0) or 0))]
         return [(str(row.get("pred_species", "")),
                  float(row.get("confidence", 0) or 0))]
 
@@ -5374,15 +5601,32 @@ def carousel_page():
         img_el.set_source(_review_img_url(path) if path else "")
         counter_lbl.set_text(f"{idx + 1} / {len(view)}")
 
-        conf  = float(row.get("confidence", row.get("top1_prob", 0)) or 0)
-        pred  = str(row.get("pred_species", row.get("top1_name", "")))
-        true  = str(row.get("true_species", ""))
+        if level == "genus":
+            conf = float(row.get("genus_conf", row.get("gtop1_prob", 0)) or 0)
+            pred = str(row.get("pred_genus", row.get("gtop1_name", "")))
+            true = str(row.get("true_genus", ""))
+        else:
+            conf = float(row.get("confidence", row.get("top1_prob", 0)) or 0)
+            pred = str(row.get("pred_species", row.get("top1_name", "")))
+            true = str(row.get("true_species", ""))
         fname = str(row.get("fname", row.get("filename", "")))
         match = ""
         if true and true != "nan":
             ok = true.strip() == pred.strip()
             match = (f" <span style='color:{'#66bb6a' if ok else '#ef5350'}'>"
                      f"{'✓' if ok else '✗'}</span>")
+
+        aum_line = ""
+        aum_raw = row.get("aum", None)
+        try:
+            if aum_raw is not None and float(aum_raw) == float(aum_raw):
+                av = float(aum_raw)
+                colour = "#ef5350" if av < 0 else ("#ffa726" if av < 2 else "#888")
+                hint = " — possible mislabel" if av < 2 else ""
+                aum_line = (f"<div style='font-size:16px'><b>AUM:</b> "
+                            f"<span style='color:{colour}'>{av:+.2f}{hint}</span></div>")
+        except (TypeError, ValueError):
+            pass
 
         info_html.set_content(
             f"<div style='line-height:1.8'>"
@@ -5391,6 +5635,7 @@ def carousel_page():
             f"<div style='font-size:16px'><b>Confidence:</b> {conf:.1%}{match}</div>"
             + (f"<div style='font-size:16px'><b>True:</b> <i>{true}</i></div>"
                if true and true != "nan" else "")
+            + aum_line
             + f"<div style='color:#888;font-size:13px;margin-top:4px'>"
             f"{Path(fname).name}</div>"
             f"</div>"

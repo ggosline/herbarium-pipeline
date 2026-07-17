@@ -1426,11 +1426,31 @@ _tar_stage_piped() {
 # Sets STAGED_IMAGES_DIR for downstream steps (consumed by train()).
 stage_images() {
   local src="${IMAGES_DIR}"
-  if [ ! -d "$src" ]; then
-    echo "stage_images: source $src does not exist"; return 1
+
+  # Prefer a restore tarball when one is present. A restore that was cancelled
+  # mid-extract (or deliberately stopped to keep the tar) leaves $DATA/<name>.tar
+  # alongside a PARTIAL $IMAGES_DIR — tar-piping that partial dir would silently
+  # stage a truncated dataset. When the tar exists we instead extract it straight
+  # to local disk: one sequential MooseFS read + fast local writes, skipping both
+  # the slow MooseFS small-file extract and the tar-pipe copy.
+  local img_tar="" _cand
+  for _cand in "$DATA/$(basename "$IMAGES_DIR").tar" "$DATA/images_1024.tar"; do
+    if [ -f "$_cand" ]; then img_tar="$_cand"; break; fi
+  done
+
+  if [ -z "$img_tar" ] && [ ! -d "$src" ]; then
+    echo "stage_images: source $src does not exist and no restore tar in $DATA"
+    return 1
   fi
+
   local src_kb shm_free_kb need_kb
-  src_kb=$(du -sk "$src" | cut -f1)
+  if [ -n "$img_tar" ]; then
+    # Restore tars are uncompressed (backup uses `tar cf`), so the tar's on-disk
+    # size is a close proxy for the extracted size used for tmpfs sizing / skip.
+    src_kb=$(du -sk "$img_tar" | cut -f1)
+  else
+    src_kb=$(du -sk "$src" | cut -f1)
+  fi
   shm_free_kb=$(df -k --output=avail /dev/shm 2>/dev/null | tail -1)
   # Need 1.25× source size to leave RAM headroom for DALI buffers + the
   # python/torch process. Without this guard a tight tmpfs fills, OOM-kills
@@ -1459,9 +1479,20 @@ stage_images() {
   if ! _image_set_from_r2 "$dest.new"; then
     rm -rf "$dest.new"
     mkdir -p "$dest.new"
-    _tar_stage_piped "$src/" "$dest.new/"
-    echo "→ Backfilling R2 image-set cache for this key (background)..."
-    image_set_push_bg
+    if [ -n "$img_tar" ]; then
+      # Extract the restore tar straight to local disk. --strip-components=1
+      # drops the leading "<basename>/" so files land directly under $dest.new,
+      # matching the layout _tar_stage_piped produces from the extracted dir.
+      echo "→ Extracting restore tar $img_tar → $dest.new (skips MooseFS extract)..."
+      tar xf "$img_tar" -C "$dest.new" --strip-components=1
+      # No R2 backfill here: image_set_push tars from $IMAGES_DIR, which is
+      # absent/partial in this path. A later run from a full extracted dir
+      # populates the image-set cache.
+    else
+      _tar_stage_piped "$src/" "$dest.new/"
+      echo "→ Backfilling R2 image-set cache for this key (background)..."
+      image_set_push_bg
+    fi
   fi
   echo "$src_kb" > "$dest.new/.stage_size_kb"
   rm -rf "$dest.old"

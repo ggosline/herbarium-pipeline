@@ -186,6 +186,17 @@ class HerbariumData:
 
         combined = pd.concat(frames, ignore_index=True)
 
+        # Genus-only determinations ("Psychotria sp.") name a genus but no
+        # species, and must never become a species class. Review writes them with
+        # indet=True so the mask above already drops them; this is an explicit
+        # guard so the invariant does not depend on that flag surviving.
+        sp_only = combined["species"].astype(str).str.match(
+            r"^\s*\S+\s+spp?\.?\s*$", case=False, na=False)
+        if sp_only.any():
+            print(f"  Dropping {int(sp_only.sum()):,} genus-only determinations "
+                  f"(e.g. 'Psychotria sp.') — no species to learn")
+            combined = combined[~sp_only].reset_index(drop=True)
+
         # Derive genus from species (first word)
         combined["genus"] = combined["species"].str.split().str[0]
 
@@ -719,9 +730,13 @@ class LitHerbarium(pl.LightningModule):
         total = len(self.data.train_files)
         keep  = (total // (batch * world)) * (batch * world)
         train_files  = self.data.train_files[:keep]
-        # When use_location is on, pass sample indices as DALI "labels" so _step()
-        # can look up the real class label and coordinates from the registered buffers.
-        if self.use_location:
+        # Whenever _step() indexes by sample (geo lookup OR AUM), DALI must hand it
+        # the sample's ROW INDEX as the "label"; _step() then reads the real class
+        # out of *_labels_t. This must match _step()'s own condition exactly —
+        # gating on use_location alone silently fed class indices while _step()
+        # treated them as row indices (AUM-on/location-off), scrambling the
+        # class↔image mapping and collapsing validation accuracy to chance.
+        if self._index_batches:
             train_dali_labels = list(range(keep))
             valid_dali_labels = list(range(len(self.data.valid_files)))
         else:

@@ -23,6 +23,7 @@ import keyring.errors
 
 SERVICE_NAME = "herbarium-cloud"
 RUNPOD_KEY = "runpod"
+RUNPOD_S3_KEY = "runpod_s3"
 R2_KEY = "r2"
 WANDB_KEY = "wandb"
 GBIF_KEY = "gbif"
@@ -44,6 +45,48 @@ def set_runpod_api_key(api_key: str) -> None:
 def delete_runpod_api_key() -> None:
     try:
         keyring.delete_password(SERVICE_NAME, RUNPOD_KEY)
+    except keyring.errors.PasswordDeleteError:
+        pass
+
+
+# ── RunPod S3 API keys (direct network-volume access, no pod needed) ──────
+# A *separate* credential from the REST API key above: RunPod's S3-compatible
+# gateway (s3api-<datacenter>.runpod.io) authenticates with its own access-key
+# /secret pair, created under Settings → S3 API Keys in the console. Stored as
+# a JSON blob so the pair travels together. Account-wide, so no datacenter or
+# bucket is baked in — those are per-volume and resolved at call time.
+
+@dataclass(frozen=True)
+class RunPodS3Credentials:
+    access_key_id: str
+    secret_access_key: str
+
+    @staticmethod
+    def endpoint_for(data_center_id: str) -> str:
+        """S3 gateway URL for a datacenter, e.g. EUR-IS-1 → s3api-eur-is-1."""
+        return f"https://s3api-{data_center_id.lower()}.runpod.io"
+
+
+def get_runpod_s3_credentials() -> RunPodS3Credentials | None:
+    raw = keyring.get_password(SERVICE_NAME, RUNPOD_S3_KEY)
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+        return RunPodS3Credentials(**d)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def set_runpod_s3_credentials(creds: RunPodS3Credentials) -> None:
+    if not creds.access_key_id.strip() or not creds.secret_access_key.strip():
+        raise ValueError("access key id and secret must both be set")
+    keyring.set_password(SERVICE_NAME, RUNPOD_S3_KEY, json.dumps(asdict(creds)))
+
+
+def delete_runpod_s3_credentials() -> None:
+    try:
+        keyring.delete_password(SERVICE_NAME, RUNPOD_S3_KEY)
     except keyring.errors.PasswordDeleteError:
         pass
 
