@@ -1642,9 +1642,23 @@ identify() {
   : "${GEO_SIGMA:=}"
   : "${LOGIT_ADJUST:=}"
 
+  # Prefer the local staged copy if train() built one on this pod: it escapes the
+  # MooseFS per-file latency, and — after a restore cancelled mid-extract — it is
+  # the COMPLETE image set while $DATA/images may be only partially extracted.
+  # An explicit IMAGES_DIR override still wins; fall back to $DATA/images when the
+  # staged dir is gone (fresh pod / tmpfs cleared).
+  IDENT_IMG_DIR="$IMG_1024"
+  if [ "$IMG_1024" = "$DATA/images" ] && [ -f "$WS/.staged_images_dir" ]; then
+    _staged=$(cat "$WS/.staged_images_dir" 2>/dev/null)
+    if [ -n "$_staged" ] && [ -d "$_staged" ]; then
+      echo "identify: using staged images $_staged (not $DATA/images)"
+      IDENT_IMG_DIR="$_staged"
+    fi
+  fi
+
   args=(--checkpoint "$CKPT_FILE"
         --model      "$MODEL"
-        --sources    "$SPECSIN:$IMG_1024"
+        --sources    "$SPECSIN:$IDENT_IMG_DIR"
         --output-dir "$DATA/predictions"
         --image-sz   "$IMAGE_SZ"
         --batch-size "$BATCH_SIZE")
