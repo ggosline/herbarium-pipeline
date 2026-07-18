@@ -1645,14 +1645,27 @@ identify() {
   # Prefer the local staged copy if train() built one on this pod: it escapes the
   # MooseFS per-file latency, and — after a restore cancelled mid-extract — it is
   # the COMPLETE image set while $DATA/images may be only partially extracted.
-  # An explicit IMAGES_DIR override still wins; fall back to $DATA/images when the
-  # staged dir is gone (fresh pod / tmpfs cleared).
+  # An explicit IMAGES_DIR override still wins.
   IDENT_IMG_DIR="$IMG_1024"
-  if [ "$IMG_1024" = "$DATA/images" ] && [ -f "$WS/.staged_images_dir" ]; then
-    _staged=$(cat "$WS/.staged_images_dir" 2>/dev/null)
+  if [ "$IMG_1024" = "$DATA/images" ]; then
+    _staged=""
+    [ -f "$WS/.staged_images_dir" ] && _staged=$(cat "$WS/.staged_images_dir" 2>/dev/null)
     if [ -n "$_staged" ] && [ -d "$_staged" ]; then
       echo "identify: using staged images $_staged (not $DATA/images)"
       IDENT_IMG_DIR="$_staged"
+    elif [ -n "$_staged" ]; then
+      # Marker points at a stage that's gone — a container restart clears
+      # /dev/shm but leaves the $WS marker file behind, so this looked like a
+      # live stage while actually silently falling back to $DATA/images,
+      # which stage_images's own comment already documents as possibly a
+      # partial restore extract. Re-stage rather than score whatever
+      # fraction happens to be on disk.
+      echo "identify: staged dir $_staged is gone (pod restart?) — re-staging before inference"
+      if stage_images; then
+        IDENT_IMG_DIR="$STAGED_IMAGES_DIR"
+      else
+        echo "identify: re-stage failed — falling back to $DATA/images (may be incomplete)"
+      fi
     fi
   fi
 
