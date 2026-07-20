@@ -764,15 +764,42 @@ _watchdog_can_terminate() {
   return 1
 }
 
+# RUNPOD_POD_ID is set in the container's environment by RunPod, but an
+# sshd-spawned session does not inherit it — which is every step this script
+# runs. Only the UI's attach path passed it explicitly, so provisioned pods
+# started with no watchdog and billed until killed by hand.
+#
+# PID 1 is the container init and always carries the original Docker env, so
+# read it from there. Cache it on the volume as a last-resort fallback for
+# any context where /proc/1/environ is unreadable.
+resolve_pod_id() {
+  [ -n "${RUNPOD_POD_ID:-}" ] && { printf '%s' "$RUNPOD_POD_ID"; return 0; }
+  local from_init
+  # Brace-group the redirect: `2>/dev/null` on `tr` alone would not suppress
+  # the shell's own "No such file" when /proc/1/environ is absent.
+  from_init="$({ tr '\0' '\n' < /proc/1/environ | \
+                 sed -n 's/^RUNPOD_POD_ID=//p' | head -n1; } 2>/dev/null)"
+  if [ -n "$from_init" ]; then printf '%s' "$from_init"; return 0; fi
+  if [ -f "$WS/.runpod_pod_id" ]; then
+    head -n1 "$WS/.runpod_pod_id" | tr -d '\r\n'; return 0
+  fi
+  return 1
+}
+
 start_watchdog() {
   if pgrep -f herbarium-watchdog >/dev/null 2>&1; then
     echo "Watchdog already running."
     return 0
   fi
+  RUNPOD_POD_ID="${RUNPOD_POD_ID:-$(resolve_pod_id || true)}"
   if [ -z "${RUNPOD_POD_ID:-}" ]; then
-    echo "ERROR: RUNPOD_POD_ID not set — watchdog cannot terminate the pod." >&2
+    echo "ERROR: RUNPOD_POD_ID not set and not resolvable from /proc/1/environ" >&2
+    echo "       or $WS/.runpod_pod_id — watchdog cannot terminate the pod." >&2
     return 1
   fi
+  # Persist for later steps / contexts that can't read /proc/1/environ.
+  printf '%s\n' "$RUNPOD_POD_ID" > "$WS/.runpod_pod_id" 2>/dev/null || true
+  export RUNPOD_POD_ID
   if ! _watchdog_can_terminate; then
     echo "ERROR: watchdog has NO working way to terminate pod $RUNPOD_POD_ID." >&2
     echo "       It will not be started. The pod bills until killed by hand." >&2

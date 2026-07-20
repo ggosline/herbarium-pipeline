@@ -1225,6 +1225,12 @@ class CloudOrchestrator:
         session = await self._ensure_session(handle, on_log=on_log)
         self._state.current_step = step
         self._save_state()
+        # Always forward the pod id. The watchdog needs it to terminate the
+        # pod, and an ssh session does not inherit the container env where
+        # RunPod sets it — so a provisioned pod used to come up with no
+        # watchdog and bill until killed by hand. Not caller-overridable: it
+        # is a property of the pod we are talking to, not a setting.
+        env = {**(env or {}), "RUNPOD_POD_ID": handle.pod_id}
         # Auto-inject GBIF credentials for the download step so --families works on-pod.
         if step == "download":
             gbif = secrets.get_gbif_credentials()
