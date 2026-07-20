@@ -3208,9 +3208,94 @@ def _build_get_started_landing(gs) -> None:
                 ui.notify(f"Project folder ready: {proj}", type="positive")
             _refresh()
 
-        with ui.row().classes("w-full gap-2 mt-2"):
+        with ui.row().classes("w-full gap-2 mt-2 items-center"):
             ui.button("Create / open project", icon="check_circle",
                       on_click=_create_project).props("unelevated color=primary")
+            ui.label("or").classes("text-caption text-grey-6")
+            ui.button("Pick from RunPod volumes", icon="storage",
+                      on_click=lambda: _pick_volume()
+                      ).props("outlined color=primary")\
+                .tooltip("List the network volumes on your RunPod account and "
+                         "set the Project name from the one you pick — the "
+                         "volume is the durable identity, not a locally-typed "
+                         "name, so this can't drift between machines the way "
+                         "a hand-typed project name can.")
+
+        async def _pick_volume() -> None:
+            api_key = cloud_secrets.get_runpod_api_key()
+            if not api_key:
+                ui.notify("Save your RunPod API key first (below).", type="warning")
+                return
+            from cloud.runpod_client import RunPodClient
+            try:
+                async with RunPodClient(api_key) as rp:
+                    volumes = await rp.list_volumes()
+                    pods = await rp.list_pods()
+            except Exception as e:
+                ui.notify(f"Couldn't fetch volumes: {e}", type="negative")
+                return
+            if not volumes:
+                ui.notify("No network volumes on this RunPod account.", type="warning")
+                return
+            pods_by_volume: dict[str, list] = {}
+            for p in pods:
+                vid = p.network_volume_id or (p.raw or {}).get("networkVolumeId")
+                if vid and p.desired_status == "RUNNING":
+                    pods_by_volume.setdefault(vid, []).append(p)
+
+            dialog = ui.dialog()
+            with dialog, ui.card().classes("w-full").style("max-width:640px"):
+                ui.label("Pick a network volume").classes("text-subtitle1 font-bold")
+                ui.label(
+                    "Sets Project name to the volume's own name, so this "
+                    "machine's local state can't silently drift from which "
+                    "volume you're actually using."
+                ).classes("text-caption text-grey-7 mb-2")
+                with ui.column().classes("w-full gap-1")\
+                        .style("max-height:400px;overflow-y:auto"):
+                    for v in volumes:
+                        live = pods_by_volume.get(v.id)
+                        with ui.row().classes("w-full items-center gap-2 pa-2")\
+                                .style("border:1px solid #e0e0e0;border-radius:6px"):
+                            with ui.column().classes("gap-0 flex-1"):
+                                ui.label(v.name).classes("font-medium")
+                                ui.label(f"{v.id} · {v.size_gb} GB · "
+                                         f"{v.data_center_id or '?'}")\
+                                    .classes("text-caption text-grey-6")
+                                if live:
+                                    ui.label(f"● live pod: {live[0].id}")\
+                                        .classes("text-caption")\
+                                        .style("color:#2e7d32")
+                            ui.button("Select", on_click=(
+                                lambda v=v, live=live: _select_volume(v, live, dialog)
+                            )).props("dense unelevated color=primary")
+                with ui.row().classes("w-full justify-end mt-2"):
+                    ui.button("Cancel", on_click=dialog.close).props("flat")
+            dialog.open()
+
+        def _select_volume(vol, live_pods, dialog) -> None:
+            dialog.close()
+            old = (gs.get("main_proj") or "").strip()
+            gs["main_proj"] = vol.name
+            if old and old != vol.name:
+                ui.notify(f"Project switched: {old!r} → {vol.name!r} "
+                          f"(from volume {vol.id}).", type="info")
+            base = (gs.get("main_base_dir") or "").strip() or str(Path.home())
+            gs["main_base_dir"] = base
+            name_inp.value = vol.name
+            img_folder = (gs.get("main_img_folder") or "images_cropped").strip()
+            apply = _page_hooks.get("apply_paths")
+            if apply:
+                apply(base=base, name=vol.name, img_folder=img_folder)
+            if live_pods:
+                gs["cloud_attach_pod_id"] = live_pods[0].id
+                ui.notify(f"Volume {vol.name!r} selected — attaching to live "
+                          f"pod {live_pods[0].id}...", type="positive")
+                _wrap_cloud(_do_attach, force=True)
+            else:
+                ui.notify(f"Volume {vol.name!r} selected. No live pod for it — "
+                          f"Provision when ready.", type="positive")
+            _refresh()
 
     # ── Status strip + progress rail (rebuilt by _refresh) ────────────────
     status_card = ui.card().classes("w-full").style("border-left:3px solid #00897b")
