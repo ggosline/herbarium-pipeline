@@ -3903,6 +3903,70 @@ def _build_setup() -> None:
                       ).props("unelevated dense color=primary")
             ui.button("Forget", on_click=_forget_r2).props("flat dense")
 
+    # ── RunPod S3 (network-volume access without a pod) ──────────────────
+    s3_card, s3_pill = _setup_card("folder_open", "RunPod S3 API",
+                                   "optional · read a volume with no pod running")
+    with s3_card:
+        ui.label(
+            "A separate key pair from the RunPod API key above — create it at "
+            "RunPod → Settings → S3 API Keys. It fronts each network volume "
+            "with an S3 endpoint, so once a run has written its results you "
+            "can terminate the pod and still pull predictions.csv, the AUM "
+            "sheets or the images down for free, with nothing billing. "
+            "Read-only: list and get."
+        ).classes("text-body2").style("color:#455a64")
+
+        s3_akid = (ui.input(label="S3 Access Key ID")
+                   .classes("w-full mt-3").props("dense outlined type=password"))
+        s3_sec  = (ui.input(label="S3 Secret Access Key",
+                            placeholder="shown once at key-creation time")
+                   .classes("w-full").props("dense outlined type=password"))
+
+        def _refresh_s3_pill() -> None:
+            creds = cloud_secrets.get_runpod_s3_credentials()
+            if creds:
+                # Show a prefix only — enough to tell which key is stored
+                # without putting the whole id on screen.
+                _set_pill(s3_pill, f"✓ {creds.access_key_id[:8]}…", "ok")
+            else:
+                _set_pill(s3_pill, "not set", "warn")
+        _refresh_s3_pill()
+
+        def _save_s3() -> None:
+            ak = (s3_akid.value or "").strip()
+            sk = (s3_sec.value or "").strip()
+            if not (ak and sk):
+                ui.notify("Fill both the Access Key ID and the Secret.",
+                          type="warning")
+                return
+            try:
+                cloud_secrets.set_runpod_s3_credentials(
+                    cloud_secrets.RunPodS3Credentials(
+                        access_key_id=ak, secret_access_key=sk))
+            except Exception as e:
+                ui.notify(f"Keyring save failed: {e}", type="negative")
+                return
+            s3_akid.value = ""
+            s3_sec.value = ""
+            _refresh_s3_pill()
+            ui.notify("RunPod S3 credentials saved.", type="positive")
+
+        def _forget_s3() -> None:
+            cloud_secrets.delete_runpod_s3_credentials()
+            _refresh_s3_pill()
+            ui.notify("RunPod S3 credentials removed.", type="info")
+
+        with ui.row().classes("gap-2 mt-2"):
+            ui.button("Save S3 keys", on_click=_save_s3
+                      ).props("unelevated dense color=primary")
+            ui.button("Forget", on_click=_forget_s3).props("flat dense")
+        ui.label(
+            "Used by pull_from_volume.py — e.g. "
+            "uv run --with boto3 python pull_from_volume.py "
+            "--project <name> --list data/"
+        ).classes("text-caption text-grey-6 mt-1")\
+            .style("white-space:normal;word-break:break-word")
+
     # ── GBIF ────────────────────────────────────────────────────────────────
     gbif_card, gbif_pill = _setup_card("grass", "GBIF",
                                        "optional · needed for multi-family bulk downloads")
