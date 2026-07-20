@@ -1059,6 +1059,34 @@ def build_trainer(config: dict, output_dir: Path, logger, callbacks: list,
     )
 
 
+def _load_compatible_state_dict(module, state_dict: dict) -> None:
+    """load_state_dict(..., strict=False), but also drop any key whose shape
+    doesn't match the live module.
+
+    strict=False only forgives keys that are missing/unexpected by NAME — a
+    key present in both dicts with a mismatched shape still raises. That bites
+    every cross-run resume (--resume --reset-optimizer) once the dataset size
+    or class count differs from the checkpoint's run: train_labels_t/
+    valid_labels_t are per-example label lookups sized to THIS run's
+    train/valid split, train_coords_t/valid_coords_t (when use_location) are
+    the matching per-example coordinates, and criterion.weight is the
+    per-class loss weighting vector — none of them are transferable learned
+    weights, they're just data-shaped buffers that happen to live in
+    state_dict. Filtering by shape here is also the semantically right call:
+    the freshly-constructed buffers from the current data are exactly what
+    should be used, not stale ones from a different dataset.
+    """
+    live = module.state_dict()
+    compatible = {}
+    for k, v in state_dict.items():
+        if k in live and live[k].shape != v.shape:
+            print(f"  skipping {k}: checkpoint shape {tuple(v.shape)} != "
+                  f"current shape {tuple(live[k].shape)}")
+            continue
+        compatible[k] = v
+    module.load_state_dict(compatible, strict=False)
+
+
 def train(config: dict):
     import os as _os
     local_rank = int(_os.environ.get("LOCAL_RANK", 0))
@@ -1265,7 +1293,7 @@ def train(config: dict):
         best_s1 = s1_ckpt_cb.best_model_path or str(output_dir / "checkpoints" / "last.ckpt")
         print(f"Stage 1 complete. Loading weights from {best_s1} for stage 2.")
         ckpt_data = torch.load(best_s1, map_location="cpu", weights_only=False)
-        lit.load_state_dict(ckpt_data["state_dict"], strict=False)
+        _load_compatible_state_dict(lit, ckpt_data["state_dict"])
 
         if hasattr(model_module, "unfreeze_all"):
             model_module.unfreeze_all()
@@ -1299,7 +1327,7 @@ def train(config: dict):
         if fit_ckpt and config.get("reset_optimizer"):
             print(f"Loading weights only from {fit_ckpt} (optimizer state discarded)")
             ckpt_data = torch.load(fit_ckpt, map_location="cpu", weights_only=False)
-            lit.load_state_dict(ckpt_data["state_dict"], strict=False)
+            _load_compatible_state_dict(lit, ckpt_data["state_dict"])
             fit_ckpt = None
 
         if hasattr(model_module, "unfreeze_all"):
@@ -1339,7 +1367,7 @@ def train(config: dict):
         # that would restore the epoch counter from the checkpoint and the trainer
         # would see current_epoch >= max_epochs and exit immediately without training.
         ckpt_data = torch.load(best_so_far, map_location="cpu", weights_only=False)
-        lit.load_state_dict(ckpt_data["state_dict"], strict=False)
+        _load_compatible_state_dict(lit, ckpt_data["state_dict"])
         print(f"Loaded weights from {best_so_far}")
 
         cooldown_ckpt_cb = ModelCheckpoint(

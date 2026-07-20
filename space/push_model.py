@@ -99,6 +99,23 @@ def _pick_checkpoint(path: Path, select_by: str = "accuracy",
     if not ckpts:
         sys.exit(f"no .ckpt files found in {path}")
 
+    # Restrict to checkpoints from the CURRENT class set when we can tell.
+    # nameslist.json (sidecar, one level up from checkpoints/) is rewritten
+    # once, early, at the start of every train() run — before any checkpoint
+    # in that run is saved — so every checkpoint from the latest run is newer
+    # than it, and every checkpoint from a prior run (a different class set)
+    # is older. Without this, picking the globally-best metric silently
+    # prefers a stale, narrower-class checkpoint whenever a newer run covers
+    # more classes at a lower aggregate accuracy — same bug found in
+    # pod_bootstrap.sh's identify()/ood() selection after the 2026-07 GBIF
+    # top-up added 38 classes.
+    nameslist_sidecar = path.parent / "nameslist.json"
+    if nameslist_sidecar.is_file():
+        cutoff = nameslist_sidecar.stat().st_mtime
+        current = [p for p in ckpts if p.stat().st_mtime >= cutoff]
+        if current:
+            ckpts = current
+
     # (metric_key, want_max, pretty_label)
     by_acc  = ("val_accuracy", True,  "val_Accuracy")
     by_loss = ("valid_loss",   False, "valid_loss")

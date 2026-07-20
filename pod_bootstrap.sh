@@ -1605,6 +1605,35 @@ train() {
   hf_cache_push
 }
 
+# ─── checkpoint auto-selection ─────────────────────────────────────────────
+# identify()/ood() call this when the caller doesn't set CKPT_FILE. Restricts
+# candidates to checkpoints newer than nameslist.json when possible:
+# nameslist.json is rewritten once, early, at the START of every train() run
+# (before any checkpoint is saved), so every checkpoint from THIS run is newer
+# than it, and every checkpoint from a prior run (built against a different
+# class set) is older. Without this, picking the globally-best val_Accuracy
+# silently prefers a stale, narrower-class checkpoint whenever a newer run
+# covers more classes at a lower aggregate accuracy — bit us exactly once,
+# after the 2026-07 GBIF top-up added 38 classes and the new checkpoint
+# scored lower (broader but harder) than the old, narrower one.
+select_best_checkpoint() {
+  local pool
+  pool=$(ls "$CKPT"/*.ckpt 2>/dev/null)
+  if [ -f "$DATA/nameslist.json" ]; then
+    local current
+    current=$(find "$CKPT" -maxdepth 1 -name '*.ckpt' -newer "$DATA/nameslist.json" 2>/dev/null)
+    [ -n "$current" ] && pool="$current"
+  fi
+  local pick
+  pick=$(echo "$pool" | grep 'val_Accuracy=' \
+    | sed -E 's/.*val_Accuracy=([0-9]+\.[0-9]+).*/\1 &/' | sort -rn | head -1 | cut -d' ' -f2-)
+  [ -z "$pick" ] && pick=$(echo "$pool" | grep 'valid_loss=' \
+    | sed -E 's/.*valid_loss=([0-9]+\.[0-9]+).*/\1 &/' | sort -n | head -1 | cut -d' ' -f2-)
+  [ -z "$pick" ] && [ -f "$CKPT/last.ckpt" ] && pick="$CKPT/last.ckpt"
+  [ -z "$pick" ] && pick=$(echo "$pool" | xargs -r ls -t 2>/dev/null | head -1)
+  echo "$pick"
+}
+
 # ─── step 4: identify ─────────────────────────────────────────────────────
 identify() {
   # Same rationale as train(): only steps importing torch/timm benefit
@@ -1612,21 +1641,15 @@ identify() {
   mirror_venv_local || echo "⚠ venv mirror skipped — imports will be slower."
   activate
   _check_cuda_compat || exit 3
-  # Pick the checkpoint unless the caller passed CKPT_FILE explicitly. Prefer
-  # the best-accuracy checkpoint (highest val_Accuracy in the filename), then
-  # best valid_loss (lowest), then last.ckpt, then newest by mtime. Picking by
-  # mtime alone is unsafe in a REUSED workspace: `last.ckpt` is overwritten in
-  # place by every run — including one with a different backbone — so it can
-  # mismatch $MODEL and blow up on load. The metric-named checkpoints carry
-  # their own arch and survive reruns (this matches what `publish` selects).
-  if [ -z "${CKPT_FILE:-}" ]; then
-    CKPT_FILE=$(ls "$CKPT"/*val_Accuracy=*.ckpt 2>/dev/null \
-      | sed -E 's/.*val_Accuracy=([0-9]+\.[0-9]+).*/\1 &/' | sort -rn | head -1 | cut -d' ' -f2-)
-    [ -z "$CKPT_FILE" ] && CKPT_FILE=$(ls "$CKPT"/*valid_loss=*.ckpt 2>/dev/null \
-      | sed -E 's/.*valid_loss=([0-9]+\.[0-9]+).*/\1 &/' | sort -n | head -1 | cut -d' ' -f2-)
-    [ -z "$CKPT_FILE" ] && [ -f "$CKPT/last.ckpt" ] && CKPT_FILE="$CKPT/last.ckpt"
-    [ -z "$CKPT_FILE" ] && CKPT_FILE=$(ls -t "$CKPT"/*.ckpt 2>/dev/null | head -1)
-  fi
+  # Pick the checkpoint unless the caller passed CKPT_FILE explicitly.
+  # select_best_checkpoint() prefers checkpoints from the current class set
+  # (newer than nameslist.json), then best-accuracy, then best valid_loss,
+  # then last.ckpt, then newest by mtime. Picking by mtime alone is unsafe in
+  # a REUSED workspace: `last.ckpt` is overwritten in place by every run —
+  # including one with a different backbone — so it can mismatch $MODEL and
+  # blow up on load. The metric-named checkpoints carry their own arch and
+  # survive reruns (this matches what `publish` selects).
+  [ -z "${CKPT_FILE:-}" ] && CKPT_FILE=$(select_best_checkpoint)
   if [ -z "${CKPT_FILE:-}" ]; then
     echo "✗ no checkpoint found in $CKPT" >&2; return 1
   fi
@@ -1697,12 +1720,8 @@ ood() {
   mirror_venv_local || echo "⚠ venv mirror skipped — imports will be slower."
   activate
   _check_cuda_compat || exit 3
-  # Same checkpoint choice as identify: best val_Accuracy, then last.ckpt.
-  if [ -z "${CKPT_FILE:-}" ]; then
-    CKPT_FILE=$(ls "$CKPT"/*val_Accuracy=*.ckpt 2>/dev/null \
-      | sed -E 's/.*val_Accuracy=([0-9]+\.[0-9]+).*/\1 &/' | sort -rn | head -1 | cut -d' ' -f2-)
-    [ -z "$CKPT_FILE" ] && [ -f "$CKPT/last.ckpt" ] && CKPT_FILE="$CKPT/last.ckpt"
-  fi
+  # Same checkpoint choice as identify — see select_best_checkpoint().
+  [ -z "${CKPT_FILE:-}" ] && CKPT_FILE=$(select_best_checkpoint)
   if [ -z "${CKPT_FILE:-}" ]; then
     echo "✗ no checkpoint found in $CKPT" >&2; return 1
   fi
