@@ -388,9 +388,39 @@ class CloudOrchestrator:
                 return match.id, match.data_center_id
             else:
                 return self._state.volume_id, match.data_center_id
+        # No saved id — but the volume may still exist, e.g. this is a second
+        # machine whose ~/.herbarium-cloud/<project>.json was never synced, or
+        # the project was picked from the volume list. Adopt a same-named
+        # volume rather than creating a duplicate: creating one silently
+        # strands the real data on the original and starts the project empty,
+        # which is how 'herb-Salacia' (80 GB, populated) ended up shadowed by
+        # a new empty 'herb-herb-Salacia'.
+        want_name = f"herb-{self._project}"
+        # Accept the bare project name too: not every volume follows the
+        # herb- convention (some were made in the RunPod console, e.g.
+        # 'Angiosperm-families_Africa'), and matching only the prefixed form
+        # would create a duplicate for those.
+        candidates = (want_name, self._project)
+        try:
+            vols = await self._rp().list_volumes()
+            existing = next(
+                (v for name in candidates for v in vols if v.name == name), None)
+        except Exception as e:
+            on_log(f"  ⚠ couldn't list volumes to check for an existing "
+                   f"{want_name} ({e}) — proceeding to create")
+            existing = None
+        if existing is not None:
+            on_log(f"Reusing existing volume {existing.id} ({want_name}, "
+                   f"{existing.size_gb} GB, {existing.data_center_id}) — "
+                   f"no local state referenced it.")
+            self._state.volume_id = existing.id
+            self._state.data_center_id = existing.data_center_id
+            self._save_state()
+            return existing.id, existing.data_center_id
+
         on_log(f"Creating network volume ({size_gb} GB, {data_center_id})...")
         vol = await self._rp().create_volume(
-            name=f"herb-{self._project}",
+            name=want_name,
             size_gb=size_gb,
             data_center_id=data_center_id,
         )
@@ -1130,6 +1160,23 @@ class CloudOrchestrator:
         size = local_zip.stat().st_size
         on_log(f"Uploading {local_zip.name} ({size:,} bytes)…")
         await session.sftp_put(local_zip, REMOTE_DWCA, on_progress=on_progress)
+
+        # Verify what actually landed. Recording local_sha unconditionally used
+        # to turn an interrupted transfer into a silent success: the volume kept
+        # a truncated zip (valid PK header, no end-of-central-directory) and the
+        # download step failed much later with a bare BadZipFile, pointing at
+        # the archive rather than at the upload that broke it.
+        remote_after = await session.remote_sha256(REMOTE_DWCA)
+        if remote_after != local_sha:
+            raise RuntimeError(
+                f"DwC-A upload verification FAILED — the copy on the volume "
+                f"does not match the local file.\n"
+                f"  local  sha256 {local_sha}  ({size:,} bytes)\n"
+                f"  remote sha256 {remote_after}\n"
+                f"The transfer was probably interrupted. Re-run the upload; "
+                f"nothing downstream should use {REMOTE_DWCA} until it matches."
+            )
+        on_log(f"Verified DwC-A on volume (sha256 {local_sha[:16]}…)")
         self._state.dwca_sha256 = local_sha
         self._save_state()
         return True
@@ -1406,22 +1453,80 @@ class CloudOrchestrator:
             if rc != 0:
                 raise RuntimeError(f"remote tar failed (rc={rc}): {out.strip()}")
 
+        import tarfile
+
         local_tar = local_dir / f"{chosen}.tar"
-        on_log(f"Downloading {local_tar.name}...")
-        try:
+
+        # Reuse a complete local tar left by an interrupted earlier attempt
+        # rather than re-pulling ~12 GB. The transfer is the expensive half
+        # and the pod may be gone by now, so a usable tar on disk is worth
+        # far more than a clean slate.
+        reuse_local = False
+        if local_tar.is_file():
+            try:
+                with tarfile.open(local_tar) as tf:
+                    while tf.next() is not None:      # streams; validates to EOF
+                        pass
+                reuse_local = True
+                on_log(f"Found a complete local {local_tar.name} from an "
+                       f"earlier run — skipping the download.")
+            except Exception as e:
+                on_log(f"Local {local_tar.name} is incomplete "
+                       f"({e.__class__.__name__}) — re-downloading.")
+                # Do not delete it yet: if the download below fails or the pod
+                # is unreachable, a partial tar is still worth ~73% of the
+                # images. sftp_get overwrites it in place.
+
+        if not reuse_local:
+            on_log(f"Downloading {local_tar.name}...")
+            # Deliberately NOT in a try/finally that deletes the tar: if this
+            # is interrupted (UI killed, pod reaped), the partial file stays
+            # so the check above can judge it next time. Deleting on the way
+            # out used to throw away a completed multi-GB transfer whenever
+            # extraction hadn't finished yet.
             await session.sftp_get(remote_tar, local_tar, on_progress=on_progress)
-            on_log("Extracting locally...")
-            import tarfile
-            with tarfile.open(local_tar) as tf:
-                tf.extractall(local_dir)
-        finally:
-            local_tar.unlink(missing_ok=True)
-            # Leave the remote tar in place so a follow-up `backup` can reuse
-            # it instead of re-tarring (~5–15 GB, slow on MooseFS). backup()
-            # cleans up after upload.
+        # Leave the remote tar in place so a follow-up `backup` can reuse it
+        # instead of re-tarring (~5–15 GB, slow on MooseFS). backup() cleans
+        # up after upload.
+
+        # Extract member-by-member rather than via extractall(): a tar cut
+        # short by an interrupted transfer makes extractall() abort and leave
+        # nothing, when in fact every member before the tear is a complete,
+        # valid image. Salvaging 73% of a 12 GB pull beats discarding it.
+        on_log("Extracting locally...")
+        extracted = 0
+        truncated_at: str | None = None
+        with tarfile.open(local_tar) as tf:
+            while True:
+                try:
+                    member = tf.next()
+                except Exception as e:               # the truncation itself
+                    truncated_at = f"{e.__class__.__name__}: {e}"
+                    break
+                if member is None:
+                    break
+                if not member.isfile():
+                    continue
+                # filter="data" strips absolute paths / ".." escapes and is
+                # the default from Python 3.14; setting it explicitly keeps
+                # behaviour identical across versions and silences the warning.
+                tf.extract(member, local_dir, filter="data")
+                extracted += 1
 
         out_dir = local_dir / chosen
-        on_log(f"Done → {out_dir}")
+        if not out_dir.is_dir():
+            raise RuntimeError(
+                f"extraction produced no {out_dir} — {local_tar} kept "
+                f"for inspection")
+
+        if truncated_at:
+            # Keep the tar: it is evidence, and re-pulling needs a live pod.
+            on_log(f"⚠ {local_tar.name} was truncated ({truncated_at}). "
+                   f"Extracted {extracted:,} complete images to {out_dir}; "
+                   f"the rest need another pull. Keeping {local_tar.name}.")
+        else:
+            local_tar.unlink(missing_ok=True)        # only now is it redundant
+            on_log(f"Done → {out_dir} ({extracted:,} images)")
         return out_dir
 
     async def terminate(

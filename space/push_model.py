@@ -200,12 +200,36 @@ def _resolve_token(explicit: str | None, token_file: Path | None) -> str | None:
     return None
 
 
+# A taxon name is a single alphabetic word (Rubiaceae, Icacinales, Uvaria).
+# Anything else — a project name, a hyphenated or underscored label — is not
+# something we can build a public repo id out of.
+_TAXON_RE = re.compile(r"^[A-Za-z]+$")
+
+
 def _default_repo(hf_user: str | None, family: str | None, region: str | None,
                   label_level: str) -> str:
     """Convention-based repo id when --repo is omitted:
     ``<user>/herbarium-<region>-<family>-<rank>`` (lowercased)."""
     if not (hf_user and family):
         sys.exit("either --repo, or both --hf-user and --family, must be given.")
+    # Refuse to slug a non-taxon into a repo id. Callers upstream default
+    # --family to the *project* name when the field is blank, so a project
+    # called "Angiosperm-families_Africa" silently produced the repo
+    # ggosline/herbarium-africa-angiosperm-families_africa-family — a
+    # duplicate of the real one, published alongside it and listed twice in
+    # the Space. A repo id is public and permanent-ish; guessing one from
+    # arbitrary text is worse than stopping and asking.
+    if not _TAXON_RE.match(family):
+        sys.exit(
+            f"--family {family!r} is not a taxon name, so no repo id can be "
+            f"derived from it (a taxon is one alphabetic word, e.g. "
+            f"'Rubiaceae').\n"
+            f"This usually means the Publish tab's Family field was left "
+            f"blank and the project name was used instead.\n"
+            f"Fix: pass an explicit --repo (e.g. "
+            f"{hf_user}/herbarium-africa-<taxon>-{label_level}), or set "
+            f"--family to the taxon this model classifies at."
+        )
     parts = ["herbarium", region or "", family, label_level]
     slug = "-".join(p for p in parts if p).lower().replace(" ", "-")
     return f"{hf_user}/{slug}"

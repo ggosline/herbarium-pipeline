@@ -23,6 +23,7 @@ from typing import Optional
 from nicegui import app, ui
 
 from cloud import secrets as cloud_secrets
+from cloud import state as cloud_state
 from cloud.orchestrator import (
     CloudOrchestrator,
     DEFAULT_DATACENTER,
@@ -2657,6 +2658,12 @@ def _build_confusion() -> "ui.input":
     import copy
     import pandas as _pd
 
+    # Render caps. Both charts scale with the number of classes, and a
+    # species-level predictions CSV for a whole flora carries ~15k of them —
+    # far past what a browser tab can lay out or a websocket frame can carry.
+    _MAX_MATRIX_CLASSES = 150   # heatmap is O(n²) cells
+    _MAX_ACC_BARS       = 80    # one 16px row + one axis label each
+
     _section("Predictions CSV")
     conf_csv = _path_input("predictions.csv:", mode="file",
                            value=app.storage.general.get("review_csv", ""))
@@ -2878,6 +2885,23 @@ def _build_confusion() -> "ui.input":
         else:
             classes = sorted(set(full_ct.index) | set(full_ct.columns))
 
+        # Hard cap the matrix. A species-level run over a big flora has ~15k
+        # classes; "all" would be 15k² = 2.4e8 cells, and even serialising that
+        # to JSON kills the browser tab (which then reconnects and re-renders,
+        # giving an endless reload loop rather than an error). Keep the classes
+        # with the most support so the view stays representative.
+        if len(classes) > _MAX_MATRIX_CLASSES:
+            support = full_ct.sum(axis=1)
+            keep = set(support.reindex(classes).fillna(0)
+                       .sort_values(ascending=False)
+                       .head(_MAX_MATRIX_CLASSES).index)
+            dropped = len(classes) - len(keep)
+            classes = [c for c in classes if c in keep]
+            ui.notify(f"{dropped:,} classes hidden — showing the "
+                      f"{len(classes)} best-represented of "
+                      f"{dropped + len(classes):,}. Use 'Top N most-confused' "
+                      f"to choose a focused subset instead.", type="warning")
+
         ct = full_ct.reindex(index=classes, columns=classes, fill_value=0)
 
         # Normalise rows to recall (fraction of true class)
@@ -2892,11 +2916,16 @@ def _build_confusion() -> "ui.input":
         true_labels = list(ct_plot.index)
         pred_labels = list(ct_plot.columns)
 
-        # Simple array data — most compatible ECharts heatmap format.
+        # Simple array data — most compatible ECharts heatmap format. Emit only
+        # non-zero cells: a confusion matrix is ~99% zeros, and ECharts renders
+        # missing cells as empty anyway, so the dense form just inflates the
+        # websocket payload quadratically for no visual difference.
+        vals = ct_plot.values
         data = [
-            [j, i, round(float(ct_plot.iloc[i, j]), 4)]
+            [j, i, round(float(vals[i, j]), 4)]
             for i in range(len(true_labels))
             for j in range(len(pred_labels))
+            if vals[i, j]
         ]
 
         # Resize chart height to fit
@@ -3031,13 +3060,25 @@ def _build_confusion() -> "ui.input":
         acc_df = (matches.groupby(df[true_col]).mean()
                           .mul(100)
                           .sort_values(ascending=True))
+        # Unlike the heatmap this chart is NOT subject to the Top-N control, so
+        # it plots every class — thousands of them on a species-level run over a
+        # big flora, giving a ~50,000px element with thousands of interval:0
+        # axis labels. That is what crashed the tab. Show the worst performers
+        # (sorted ascending, so the head) and say how many were left out.
+        n_classes = len(acc_df)
+        if n_classes > _MAX_ACC_BARS:
+            acc_df = acc_df.head(_MAX_ACC_BARS)
         acc_labels = acc_df.index.tolist()
         acc_values = [round(v, 1) for v in acc_df.values]
+        acc_chart_title = (
+            f"worst {len(acc_labels)} of {n_classes:,} classes"
+            if n_classes > _MAX_ACC_BARS else f"all {n_classes:,} classes")
         acc_height = max(300, len(acc_labels) * 16 + 80)
         acc_chart.style(f"height:{acc_height}px; width:100%")
         acc_chart.options["yAxis"]["data"] = acc_labels
         acc_chart.options["series"][0]["data"] = acc_values
-        acc_chart.options["xAxis"]["name"] = f"{level_label} accuracy (%)"
+        acc_chart.options["xAxis"]["name"] = (
+            f"{level_label} accuracy (%) — {acc_chart_title}")
         acc_chart.update()
 
         # ── Most confused list ──────────────────────────────────────────────
@@ -3273,20 +3314,43 @@ def _build_get_started_landing(gs) -> None:
                     ui.button("Cancel", on_click=dialog.close).props("flat")
             dialog.open()
 
+        def _project_from_volume_name(name: str) -> str:
+            """Invert the orchestrator's ``herb-<project>`` volume naming.
+
+            Taking the volume name verbatim double-prefixes on the next
+            provision: picking 'herb-Salacia' set project='herb-Salacia',
+            whose volume is named 'herb-herb-Salacia' — which didn't exist,
+            so a second, empty volume was created and the real one stranded.
+            """
+            return name[len("herb-"):] if name.startswith("herb-") else name
+
         def _select_volume(vol, live_pods, dialog) -> None:
             dialog.close()
+            proj = _project_from_volume_name(vol.name)
+            # Bind the chosen volume by id, not just by name. The id is the
+            # durable identity the picker exists to capture; deriving it back
+            # from a typed project name is what drifts.
+            try:
+                st = cloud_state.load(proj)
+                if st.volume_id != vol.id:
+                    st.volume_id = vol.id
+                    st.data_center_id = vol.data_center_id or st.data_center_id
+                    cloud_state.save(st)
+            except Exception as e:
+                ui.notify(f"Couldn't record volume {vol.id} in local state: {e}",
+                          type="warning")
             old = (gs.get("main_proj") or "").strip()
-            gs["main_proj"] = vol.name
-            if old and old != vol.name:
-                ui.notify(f"Project switched: {old!r} → {vol.name!r} "
-                          f"(from volume {vol.id}).", type="info")
+            gs["main_proj"] = proj
+            if old and old != proj:
+                ui.notify(f"Project switched: {old!r} → {proj!r} "
+                          f"(from volume {vol.name!r}, {vol.id}).", type="info")
             base = (gs.get("main_base_dir") or "").strip() or str(Path.home())
             gs["main_base_dir"] = base
-            name_inp.value = vol.name
+            name_inp.value = proj
             img_folder = (gs.get("main_img_folder") or "images_cropped").strip()
             apply = _page_hooks.get("apply_paths")
             if apply:
-                apply(base=base, name=vol.name, img_folder=img_folder)
+                apply(base=base, name=proj, img_folder=img_folder)
             if live_pods:
                 gs["cloud_attach_pod_id"] = live_pods[0].id
                 ui.notify(f"Volume {vol.name!r} selected — attaching to live "
@@ -4613,9 +4677,25 @@ async def _do_publish() -> None:
     `publish` step. push_model.py auto-picks the accuracy-best checkpoint and
     reads the embedded nameslist; we only supply the metadata."""
     gs = app.storage.general
-    fam  = (gs.get("pub_family") or gs.get("main_proj") or "").strip()
+    fam  = (gs.get("pub_family") or "").strip()
     user = (gs.get("pub_hfuser") or "").strip()
     repo = (gs.get("pub_repo") or "").strip()
+    # Fall back to the project name only when it is itself a plain taxon.
+    # Blindly falling back is how a project called "Angiosperm-families_Africa"
+    # got published as ggosline/herbarium-africa-angiosperm-families_africa-
+    # family — a duplicate of the real repo, listed twice in the Space. The
+    # repo id derived from this is public, so guess nothing.
+    if not fam:
+        proj = (gs.get("main_proj") or "").strip()
+        if re.fullmatch(r"[A-Za-z]+", proj):
+            fam = proj
+        elif not repo:
+            _cloud_warn(
+                f"Project name {proj!r} is not a taxon, so it can't be used to "
+                f"name the Hub repo. Fill in the Family field (e.g. "
+                f"'Rubiaceae') or set an explicit Repo below, then publish "
+                f"again.")
+            return
     if not repo and not (user and fam):
         _cloud_warn("Set a Hugging Face user + family, or an explicit repo, "
                     "before publishing.")

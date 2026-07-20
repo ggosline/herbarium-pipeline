@@ -40,6 +40,50 @@ mkdir -p "$WS"
 touch "$ACTIVITY_FILE"
 trap 'touch "$ACTIVITY_FILE" 2>/dev/null || true' EXIT
 
+# ─── project marker: bind a volume to one project name ────────────────────
+# $PROJECT comes from the UI and only names an R2 prefix — nothing ever
+# checked it against the volume actually mounted. On 2026-07-19/20 the
+# Angiosperm-families_Africa volume was backed up under PROJECT=Rubiaceae-
+# genera (a stale name carried over from another machine's local state),
+# writing 30 GB of Angiosperm data into r2:herbarium-backup/Rubiaceae-genera/
+# and overwriting that project's real images.tar. Nothing failed; both runs
+# reported success.
+#
+# The marker is written into the volume itself, so it travels with the data
+# rather than with whichever machine is driving. Steps that map the volume
+# onto an R2 prefix call require_project_match before touching anything.
+PROJECT_MARKER="$WS/.project"
+
+require_project_match() {
+  : "${PROJECT:?PROJECT env var required}"
+  if [ ! -f "$PROJECT_MARKER" ]; then
+    # First run on this volume (or one predating the marker): adopt the
+    # current name. Loud, because if it is wrong this is the moment to stop.
+    printf '%s\n' "$PROJECT" > "$PROJECT_MARKER"
+    echo "→ Marked this volume as project '$PROJECT' ($PROJECT_MARKER)."
+    echo "  If that is not the project whose data is on this volume, abort now"
+    echo "  and correct the Project name — later steps will trust this marker."
+    return 0
+  fi
+  marked="$(head -n1 "$PROJECT_MARKER" | tr -d '\r\n')"
+  if [ "$marked" != "$PROJECT" ]; then
+    echo "✗ PROJECT MISMATCH — refusing to continue."
+    echo "    this volume is marked: '$marked'"
+    echo "    but PROJECT is set to: '$PROJECT'"
+    echo ""
+    echo "  Backing up or restoring now would mix two projects' data in R2."
+    echo "  This is exactly how r2:herbarium-backup/Rubiaceae-genera/ ended up"
+    echo "  holding Angiosperm-families_Africa checkpoints and images."
+    echo ""
+    echo "  Fix the Project name to '$marked', or — only if you are certain the"
+    echo "  marker is wrong (e.g. the project was deliberately renamed) —"
+    echo "  update it:  echo '$PROJECT' > $PROJECT_MARKER"
+    return 1
+  fi
+  echo "✓ project marker matches: '$marked'"
+  return 0
+}
+
 # ─── caches: split between volume (persistent) and container disk (fast) ──
 # Wheels (UV_CACHE_DIR) and HF model weights (HF_HOME) live on the volume
 # so every fresh pod reuses them. EUR-IS-1's egress to PyPI has been
@@ -1758,8 +1802,20 @@ publish() {
     return 1
   fi
 
-  # Default the family to the project name when not given explicitly.
-  FAMILY="${FAMILY:-${PROJECT:-}}"
+  # Default the family to the project name ONLY when the project name is
+  # itself a plain taxon (Olacaceae, Icacinales). For anything else the
+  # fallback used to manufacture a bogus repo id — "Angiosperm-families_Africa"
+  # became ggosline/herbarium-africa-angiosperm-families_africa-family. Leave
+  # FAMILY unset instead and let push_model.py refuse with a clear message,
+  # unless an explicit HF_REPO makes the family irrelevant to the id.
+  if [ -z "${FAMILY:-}" ] && [ -n "${PROJECT:-}" ]; then
+    if printf '%s' "$PROJECT" | grep -qE '^[A-Za-z]+$'; then
+      FAMILY="$PROJECT"
+    else
+      echo "Note: project name '$PROJECT' is not a taxon, so it is NOT being"
+      echo "      used as --family. Set the Family field or an explicit repo."
+    fi
+  fi
 
   args=(--ckpt "$CKPT")
   [ -n "${SELECT_BY:-}" ]    && args+=(--select-by    "$SELECT_BY")
@@ -1783,6 +1839,8 @@ publish() {
 # under the same R2 bucket (e.g. r2:herbarium-backup/menispermaceae/).
 backup() {
   : "${PROJECT:?PROJECT env var required (e.g. PROJECT=menispermaceae)}"
+  # Refuse to write this volume's data under another project's R2 prefix.
+  require_project_match || return 1
   REMOTE="$R2_REMOTE/$PROJECT"
   echo "→ Archiving project '$PROJECT' to $REMOTE"
 
@@ -1855,6 +1913,9 @@ backup() {
 # ─── restore: pull a project archive back onto a fresh volume ─────────────
 restore() {
   : "${PROJECT:?PROJECT env var required (e.g. PROJECT=menispermaceae)}"
+  # Same hazard in reverse: pulling another project's archive on top of this
+  # volume's data would overwrite specsin.csv / images with a foreign set.
+  require_project_match || return 1
   REMOTE="$R2_REMOTE/$PROJECT"
   echo "→ Restoring project '$PROJECT' from $REMOTE"
 
