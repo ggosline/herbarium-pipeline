@@ -873,15 +873,43 @@ def save_specsin(path: Path, rows: dict[str, dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def gbif_taxon_key(name: str, rank: str = "FAMILY") -> str:
-    """Resolve a taxon name to its GBIF usageKey via the species/match API."""
+    """Resolve a taxon name to its GBIF usageKey via the species/match API.
+
+    Constrained to kingdom Plantae. Without it, a name that is a homonym
+    across kingdoms matches nothing at all rather than picking one: 'Salacia'
+    is both a plant genus (Celastraceae) and an animal genus, and GBIF
+    answered matchType=NONE for it. Every taxon this pipeline handles is a
+    plant, and the constraint leaves unambiguous names untouched (verified:
+    Rubiaceae, Olacaceae, Opiliaceae, Ebenaceae, Connaraceae, Icacinales,
+    Uvaria, Psychotria all resolve to the same usageKey with and without it).
+    """
     url = (GBIF_SPECIES_MATCH
-           + "?" + urllib.parse.urlencode({"name": name, "rank": rank, "verbose": "false"}))
+           + "?" + urllib.parse.urlencode({"name": name, "rank": rank,
+                                           "kingdom": "Plantae",
+                                           "verbose": "false"}))
     data = gbif_get(url)
-    if data.get("matchType") == "NONE" or not data.get("usageKey"):
+    got_rank = (data.get("rank") or "").upper()
+    # Reject anything that isn't a match AT THE REQUESTED RANK. Supplying
+    # kingdom=Plantae makes GBIF fall back to the kingdom itself when the name
+    # matches nothing — 'Notarealgenusxyz' returns matchType=HIGHERRANK,
+    # rank=KINGDOM, usageKey=6 (Plantae) with confidence 99. Accepting that
+    # would turn one typo into a download of every plant on GBIF, so the rank
+    # check is what makes the kingdom constraint safe.
+    if (data.get("matchType") in (None, "NONE", "HIGHERRANK")
+            or not data.get("usageKey")
+            or got_rank != rank.upper()):
+        # Note: GBIF reports a high confidence alongside matchType=NONE and
+        # for HIGHERRANK backoffs, which reads as a confident success. Don't
+        # repeat it — it says nothing about whether we got what we asked for.
+        detail = ""
+        if got_rank and got_rank != rank.upper():
+            detail = (f" — GBIF matched '{data.get('canonicalName')}' at rank "
+                      f"{got_rank}, not {rank.upper()}")
         raise ValueError(
-            f"GBIF could not match {rank} '{name}' "
-            f"(matchType={data.get('matchType')}, confidence={data.get('confidence')}). "
-            f"Check the spelling or try the GBIF website."
+            f"GBIF could not match {rank} '{name}' in kingdom Plantae "
+            f"(matchType={data.get('matchType')}){detail}. Check the spelling, "
+            f"or whether the name is a synonym or sits at a different rank — "
+            f"try https://www.gbif.org/species/search?q={urllib.parse.quote(name)}"
         )
     key = str(data["usageKey"])
     confidence = data.get("confidence", "?")
