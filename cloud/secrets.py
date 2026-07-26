@@ -111,15 +111,50 @@ def delete_wandb_api_key() -> None:
 
 
 # ── Hugging Face write token (publish models to the Hub) ──────────────────
+# Stored as a JSON blob {token, username} so the Publish tab's "HF user"
+# field can default from here instead of being typed in on every project.
+# get/set_hf_token() stay token-only for existing callers; older stores hold
+# a bare token string (pre-username), which get_hf_credentials() treats as
+# a token with no username rather than failing to parse.
+
+@dataclass(frozen=True)
+class HFCredentials:
+    token: str
+    username: str = ""
+
+
+def get_hf_credentials() -> HFCredentials | None:
+    raw = keyring.get_password(SERVICE_NAME, HF_KEY)
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+        return HFCredentials(token=d.get("token", ""), username=d.get("username", ""))
+    except json.JSONDecodeError:
+        return HFCredentials(token=raw, username="")
+
 
 def get_hf_token() -> str | None:
-    return keyring.get_password(SERVICE_NAME, HF_KEY)
+    creds = get_hf_credentials()
+    return creds.token if creds and creds.token else None
+
+
+def get_hf_username() -> str | None:
+    creds = get_hf_credentials()
+    return creds.username if creds and creds.username else None
+
+
+def set_hf_credentials(token: str, username: str = "") -> None:
+    if not token.strip():
+        raise ValueError("token is empty")
+    keyring.set_password(SERVICE_NAME, HF_KEY,
+                         json.dumps({"token": token.strip(), "username": username.strip()}))
 
 
 def set_hf_token(token: str) -> None:
-    if not token.strip():
-        raise ValueError("token is empty")
-    keyring.set_password(SERVICE_NAME, HF_KEY, token.strip())
+    """Back-compat single-value setter; preserves any username already saved."""
+    existing = get_hf_credentials()
+    set_hf_credentials(token, existing.username if existing else "")
 
 
 def delete_hf_token() -> None:

@@ -1965,15 +1965,17 @@ def _build_review() -> tuple:
                          .props("dense outlined").classes("w-44")
                          .bind_value(app.storage.general, "review_fetch_src"))
             if not app.storage.general.get("cloud_ckpt_filter"):
-                app.storage.general["cloud_ckpt_filter"] = "latest"
+                app.storage.general["cloud_ckpt_filter"] = "best+latest"
             (ui.select({"latest": "ckpts: latest",
                         "best+latest": "ckpts: best + latest",
                         "all": "ckpts: all"},
-                       value=app.storage.general.get("cloud_ckpt_filter") or "latest")
+                       value=app.storage.general.get("cloud_ckpt_filter") or "best+latest")
              .props("dense outlined").classes("w-44")
              .bind_value(app.storage.general, "cloud_ckpt_filter")
-             .tooltip("Which checkpoints the pod fetch pulls. 'best + latest' is "
-                      "usually what you want for local CPU Identify."))
+             .tooltip("Which checkpoints the pod fetch pulls. Default 'best + "
+                      "latest' pulls the accuracy-best checkpoint (what "
+                      "Identify/Publish use) plus last.ckpt; 'latest' alone "
+                      "is cheaper but only usable to eyeball training progress."))
             ui.button("Fetch & load", icon="cloud_download",
                       on_click=lambda: _wrap_cloud_aux(_run_fetch))\
                 .props("unelevated color=teal")\
@@ -2523,11 +2525,25 @@ def _build_review() -> tuple:
         gs["review_csv"]  = rev_csv.value
         gs["review_imgs"] = rev_imgs.value
         ck_dir = Path(target) / "checkpoints"
-        ckpts = (sorted(ck_dir.glob("*.ckpt"), key=lambda p: p.stat().st_mtime)
-                 if ck_dir.is_dir() else [])
+        ckpts = list(ck_dir.glob("*.ckpt")) if ck_dir.is_dir() else []
         if ckpts:
-            gs["id_ckpt"] = str(ckpts[-1])
-            gs["active_ckpt"] = str(ckpts[-1])
+            # Prefer accuracy-best (what Identify/Publish use), then loss-best,
+            # then most-recently-modified — same fallback order as
+            # push_model.py, so a multi-checkpoint restore doesn't silently
+            # hand Identify whichever file happens to be newest.
+            chosen = None
+            for rx, want_max in ((re.compile(r"val_Accuracy=(\d+\.\d+)"), True),
+                                 (re.compile(r"valid_loss=(\d+\.\d+)"), False)):
+                scored = [(float(m.group(1)), p) for p in ckpts
+                         if (m := rx.search(p.name))]
+                if scored:
+                    scored.sort(key=lambda x: x[0], reverse=want_max)
+                    chosen = scored[0][1]
+                    break
+            if chosen is None:
+                chosen = max(ckpts, key=lambda p: p.stat().st_mtime)
+            gs["id_ckpt"] = str(chosen)
+            gs["active_ckpt"] = str(chosen)
         _load()
 
     def _go(delta: int):
@@ -3436,7 +3452,8 @@ def _collect_creds() -> dict:
     c: dict = {}
     if (k := cloud_secrets.get_runpod_api_key()): c["runpod"] = k
     if (k := cloud_secrets.get_wandb_api_key()):  c["wandb"] = k
-    if (k := cloud_secrets.get_hf_token()):       c["huggingface"] = k
+    if (hf := cloud_secrets.get_hf_credentials()):
+        c["huggingface"] = {"token": hf.token, "username": hf.username}
     if (r2 := cloud_secrets.get_r2_credentials()):
         c["r2"] = {"account_id": r2.account_id,
                    "access_key_id": r2.access_key_id,
@@ -3454,7 +3471,12 @@ def _restore_creds(c: dict) -> int:
     try:
         if c.get("runpod"):      cloud_secrets.set_runpod_api_key(c["runpod"]); n += 1
         if c.get("wandb"):       cloud_secrets.set_wandb_api_key(c["wandb"]); n += 1
-        if c.get("huggingface"): cloud_secrets.set_hf_token(c["huggingface"]); n += 1
+        if (hf := c.get("huggingface")):
+            if isinstance(hf, dict):
+                cloud_secrets.set_hf_credentials(hf.get("token", ""), hf.get("username", ""))
+            else:
+                cloud_secrets.set_hf_token(hf)  # legacy export: bare token string
+            n += 1
         if c.get("r2"):
             cloud_secrets.set_r2_credentials(
                 cloud_secrets.R2Credentials(**c["r2"])); n += 1
@@ -3810,6 +3832,11 @@ def _build_setup() -> None:
             "huggingface.co/settings/tokens with the 'Write' role."
         ).classes("text-body2").style("color:#455a64")
 
+        hf_user_inp = (ui.input(label="Username", placeholder="e.g. ggosline",
+                                value=cloud_secrets.get_hf_username() or "")
+                      .classes("w-full mt-3").props("dense outlined")
+                      .tooltip("Prefills the Publish tab's 'HF user' field so "
+                               "you don't retype it per project."))
         hf_inp = (ui.input(label="Write token", placeholder="hf_…")
                   .classes("w-full mt-3").props("dense outlined type=password"))
 
@@ -3822,16 +3849,19 @@ def _build_setup() -> None:
 
         def _save_hf() -> None:
             v = (hf_inp.value or "").strip()
-            if not v:
+            v_user = (hf_user_inp.value or "").strip()
+            existing = cloud_secrets.get_hf_credentials()
+            token = v or (existing.token if existing else "")
+            if not token:
                 ui.notify("Paste a token first.", type="warning"); return
             try:
-                cloud_secrets.set_hf_token(v)
+                cloud_secrets.set_hf_credentials(token, v_user)
             except Exception as e:
                 ui.notify(f"Keyring save failed: {e}", type="negative"); return
             hf_inp.value = ""
             _refresh_hf_pill()
-            ui.notify("Hugging Face token saved (pushed to pod at publish time).",
-                      type="positive")
+            ui.notify("Hugging Face credentials saved (token pushed to pod at "
+                      "publish time).", type="positive")
 
         def _forget_hf() -> None:
             cloud_secrets.delete_hf_token()
@@ -4624,30 +4654,40 @@ async def _do_download_results() -> None:
     gs = app.storage.general
     local_dir = _cloud_results_dir(orch)
     cb = _make_progress_cb("download")
-    ckpt_filter = (gs.get("cloud_ckpt_filter") or "latest").strip() or "latest"
+    ckpt_filter = (gs.get("cloud_ckpt_filter") or "best+latest").strip() or "best+latest"
     written = await orch.download_results(
         pod, local_dir, on_log=_cloud_log, on_progress=cb,
         ckpt_filter=ckpt_filter,
     )
     names = {p.name: str(p) for p in written}
 
-    # Pick the lowest-valid_loss checkpoint over last.ckpt for inference.
+    # Prefer the accuracy-best checkpoint for local Identify — the same
+    # metric push_model.py publishes by default — falling back to loss-best,
+    # then last.ckpt, if the pull didn't include an accuracy-tagged file
+    # (e.g. ckpt_filter=latest only pulled last.ckpt).
     import re
-    loss_re = re.compile(r"-(\d+\.\d+)\.ckpt$")
-    scored: list[tuple[float, str]] = []
-    for name, path in names.items():
-        m = loss_re.search(name)
-        if m:
-            try:
-                scored.append((float(m.group(1)), path))
-            except ValueError:
-                pass
-    if scored:
-        scored.sort(key=lambda x: x[0])
-        best_loss, best_path = scored[0]
-        gs["id_ckpt"] = best_path
-        gs["active_ckpt"] = best_path
-        _cloud_info(f"Identify ckpt → {Path(best_path).name} (best valid_loss={best_loss:.4f})")
+    acc_re  = re.compile(r"val_Accuracy=(\d+\.\d+)")
+    loss_re = re.compile(r"valid_loss=(\d+\.\d+)")
+    chosen_path: str | None = None
+    chosen_label = ""
+    for rx, label, want_max in ((acc_re, "val_Accuracy", True), (loss_re, "valid_loss", False)):
+        scored: list[tuple[float, str]] = []
+        for name, path in names.items():
+            m = rx.search(name)
+            if m:
+                try:
+                    scored.append((float(m.group(1)), path))
+                except ValueError:
+                    pass
+        if scored:
+            scored.sort(key=lambda x: x[0], reverse=want_max)
+            best_val, chosen_path = scored[0]
+            chosen_label = f"{label}={best_val:.4f}"
+            break
+    if chosen_path:
+        gs["id_ckpt"] = chosen_path
+        gs["active_ckpt"] = chosen_path
+        _cloud_info(f"Identify ckpt → {Path(chosen_path).name} (best {chosen_label})")
     elif "last.ckpt" in names:
         gs["id_ckpt"] = names["last.ckpt"]
         gs["active_ckpt"] = names["last.ckpt"]
@@ -4678,7 +4718,7 @@ async def _do_publish() -> None:
     reads the embedded nameslist; we only supply the metadata."""
     gs = app.storage.general
     fam  = (gs.get("pub_family") or "").strip()
-    user = (gs.get("pub_hfuser") or "").strip()
+    user = (gs.get("pub_hfuser") or "").strip() or (cloud_secrets.get_hf_username() or "")
     repo = (gs.get("pub_repo") or "").strip()
     # Fall back to the project name only when it is itself a plain taxon.
     # Blindly falling back is how a project called "Angiosperm-families_Africa"
@@ -5244,12 +5284,15 @@ def _build_publish() -> None:
             "(Get Started → Hugging Face)."
         ).classes("text-body2 mt-1").style("color:#455a64;max-width:820px")
 
+        if not gs.get("pub_hfuser"):
+            gs["pub_hfuser"] = cloud_secrets.get_hf_username() or ""
         with ui.row().classes("w-full items-center gap-2 mt-1"):
             ui.label("HF user:").classes("w-24 text-right shrink-0")
-            ui.input(value="", placeholder="e.g. ggosline").classes("w-48")\
+            ui.input(value=gs.get("pub_hfuser") or "", placeholder="e.g. ggosline").classes("w-48")\
               .props("dense outlined").bind_value(gs, "pub_hfuser")\
               .tooltip("Your Hugging Face username. Used to build the repo name "
-                       "when no explicit repo is given.")
+                       "when no explicit repo is given. Defaults from Get "
+                       "Started → Hugging Face if set there.")
             ui.label("Family:").classes("w-20 text-right shrink-0")
             ui.input(value="", placeholder="defaults to project").classes("w-48")\
               .props("dense outlined").bind_value(gs, "pub_family")\

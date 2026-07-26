@@ -46,12 +46,14 @@ LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int], None]
 
 
-# Parses a numeric val_loss from filenames like:
-#   epoch=07-valid_loss=0.4072.ckpt   (stage 2 best)
-#   s1-epoch=03-valid_loss=0.6797.ckpt
+# Parses numeric metrics from filenames like:
+#   acc-epoch=07-val_Accuracy=0.9123.ckpt   (stage 2, accuracy-best)
+#   epoch=07-valid_loss=0.4072.ckpt         (stage 2, loss-best)
+#   s1-acc-epoch=03-val_Accuracy=0.88.ckpt / s1-epoch=03-valid_loss=0.6797.ckpt
 #   cd-epoch=02-valid_loss=0.39.ckpt
 # Returns None for files without a parseable score (e.g. last.ckpt, last-v3.ckpt).
 _LOSS_RE = re.compile(r"valid_loss=(\d+\.\d+)")
+_ACC_RE  = re.compile(r"val_Accuracy=(\d+\.\d+)")
 
 
 def _select_ckpts(
@@ -64,6 +66,9 @@ def _select_ckpts(
 
     ``ckpts`` is a list of (mtime, remote_path). ``mode`` is one of
     ``"all" | "latest" | "best+latest"``; unknown values fall back to "latest".
+    "best" means highest val_Accuracy — the same metric push_model.py
+    publishes by default — falling back to lowest valid_loss only when no
+    filename in the pull carries an accuracy score (older runs).
     """
     if not ckpts:
         return []
@@ -76,24 +81,26 @@ def _select_ckpts(
         return [latest]
 
     # best+latest
-    scored: list[tuple[float, str]] = []
-    for _, p in ckpts:
-        m = _LOSS_RE.search(Path(p).name)
-        if m:
-            try:
-                scored.append((float(m.group(1)), p))
-            except ValueError:
-                pass
     chosen = {latest}
-    if scored:
-        scored.sort(key=lambda x: x[0])
-        best_loss, best_path = scored[0]
-        chosen.add(best_path)
-        on_log(f"  ckpt filter=best+latest → {Path(best_path).name} "
-               f"(valid_loss={best_loss:.4f}), {Path(latest).name}")
+    for rx, label in ((_ACC_RE, "val_Accuracy"), (_LOSS_RE, "valid_loss")):
+        scored: list[tuple[float, str]] = []
+        for _, p in ckpts:
+            m = rx.search(Path(p).name)
+            if m:
+                try:
+                    scored.append((float(m.group(1)), p))
+                except ValueError:
+                    pass
+        if scored:
+            scored.sort(key=lambda x: x[0], reverse=(rx is _ACC_RE))
+            best_val, best_path = scored[0]
+            chosen.add(best_path)
+            on_log(f"  ckpt filter=best+latest → {Path(best_path).name} "
+                   f"({label}={best_val:.4f}), {Path(latest).name}")
+            break
     else:
         on_log(f"  ckpt filter=best+latest → {Path(latest).name} "
-               f"(no parseable valid_loss in any filename — kept latest only)")
+               f"(no parseable val_Accuracy/valid_loss in any filename — kept latest only)")
     return list(chosen)
 
 # ── defaults ─────────────────────────────────────────────────────────────
@@ -1306,7 +1313,7 @@ class CloudOrchestrator:
         *,
         on_log: LogFn = print,
         on_progress: ProgressFn | None = None,
-        ckpt_filter: str = "latest",
+        ckpt_filter: str = "best+latest",
     ) -> list[Path]:
         """Pull checkpoints, the names list, predictions, and specsin back
         to ``local_dir``.

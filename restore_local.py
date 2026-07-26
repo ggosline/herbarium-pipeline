@@ -20,7 +20,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +34,11 @@ if sys.platform == "win32":
 
 import tarfile
 from pathlib import Path
+
+# Same convention as push_model.py: training saves a loss-best and an
+# accuracy-best checkpoint per stage, with the metric in the filename.
+_LOSS_RE = re.compile(r"valid_loss=(\d+\.\d+)")
+_ACC_RE  = re.compile(r"val_Accuracy=(\d+\.\d+)")
 
 
 def _have_rclone() -> str:
@@ -109,9 +116,55 @@ def _copy(rclone: str, src: str, dst: Path, *extra: str,
                 extra_env=env)
 
 
+def _pick_remote_checkpoints(rclone: str, checkpoints_url: str, select_by: str,
+                             env: dict[str, str] | None = None) -> list[str]:
+    """Return the .ckpt filename(s) to pull from ``checkpoints_url``.
+
+    ``select_by`` is "accuracy" (max val_Accuracy, default), "loss" (min
+    valid_loss), or "all" (every .ckpt — the old behaviour). Mirrors
+    push_model.py's _pick_checkpoint fallback order: preferred metric, then
+    the other metric, then most-recently-modified. A multi-GB .ckpt archive
+    otherwise means downloading every stage's checkpoint just to use one.
+    """
+    out = subprocess.run(
+        [rclone, "lsjson", checkpoints_url],
+        capture_output=True, text=True, check=False,
+        env={**os.environ, **(env or {})},
+    )
+    if out.returncode != 0 or not out.stdout.strip():
+        return []
+    try:
+        entries = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return []
+    ckpts = [e for e in entries if str(e.get("Name", "")).endswith(".ckpt")]
+    if not ckpts:
+        return []
+    if select_by == "all":
+        return [e["Name"] for e in ckpts]
+
+    def metric(name: str, rx: re.Pattern) -> float | None:
+        m = rx.search(name)
+        return float(m.group(1)) if m else None
+
+    by_acc  = (_ACC_RE,  True)
+    by_loss = (_LOSS_RE, False)
+    order = [by_acc, by_loss] if select_by == "accuracy" else [by_loss, by_acc]
+    for rx, want_max in order:
+        cand = [(metric(e["Name"], rx), e["Name"]) for e in ckpts
+                if metric(e["Name"], rx) is not None]
+        if cand:
+            cand.sort(key=lambda x: x[0], reverse=want_max)
+            return [cand[0][1]]
+    # No filename carries either metric — fall back to most recently modified.
+    ckpts.sort(key=lambda e: e.get("ModTime", ""), reverse=True)
+    return [ckpts[0]["Name"]]
+
+
 def restore(project: str, target: Path, remote: str = "r2:herbarium-backup",
             images_dirname: str = "images",
-            skip_images_if_present: bool = False) -> int:
+            skip_images_if_present: bool = False,
+            select_by: str = "accuracy") -> int:
     rclone = _have_rclone()
     env = _r2_env()
     if env:
@@ -120,10 +173,24 @@ def restore(project: str, target: Path, remote: str = "r2:herbarium-backup",
     print(f"→ Restoring '{project}' from {base} to {target}", flush=True)
     target.mkdir(parents=True, exist_ok=True)
 
-    # 1. Checkpoints (+ nameslist.json next to them)
-    rc = _copy(rclone, f"{base}/checkpoints/", target / "checkpoints", env=env)
-    if rc != 0:
-        print(f"⚠ checkpoint copy returned {rc}", flush=True)
+    # 1. Checkpoint(s) — by default just the one Identify/Publish would use
+    # (accuracy-best), not every stage's multi-GB .ckpt. --select-by all
+    # restores the old pull-everything behaviour.
+    ckpt_dir = target / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    chosen = _pick_remote_checkpoints(rclone, f"{base}/checkpoints/", select_by, env=env)
+    if chosen:
+        print(f"→ Pulling checkpoint (select_by={select_by}): {', '.join(chosen)}", flush=True)
+        for name in chosen:
+            rc = _run([rclone, "copyto", f"{base}/checkpoints/{name}",
+                       str(ckpt_dir / name), "--progress",
+                       "--s3-chunk-size", "64M"], extra_env=env)
+            if rc != 0:
+                print(f"⚠ checkpoint copy returned {rc}", flush=True)
+        # nameslist.json + any other metadata sitting alongside the checkpoints.
+        _copy(rclone, f"{base}/checkpoints/", ckpt_dir, "--include", "*.json", env=env)
+    else:
+        print("  no .ckpt files found in archive checkpoints/ — skipping", flush=True)
 
     # 2. Per-project state (specsin, dwca) — copied selectively from project root
     _copy(rclone, f"{base}/", target,
@@ -211,8 +278,13 @@ def main() -> int:
     p.add_argument("--skip-images-if-present", action="store_true",
                    help="Skip pulling/extracting the image tarball when the "
                         "images directory already exists and is non-empty.")
+    p.add_argument("--select-by", choices=("accuracy", "loss", "all"), default="accuracy",
+                   help="Which archived checkpoint(s) to pull: highest "
+                        "val_Accuracy (default, matches Identify/Publish), "
+                        "lowest valid_loss, or all of them.")
     args = p.parse_args()
     return restore(args.project, args.target.resolve(),
+                   select_by=args.select_by,
                    remote=args.remote, images_dirname=args.images_dirname,
                    skip_images_if_present=args.skip_images_if_present)
 
