@@ -659,10 +659,13 @@ def _build_download() -> callable:
                      value="family").props("inline dense")
             .bind_value(gs, "dl_rank"))
     taxon     = _text_row("Taxon name:", "Ebenaceae", "w-48").bind_value(gs, "dl_taxon")
-    families  = (_text_row("Families (multi):", "", "w-full")
+    families  = (_text_row("Taxon list (multi):", "", "w-full")
                  .bind_value(gs, "dl_families"))
-    ui.label("Space-separated list for a combined GBIF bulk download (e.g. split clades). "
-             "Overrides Taxon name. Cloud mode only — requires GBIF credentials in Get Started tab."
+    ui.label("Space-separated list for a combined GBIF bulk download — split clades "
+             "(Family) or a clade smaller than a family such as the hippocratioid "
+             "Celastraceae (Genus). Uses the rank selected above, so every name must "
+             "sit at that rank. Overrides Taxon name. Requires GBIF credentials in the "
+             "Get Started tab."
              ).classes("text-caption text-grey-7 ml-48")
     continent = _text_row("Continent:", "AFRICA", "w-36").bind_value(gs, "dl_continent")
 
@@ -748,10 +751,12 @@ def _build_download() -> callable:
         t  = _v(taxon)
         ff = _v(families).split()
         if not d and not t and not ff:
-            raise ValueError("Enter a taxon name, a families list, or select a DwC-A ZIP.")
+            raise ValueError("Enter a taxon name, a multi-taxon list, or select a DwC-A ZIP.")
         cmd = [sys.executable, str(SCRIPTS["download"])]
         if d:  cmd += ["--dwca", d]
-        elif ff: cmd += ["--families"] + ff
+        # The multi-taxon list follows the rank radio: --genera for a sub-family
+        # clade, --families otherwise (ORDER has no multi form; treat it as family).
+        elif ff: cmd += ["--genera" if rank.value == "genus" else "--families"] + ff
         elif t: cmd += [f"--{rank.value}", t]
         c = _v(continent)
         if c: cmd += ["--continent", c]
@@ -1138,13 +1143,23 @@ def _build_train() -> tuple:
                  "same morphology but live in different ranges."
                  ).classes("text-caption text-grey-7")
 
-    with _accordion("Logging & resume", opened=False):
+    # Open this section when a resume checkpoint is already set. It's an
+    # advanced panel and normally collapsed, but a resume silently skips
+    # stage-1 warm-up, so it must never be in force while out of sight.
+    with _accordion("Logging & resume", opened=bool((gs.get("tr_resume") or "").strip())):
         with ui.row().classes("w-full items-center gap-2"):
             ui.label("WandB project:").classes("w-36 text-right shrink-0 font-medium").style("color:#455a64")
             wandb_proj = ui.input(value="").classes("w-48").props("dense outlined").bind_value(gs, "tr_wandb_proj")
             ui.label("(rarely changes — set once per project; experiments distinguished by Run name below)"
                      ).classes("text-caption text-grey-7")
         resume = _path_input("Resume checkpoint:", mode="file").bind_value(gs, "tr_resume")
+        with ui.row().classes("w-full items-center gap-2 ml-48") as resume_warn:
+            ui.icon("warning").style("color:#e65100;font-size:18px")
+            ui.label("Set — stage 1 warm-up will be SKIPPED and training continues "
+                     "from this checkpoint. Clear it for a fresh run."
+                     ).classes("text-caption").style("color:#e65100")
+        resume_warn.bind_visibility_from(resume, "value",
+                                         backward=lambda v: bool((v or "").strip()))
         reset_opt = (ui.checkbox(
             "Reset optimizer  (load weights only — use when starting a fresh stage 2 from a stage-1 checkpoint)",
             value=False).bind_value(gs, "tr_reset_optimizer")
@@ -1260,7 +1275,7 @@ def _build_train() -> tuple:
 
         return cmd
 
-    return _tr_cmd, tr_out, wandb_name, tr_sources, tr_model
+    return _tr_cmd, tr_out, wandb_name, tr_sources, tr_model, resume
 
 
 def _build_quick_identify() -> None:
@@ -3969,12 +3984,14 @@ def _build_setup() -> None:
 
     # ── GBIF ────────────────────────────────────────────────────────────────
     gbif_card, gbif_pill = _setup_card("grass", "GBIF",
-                                       "optional · needed for multi-family bulk downloads")
+                                       "optional · needed for multi-taxon bulk downloads")
     with gbif_card:
         ui.label(
-            "Required when using --families (e.g. a split clade like old Olacaceae). "
+            "Required for the Download tab's multi-taxon list — a split clade like "
+            "old Olacaceae (families), or a clade smaller than a family like the "
+            "hippocratioid Celastraceae (genera). "
             "The pipeline submits a single bulk download job to GBIF on the pod, "
-            "which is far faster than paginating the search API for each family. "
+            "which is far faster than paginating the search API for each taxon. "
             "Register at gbif.org — the same account you use on the website."
         ).classes("text-body2").style("color:#455a64")
 
@@ -5999,13 +6016,25 @@ def main_page():
                             ui.label("Project name:").classes("text-sm font-bold shrink-0")
                             proj_inp = (ui.input(value="").props("dense outlined").classes("w-44")
                                         .bind_value(app.storage.general, "main_proj"))
-                            # Keep the W&B run name in step with the project. tr_wandb_name
-                            # is otherwise only refreshed by "Apply paths", so a project
-                            # switch left it stale and W&B logged the run under the previous
-                            # family's name. Fires only on an actual change to the project.
-                            proj_inp.on_value_change(
-                                lambda e: setattr(tr_wandb_name, "value", (e.value or "").strip())
-                                if (e.value or "").strip() else None)
+                            # Keep per-project training state in step with the project.
+                            # These are otherwise only refreshed by "Apply paths", so a
+                            # project switch left them stale: W&B logged the run under the
+                            # previous family's name, and the resume checkpoint still
+                            # pointed into the old project — which skips stage-1 warm-up
+                            # and then fails on a path that no longer exists. Fires only
+                            # on an actual change to the project.
+                            def _on_proj_change(e) -> None:
+                                new = (e.value or "").strip()
+                                if not new:
+                                    return
+                                tr_wandb_name.value = new
+                                if (tr_resume.value or "").strip():
+                                    tr_resume.value = ""
+                                    ui.notify("Cleared the resume checkpoint from the "
+                                              "previous project — this run starts fresh.",
+                                              type="warning")
+
+                            proj_inp.on_value_change(_on_proj_change)
 
                         with ui.row().classes("items-center gap-1"):
                             ui.label("Image folder:").classes("text-sm font-bold shrink-0")
@@ -6114,7 +6143,8 @@ def main_page():
                             rs_cmd, rs_inp = _build_resize()
 
                     with ui.tab_panel(t_tr).classes("p-4"):
-                        tr_cmd, tr_out, tr_wandb_name, tr_sources, tr_model = _build_train()
+                        (tr_cmd, tr_out, tr_wandb_name, tr_sources, tr_model,
+                         tr_resume) = _build_train()
 
                     with ui.tab_panel(t_id).classes("p-4"):
                         id_cmd, id_ckpt, id_nl, id_out, id_sources = _build_identify(tr_model)
@@ -6203,6 +6233,21 @@ def main_page():
         )
 
     # ---- Apply-paths logic (closure over all inputs) ----
+    def _is_within(candidate: str, parent: Path) -> bool:
+        """True if `candidate` sits inside `parent`. Never raises: an unparsable
+        or foreign-root path (a pod path like /workspace/... under Windows) is
+        simply 'not inside', which is the safe answer for the resume check."""
+        try:
+            Path(candidate).resolve().relative_to(parent.resolve())
+            return True
+        except (ValueError, OSError):
+            return False
+
+    # Project this closure last applied paths for. Lets _apply_paths tell a real
+    # project SWITCH from a re-apply of the same one, which decides whether the
+    # resume checkpoint is stale or still the user's deliberate choice.
+    _applied_proj: list[str] = [(app.storage.general.get("main_proj") or "").strip()]
+
     def _apply_paths(base=None, name=None, img_folder=None):
         # Explicit args come from the Get Started "Create / open project" flow;
         # when the header button calls this they're None and we read the inputs.
@@ -6243,6 +6288,23 @@ def main_page():
         tr_out.value     = runs
         tr_wandb_name.value = name
         tr_sources.set_source(pair)
+        # Drop a resume checkpoint belonging to a DIFFERENT project. It lives in
+        # a collapsed accordion where nobody sees it, and left set it silently
+        # skips stage-1 warm-up, then either dies on a missing file or — worse —
+        # trains from the wrong project's weights. Kept when we're re-applying
+        # paths for the same project (in cloud mode it's a pod path like
+        # /workspace/... that no local check can vouch for) or when it genuinely
+        # lives inside this project's folder — re-applying paths must not
+        # cancel a deliberate resume.
+        old_ckpt = _v(tr_resume)
+        switched = _applied_proj[0] != name
+        if old_ckpt and switched and not _is_within(old_ckpt, proj):
+            tr_resume.value = ""
+            ui.notify(f"Cleared the resume checkpoint left over from "
+                      f"{_applied_proj[0] or 'another project'} "
+                      f"({Path(old_ckpt).name}) — {name} starts fresh.",
+                      type="warning")
+        _applied_proj[0] = name
         id_ckpt.value    = ckpt
         id_nl.value      = nl
         id_out.value     = review

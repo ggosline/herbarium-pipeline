@@ -1654,6 +1654,20 @@ if __name__ == "__main__":
               flush=True)
 
     args = parse_args()
+
+    # Fail fast on a resume checkpoint that isn't there. A stale --resume is
+    # not merely fatal-later, it changes the run: `do_stage1` is False whenever
+    # resume is set, so warm-up is silently skipped. Without this check the
+    # error surfaces only after the sources are scanned and the images staged
+    # — many minutes and, on a pod, real money into the run.
+    if args.resume and not Path(args.resume).exists():
+        sys.exit(
+            f"--resume checkpoint not found: {args.resume}\n"
+            f"Nothing was trained. If this path belongs to a previous project, "
+            f"clear the 'Resume checkpoint' box under Train → 'Logging & resume' "
+            f"(it is collapsed by default) and run again for a fresh run."
+        )
+
     config = dict(
         sources=args.sources,
         output_dir=args.output_dir,
