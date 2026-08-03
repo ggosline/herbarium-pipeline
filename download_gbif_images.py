@@ -11,6 +11,7 @@ Usage:
   python download_gbif_images.py --family Ebenaceae --continent AFRICA --exclude-countries MG
   python download_gbif_images.py --family Ebenaceae --countries ZA NG TZ KE
   python download_gbif_images.py --family Ebenaceae --output-dir /path/to/project/images --specsin /path/to/project/specsin.csv
+  python download_gbif_images.py --genera Salacia Loeseneriella Reissantia --continent AFRICA
 
 GBIF continent codes:
   AFRICA, ASIA, EUROPE, NORTH_AMERICA, SOUTH_AMERICA, OCEANIA, ANTARCTICA
@@ -938,8 +939,15 @@ def request_gbif_download(
     predicates: list[dict] = []
 
     # Resolve each taxon name to a GBIF key; the download API requires numeric keys.
+    # An all-digit entry is passed through as a key already. That's the escape
+    # hatch for a name the backbone holds twice: species/match returns only the
+    # ACCEPTED node, so occurrences filed under a DOUBTFUL duplicate would be
+    # dropped (Celastraceae's Campylostemon is both 7855427 and 7506323).
+    # List the extra key alongside the name to pull both.
     print(f"Resolving GBIF taxon keys for {len(families)} {rank.lower()}(s)...")
-    fam_preds = [{"type": "equals", "key": "TAXON_KEY", "value": gbif_taxon_key(f, rank)} for f in families]
+    fam_preds = [{"type": "equals", "key": "TAXON_KEY",
+                  "value": f if f.isdigit() else gbif_taxon_key(f, rank)}
+                 for f in families]
     predicates.append(fam_preds[0] if len(fam_preds) == 1 else {"type": "or", "predicates": fam_preds})
 
     predicates.append({"type": "equals", "key": "MEDIA_TYPE", "value": "StillImage"})
@@ -1037,6 +1045,14 @@ def main() -> None:
                             "Requires GBIF_USER and GBIF_PASSWORD env vars. "
                             "Downloads a single DwC-A zip covering all families at once. "
                             "Use --dwca-out to control where the zip is saved.")
+    group.add_argument("--genera", nargs="+", metavar="GENUS",
+                       help="Two or more genera for a combined GBIF bulk download — "
+                            "the way to grab a clade that isn't a whole family "
+                            "(e.g. the hippocratioid genera of Celastraceae). "
+                            "Same mechanics as --families but resolved at rank GENUS; "
+                            "requires GBIF_USER and GBIF_PASSWORD env vars. "
+                            "An all-digit entry is used as a GBIF taxon key verbatim, "
+                            "which is how you also pull a name the backbone holds twice.")
 
     parser.add_argument("--continent", metavar="CONTINENT", default=None,
                         help=f"GBIF continent code: {', '.join(sorted(VALID_CONTINENTS))}")
@@ -1104,22 +1120,28 @@ def main() -> None:
                              "URLs cost up to ~90s each to retry. Omit (default) "
                              "to retry every failed row.")
     parser.add_argument("--dwca-out", type=Path, default=None, metavar="ZIP",
-                        help="Where to save the downloaded DwC-A zip when using --families "
-                             "(default: ./<joined_names>.zip next to --specsin).")
+                        help="Where to save the downloaded DwC-A zip when using --families, "
+                             "--genera or --order (default: ./<joined_names>.zip next to "
+                             "--specsin).")
 
     args = parser.parse_args()
 
     if (not args.dwca and not args.family and not args.genus and not args.order
-            and not args.families and not args.from_specsin):
-        parser.error("Provide --from-specsin, --family, --genus, --order, --families, or --dwca.")
+            and not args.families and not args.genera and not args.from_specsin):
+        parser.error("Provide --from-specsin, --family, --genus, --genera, --order, "
+                     "--families, or --dwca.")
 
     if args.continent and args.continent.upper() not in VALID_CONTINENTS:
         parser.error(f"Unknown continent '{args.continent}'. Valid: {', '.join(sorted(VALID_CONTINENTS))}")
 
     if args.from_specsin:
         taxon = args.from_specsin.stem
-    elif args.families:
-        taxon = "_".join(safe_name(f) for f in args.families)
+    elif args.families or args.genera:
+        # A clade can run to a dozen-plus genera; joining them all makes a
+        # filename no OS will take, so cap it and name the rest by count.
+        names = args.families or args.genera
+        taxon = ("_".join(safe_name(n) for n in names) if len(names) <= 3
+                 else f"{safe_name(names[0])}_plus{len(names) - 1}")
     else:
         taxon = (args.family or args.genus or args.order
                  or (args.dwca.stem if args.dwca else "download"))
@@ -1163,18 +1185,26 @@ def main() -> None:
         else:
             for r in records:
                 r.pop("_hasfile_prev", None)
-    elif args.families:
+    elif args.families or args.genera or args.order:
+        # The three bulk-download paths differ only in the rank the names are
+        # resolved at; GBIF's TAXON_KEY predicate does the rest.
+        if args.families:
+            bulk_names, bulk_rank, bulk_flag = args.families, "FAMILY", "--families"
+        elif args.genera:
+            bulk_names, bulk_rank, bulk_flag = args.genera, "GENUS", "--genera"
+        else:
+            bulk_names, bulk_rank, bulk_flag = [args.order], "ORDER", "--order"
         gbif_user = os.environ.get("GBIF_USER", "").strip()
         gbif_pass = os.environ.get("GBIF_PASSWORD", "").strip()
         if not gbif_user or not gbif_pass:
-            parser.error("--families requires GBIF credentials. "
+            parser.error(f"{bulk_flag} requires GBIF credentials. "
                          "Set GBIF_USER and GBIF_PASSWORD environment variables.")
         dwca_out = args.dwca_out or specsin_path.parent / f"{taxon_key}.zip"
         if dwca_out.exists():
             print(f"  Reusing existing DwC-A zip: {dwca_out}")
         else:
             dwca_out = request_gbif_download(
-                families=args.families,
+                families=bulk_names,
                 continent=kw["continent"],
                 countries=kw["countries"],
                 exclude_countries=kw["exclude_countries"],
@@ -1182,28 +1212,7 @@ def main() -> None:
                 username=gbif_user,
                 password=gbif_pass,
                 dest=dwca_out,
-            )
-        records = load_dwca(dwca_out, **kw)
-    elif args.order:
-        gbif_user = os.environ.get("GBIF_USER", "").strip()
-        gbif_pass = os.environ.get("GBIF_PASSWORD", "").strip()
-        if not gbif_user or not gbif_pass:
-            parser.error("--order requires GBIF credentials. "
-                         "Set GBIF_USER and GBIF_PASSWORD environment variables.")
-        dwca_out = args.dwca_out or specsin_path.parent / f"{taxon_key}.zip"
-        if dwca_out.exists():
-            print(f"  Reusing existing DwC-A zip: {dwca_out}")
-        else:
-            dwca_out = request_gbif_download(
-                families=[args.order],
-                continent=kw["continent"],
-                countries=kw["countries"],
-                exclude_countries=kw["exclude_countries"],
-                basis_of_record=kw["basis_of_record"],
-                username=gbif_user,
-                password=gbif_pass,
-                dest=dwca_out,
-                rank="ORDER",
+                rank=bulk_rank,
             )
         records = load_dwca(dwca_out, **kw)
     elif args.dwca:
@@ -1211,8 +1220,8 @@ def main() -> None:
     elif args.family or args.genus:
         records = search_occurrences(**kw)
     else:
-        parser.error("Provide --from-specsin, --dwca, --family, --genus, --order, or --families to specify "
-                      "which records to download.")
+        parser.error("Provide --from-specsin, --dwca, --family, --genus, --genera, "
+                     "--order, or --families to specify which records to download.")
 
     if args.limit:
         records = records[: args.limit]

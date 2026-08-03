@@ -1240,17 +1240,22 @@ download() {
       --per-host-workers "$PER_HOST_WORKERS" \
       "${EXTRA[@]}"
   elif [ -n "${TAXON_FAMILIES:-}" ]; then
-    # Multiple families (e.g. split clade like old Olacaceae).
+    # Multiple taxa in one bulk download — a split clade like old Olacaceae
+    # (families), or a clade smaller than a family like the hippocratioid
+    # Celastraceae (genera). RANK picks which; the names must all sit at that
+    # rank, since GBIF resolves each one there and rejects a rank mismatch.
     # Submits one GBIF bulk download job, waits for it, then downloads the zip.
     # Requires GBIF_USER and GBIF_PASSWORD env vars (forwarded by orchestrator).
+    MULTI_FLAG="--families"
+    [ "${RANK:-family}" = "genus" ] && MULTI_FLAG="--genera"
     GEO=()
     [ -n "${CONTINENT:-}" ]         && GEO+=(--continent "$CONTINENT")
     [ -n "${EXCLUDE_COUNTRIES:-}" ] && GEO+=(--exclude-countries $EXCLUDE_COUNTRIES)
     [ -n "${COUNTRIES:-}" ]         && GEO+=(--countries $COUNTRIES)
-    echo "Requesting GBIF bulk download for: $TAXON_FAMILIES"
+    echo "Requesting GBIF bulk download ($MULTI_FLAG) for: $TAXON_FAMILIES"
     # shellcheck disable=SC2086  # word-split on TAXON_FAMILIES is intentional
     python -u "$REPO/download_gbif_images.py" \
-      --families $TAXON_FAMILIES \
+      $MULTI_FLAG $TAXON_FAMILIES \
       --dwca-out "$DWCA" \
       --output-dir "$IMG_RAW" \
       --specsin "$SPECSIN" \
@@ -1284,7 +1289,7 @@ download() {
       "${GEO[@]}" \
       "${EXTRA[@]}"
   else
-    echo "ERROR: nothing to download. Set a taxon (rank + name) or a families" >&2
+    echo "ERROR: nothing to download. Set a taxon (rank + name) or a multi-taxon" >&2
     echo "list in the Download tab, upload a DwC-A, or provide a specsin." >&2
     exit 2
   fi

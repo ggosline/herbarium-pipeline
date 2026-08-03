@@ -1231,7 +1231,8 @@ class CloudOrchestrator:
         # watchdog and bill until killed by hand. Not caller-overridable: it
         # is a property of the pod we are talking to, not a setting.
         env = {**(env or {}), "RUNPOD_POD_ID": handle.pod_id}
-        # Auto-inject GBIF credentials for the download step so --families works on-pod.
+        # Auto-inject GBIF credentials for the download step so the bulk-download
+        # paths (--families / --genera / --order) work on-pod.
         if step == "download":
             gbif = secrets.get_gbif_credentials()
             if gbif:
