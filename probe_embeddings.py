@@ -56,6 +56,13 @@ from identify_herbarium import (
 
 Image.MAX_IMAGE_PIXELS = None
 
+# tqdm draws with carriage returns, which turn a redirected log into one
+# unreadable line — the stdout/TTY problem this project hits repeatedly. Default
+# to quiet whenever stdout is not a terminal; --quiet forces it either way.
+# Read through the module (probe_embeddings.QUIET), never `from ... import QUIET`,
+# so a runtime override is visible to every caller.
+QUIET = not sys.stdout.isatty()
+
 META_NAME = "meta.csv"
 FEAT_NAME = "features.npz"
 
@@ -172,7 +179,7 @@ def extract(backbone, paths: list[str], image_sz: int, batch_size: int,
     gh, gw = grid_shape(backbone, image_sz)
     rng = np.random.RandomState(seed)
     pooled_all = []
-    for batch, _, _ in tqdm(loader, desc="Extracting", unit="batch"):
+    for batch, _, _ in tqdm(loader, desc="Extracting", unit="batch", disable=QUIET):
         batch = batch.to(device, non_blocking=True)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                             enabled=device.type == "cuda"):

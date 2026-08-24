@@ -38,6 +38,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from identify_herbarium import InferenceDataset, encode_coords, load_model, resolve_checkpoint
+import probe_embeddings as pe
 from probe_embeddings import META_NAME, FEAT_NAME, extract, grid_shape, load_backbone
 
 Image.MAX_IMAGE_PIXELS = None
@@ -174,7 +175,8 @@ def predict(model, paths, geo, image_sz, batch_size, device, workers,
     loader = DataLoader(ds, batch_size=batch_size, num_workers=workers,
                         pin_memory=True, shuffle=False)
     top1, top5, conf = [], [], []
-    for batch, _, batch_geo in tqdm(loader, desc="Inferring", unit="batch", leave=False):
+    for batch, _, batch_geo in tqdm(loader, desc="Inferring", unit="batch",
+                                    leave=False, disable=pe.QUIET):
         batch = batch.to(device, non_blocking=True)
         g = batch_geo.to(device) if geo is not None else None
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
