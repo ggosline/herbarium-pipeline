@@ -66,19 +66,110 @@ TAXPUB_NS = {"tp": "http://www.plazi.org/taxpub"}
 # That is label noise, and it biases TCAV towards zero rather than inventing an
 # effect — but it also means a CAV can learn 'these species' instead of the
 # trait, which is what the cross-genus control in `cav` exists to catch.
-TREATMENT_PATTERNS = {
-    # Treatments differ in wording between works and the patterns have to span
-    # them: the Cameroon flora writes "secondary veins 8 to 12 pairs" and
-    # "blade 7-28 cm long", the Xylopia monograph "secondary veins
-    # brochidodromous, 7-11 per side" and "larger blades 5.1-11.8 cm long".
-    # Hence the tolerant gap before the numbers, and 'pairs|per side'.
-    "veins":  re.compile(r"secondary veins?[^.]{0,100}?(\d+)\s*(?:to|[-–])\s*(\d+)"
-                         r"\s*(?:pairs|per side)", re.I),
-    "blade":  re.compile(r"blades?[^.]{0,80}?([\d.]+)\s*[-–]\s*([\d.]+)\s*cm long,\s*"
-                         r"([\d.]+)\s*[-–]\s*([\d.]+)\s*cm wide", re.I),
-    "liana":  re.compile(r"\b(liana|climb\w*|scandent|twining)", re.I),
-    "tree":   re.compile(r"\b(tree|shrub)", re.I),
-}
+# Every revision words its descriptions differently, so each trait is a LIST of
+# alternatives tried in order. Observed so far:
+#   Cameroon flora   "secondary veins 8 to 12 pairs"  / "blade 7-28 cm long, 2-9.5 cm wide"
+#   Xylopia monograph"secondary veins ..., 7-11 per side" / "blades 5.1-11.8 cm long, ..."
+#   Monanthotaxis    "secondary veins ... 7-9 per side"  / "lamina ... 8.4-14 by 2.9-5.2 cm"
+# A pattern fitted to one work extracts NOTHING from another while habit and
+# indumentum keep parsing, so the output looks healthy — check fill rates.
+VEIN_PATTERNS = [
+    re.compile(r"secondary veins?[^.]{0,100}?(\d+)\s*(?:to|[-–])\s*(\d+)"
+               r"\s*(?:pairs|per side)", re.I),
+]
+BLADE_PATTERNS = [
+    re.compile(r"blades?[^.]{0,80}?([\d.]+)\s*[-–]\s*([\d.]+)\s*cm long,\s*"
+               r"([\d.]+)\s*[-–]\s*([\d.]+)\s*cm wide", re.I),
+    re.compile(r"lamina[^.]{0,200}?([\d.]+)\s*[-–]\s*([\d.]+)\s*by\s*"
+               r"([\d.]+)\s*[-–]\s*([\d.]+)\s*cm", re.I),
+]
+RATIO_PATTERN = re.compile(r"([\d.]+)\s*[-–]\s*([\d.]+)\s*times longer than wide", re.I)
+LIANA_PATTERN = re.compile(r"\b(liana|climb\w*|scandent|twining|lianescent)", re.I)
+TREE_PATTERN = re.compile(r"\b(tree|shrub)", re.I)
+
+
+def extract_traits(text: str) -> dict:
+    """Measured traits from one species description, whatever its house style."""
+    row: dict = {}
+    for pat in VEIN_PATTERNS:
+        m = pat.search(text)
+        if m:
+            row["vein_pairs"] = (int(m.group(1)) + int(m.group(2))) / 2
+            break
+    for pat in BLADE_PATTERNS:
+        m = pat.search(text)
+        if m:
+            lo_l, hi_l, lo_w, hi_w = (float(m.group(i)) for i in range(1, 5))
+            row["blade_len"] = (lo_l + hi_l) / 2
+            row["blade_wid"] = (lo_w + hi_w) / 2
+            row["blade_ratio"] = row["blade_len"] / max(row["blade_wid"], 1e-6)
+            break
+    # Some works state elongation outright, which beats dividing two midpoints.
+    m = RATIO_PATTERN.search(text)
+    if m:
+        row["blade_ratio"] = (float(m.group(1)) + float(m.group(2))) / 2
+    # Habit comes from the sentence that opens the description ("Shrub or
+    # liana, to 6 m long; ..."), located by its opening word rather than by a
+    # fixed offset: in a PDF revision the synonymy and type block sit between
+    # the heading and the description, so any window measured from the start
+    # either misses the habit or drags in unrelated prose.
+    m = re.search(r"(?:^|[.;]\s)((?:Trees?|Shrubs?|Lianas?|Climbers?|Herbs?)"
+                  r"[^.]{0,300})", text)
+    habit_sentence = m.group(1) if m else text[:220]
+    if LIANA_PATTERN.search(habit_sentence):
+        row["habit_liana"] = 1
+    elif TREE_PATTERN.search(habit_sentence):
+        row["habit_liana"] = 0
+    # Blade indumentum specifically, not the whole plant's: almost every
+    # description says both 'glabrous' and 'pubescent' about some organ.
+    seg = re.split(r"secondary veins?", text, flags=re.I)[0]
+    low = seg.lower()
+    cut = max(low.find("blade"), low.find("lamina"))
+    seg = seg[cut:] if cut >= 0 else ""
+    if seg:
+        pub = len(re.findall(r"pubescen|puberul|tomentos|villous|hairy|sericeous|hairs",
+                             seg, re.I))
+        gla = len(re.findall(r"glabrous|glabrate", seg, re.I))
+        if pub or gla:
+            row["blade_hairy"] = int(pub > gla)
+    return row
+
+
+def parse_pdf_treatments(path: Path) -> pd.DataFrame:
+    """Species descriptions from a plain PDF revision with a text layer.
+
+    Treatments are found by their numbered headings ("4. Monanthotaxis
+    atopostema"). Where a species appears more than once (key entries, running
+    heads) the longest block wins, which is the description rather than the
+    cross-reference.
+    """
+    import fitz
+
+    doc = fitz.open(str(path))
+    text = "\n".join(page.get_text() for page in doc)
+    text = text.replace("\u00ad", "")                      # soft hyphens
+    text = re.sub(r"-\n(?=[a-z])", "", text)               # hyphenated line breaks
+    # Headings must be matched BEFORE newlines are collapsed: only the line
+    # anchor separates a real treatment heading from a literature citation like
+    # "... (1971b) 30, non Monanthotaxis angustifolia". Without it the parser
+    # finds three times too many "species", each with the wrong text attached.
+    heads = list(re.finditer(r"^\s{0,4}(\d+)\.\s+([A-Z][a-z]+)\s+([a-z\-]{3,})\b",
+                             text, re.M))
+    if not heads:
+        raise SystemExit(f"ERROR: no numbered species headings found in {path.name}.")
+    best: dict[str, str] = {}
+    for i, h in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        name = f"{h.group(2)} {h.group(3)}"
+        seg = re.sub(r"\s*\n\s*", " ", text[h.start():end])
+        if len(seg) > len(best.get(name, "")):
+            best[name] = seg
+    rows = []
+    for name, seg in best.items():
+        row = {"species": name, "source": path.name}
+        row.update(extract_traits(seg))
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def parse_treatments(paths: list[Path]) -> pd.DataFrame:
@@ -103,32 +194,7 @@ def parse_treatments(paths: list[Path]) -> pd.DataFrame:
                 continue
             text = " ".join("".join(q.itertext()) for q in secs[0].findall(".//p"))
             row = {"species": f"{genus} {epithet}", "source": path.name}
-
-            m = TREATMENT_PATTERNS["veins"].search(text)
-            if m:
-                row["vein_pairs"] = (int(m.group(1)) + int(m.group(2))) / 2
-            m = TREATMENT_PATTERNS["blade"].search(text)
-            if m:
-                lo_l, hi_l, lo_w, hi_w = (float(m.group(i)) for i in range(1, 5))
-                row["blade_len"] = (lo_l + hi_l) / 2
-                row["blade_wid"] = (lo_w + hi_w) / 2
-                row["blade_ratio"] = row["blade_len"] / max(row["blade_wid"], 1e-6)
-            head = text[:160]
-            if TREATMENT_PATTERNS["liana"].search(head):
-                row["habit_liana"] = 1
-            elif TREATMENT_PATTERNS["tree"].search(head):
-                row["habit_liana"] = 0
-            # Blade indumentum specifically, not the plant's: read only the
-            # stretch of text between 'blade' and 'secondary veins', because
-            # almost every description says both 'glabrous' and 'pubescent'
-            # somewhere about some organ.
-            seg = re.split(r"secondary veins?", text, flags=re.I)[0]
-            seg = seg[seg.lower().find("blade"):] if "blade" in seg.lower() else ""
-            if seg:
-                pub = len(re.findall(r"pubescen|puberul|tomentos|villous|hairy", seg, re.I))
-                gla = len(re.findall(r"glabrous", seg, re.I))
-                if pub or gla:
-                    row["blade_hairy"] = int(pub > gla)
+            row.update(extract_traits(text))
             rows.append(row)
     return pd.DataFrame(rows).drop_duplicates("species")
 
@@ -136,7 +202,18 @@ def parse_treatments(paths: list[Path]) -> pd.DataFrame:
 def stage_from_treatments(args) -> None:
     out = Path(args.out)
     df = pd.read_csv(out / META_NAME)
-    tr = parse_treatments([Path(p) for p in args.xml])
+    frames = []
+    if args.xml:
+        frames.append(parse_treatments([Path(p) for p in args.xml]))
+    for pdf in (args.pdf or []):
+        frames.append(parse_pdf_treatments(Path(pdf)))
+    tr = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not tr.empty:
+        # Prefer the row that actually carries measurements when a species is
+        # treated in more than one work.
+        tr["_filled"] = tr.notna().sum(axis=1)
+        tr = (tr.sort_values("_filled", ascending=False)
+                .drop_duplicates("species").drop(columns="_filled"))
     if tr.empty:
         raise SystemExit("ERROR: no treatments parsed — is this TaxPub XML?")
     ours = set(df["species"].unique())
@@ -504,7 +581,9 @@ def parse_args(argv=None):
 
     t = sub.add_parser("from-treatments", help="Traits from TaxPub treatment XML.")
     common(t)
-    t.add_argument("--xml", nargs="+", required=True)
+    t.add_argument("--xml", nargs="*", default=[], help="TaxPub treatment XML.")
+    t.add_argument("--pdf", nargs="*", default=[],
+                   help="Plain PDF revisions with a text layer.")
     t.add_argument("--min-specimens", type=int, default=60)
     t.set_defaults(func=stage_from_treatments)
 
