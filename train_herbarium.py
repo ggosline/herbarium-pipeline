@@ -402,20 +402,42 @@ def create_dali_pipeline(files, labels, crop, size, shard_id, num_shards,
 # Model
 # ---------------------------------------------------------------------------
 
+def _create_timm(model_name: str, img_size: int = 0, **kwargs):
+    """timm.create_model, forwarding img_size only to backbones that accept it.
+
+    A ViT with a learned position-embedding grid bakes that grid in at
+    construction, so a backbone whose pretrained cfg is smaller than our
+    --image-sz must be told the real input size or it rejects the input.
+    RoPE ViTs need no such help (both vit_large_patch16_dinov3 and
+    vit_large_patch16_lingbot report pos_embed=None, dynamic_img_size=True,
+    strict_img_size=False and run at any size), so for them img_size is a
+    verified no-op and the 640 px baseline is unchanged. CNNs (efficientnet
+    et al.) take no img_size argument at all and raise TypeError, so fall
+    back to plain creation.
+    """
+    if img_size:
+        try:
+            return timm.create_model(model_name, img_size=img_size, **kwargs)
+        except TypeError:
+            pass
+    return timm.create_model(model_name, **kwargs)
+
+
 class TimmModel(nn.Module):
     def __init__(self, model_name: str, num_classes: int, pretrained: bool = True,
-                 geo_dim: int = 0):
+                 geo_dim: int = 0, img_size: int = 0):
         super().__init__()
         self.geo_dim = geo_dim
         if geo_dim:
-            self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+            self.backbone = _create_timm(model_name, img_size, pretrained=pretrained, num_classes=0)
             feat_dim = self.backbone.num_features
             self.geo_mlp = nn.Sequential(
                 nn.Linear(4, geo_dim), nn.GELU(), nn.Linear(geo_dim, geo_dim)
             )
             self.head = nn.Linear(feat_dim + geo_dim, num_classes)
         else:
-            self.model = timm.create_model(model_name, pretrained=pretrained, num_classes=num_classes)
+            self.model = _create_timm(model_name, img_size, pretrained=pretrained,
+                                      num_classes=num_classes)
 
     def forward(self, x, geo=None):
         if self.geo_dim:
@@ -465,9 +487,10 @@ class TimmModelHierarchical(nn.Module):
                  num_genus: int = 0,
                  num_family: int = 0,
                  pretrained: bool = True,
-                 geo_dim: int = 0):
+                 geo_dim: int = 0,
+                 img_size: int = 0):
         super().__init__()
-        self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        self.backbone = _create_timm(model_name, img_size, pretrained=pretrained, num_classes=0)
         feat_dim = self.backbone.num_features
         self.geo_dim = geo_dim
         if geo_dim:
@@ -1154,11 +1177,13 @@ def train(config: dict):
             num_family=data.num_family,
             pretrained=config.get("pretrained", True),
             geo_dim=geo_dim,
+            img_size=config.get("image_sz", 0),
         )
     else:
         model = TimmModel(config["model_name"], num_classes=data.num_classes,
                           pretrained=config.get("pretrained", True),
-                          geo_dim=geo_dim)
+                          geo_dim=geo_dim,
+                          img_size=config.get("image_sz", 0))
     # Gradient checkpointing trades ~30% compute for activation memory.
     # Required on 24 GB cards (3090) at ViT-L 640px batch=4. On A100s with
     # plenty of VRAM headroom, disabling it gives back the compute and lifts

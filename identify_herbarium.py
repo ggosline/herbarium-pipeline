@@ -555,8 +555,27 @@ def _check_arch(state_dict: dict, model_name: str, feat_dim: int) -> None:
         )
 
 
+def _create_timm(model_name: str, img_size: int = 0, **kwargs):
+    """timm.create_model, forwarding img_size only to backbones that accept it.
+
+    Twin of the helper in train_herbarium.py, duplicated to keep this module
+    free of the lightning/DALI import chain. A ViT with a learned pos-embed
+    grid builds the wrong grid when constructed at its pretrained size but fed
+    --image-sz — and since we load weights with strict=False, that mismatch
+    surfaces only as a "missing keys" warning rather than an error, so pass the
+    real inference size. RoPE ViTs (dinov3, lingbot) ignore img_size; CNNs
+    raise TypeError, so fall back to plain creation.
+    """
+    if img_size:
+        try:
+            return timm.create_model(model_name, img_size=img_size, **kwargs)
+        except TypeError:
+            pass
+    return timm.create_model(model_name, **kwargs)
+
+
 def build_model_from_state(state_dict: dict, model_name: str, num_classes: int,
-                           geo_dim: int) -> nn.Module:
+                           geo_dim: int, img_size: int = 0) -> nn.Module:
     """Reconstruct the inference model from a cleaned state_dict.
 
     Mirrors the architecture in train_herbarium: a plain timm classifier, or a
@@ -565,7 +584,7 @@ def build_model_from_state(state_dict: dict, model_name: str, num_classes: int,
     reconstruct weights identically.
     """
     if geo_dim:
-        backbone = timm.create_model(model_name, pretrained=False, num_classes=0)
+        backbone = _create_timm(model_name, img_size, pretrained=False, num_classes=0)
         feat_dim = backbone.num_features
         _check_arch(state_dict, model_name, feat_dim)
         geo_mlp = nn.Sequential(
@@ -588,7 +607,8 @@ def build_model_from_state(state_dict: dict, model_name: str, num_classes: int,
         model = _GeoModel(backbone, geo_mlp, head, geo_dim)
         print(f"  Geo-capable model built (feat_dim={feat_dim}, geo_dim={geo_dim})")
     else:
-        model = timm.create_model(model_name, pretrained=False, num_classes=num_classes)
+        model = _create_timm(model_name, img_size, pretrained=False,
+                             num_classes=num_classes)
         _check_arch(state_dict, model_name, model.num_features)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if unexpected:
@@ -778,7 +798,8 @@ def identify(args):
 
     print(f"Building model: {model_name}  ({num_classes} classes)")
 
-    base_model = build_model_from_state(state_dict, model_name, num_classes, geo_dim)
+    base_model = build_model_from_state(state_dict, model_name, num_classes, geo_dim,
+                                        img_size=args.image_sz)
 
     # Attach the trained genus head so genus is predicted directly rather than
     # read off the first word of the species guess.

@@ -43,8 +43,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # only-managed above forces uv to install its own CPython under
 # /opt/uv-python (the CUDA base ships no python), so the interpreter the venv
 # symlinks to lives at a known path we can copy into the final stage.
+# git is needed by `uv sync` itself: local-ml pins timm to a GitHub commit
+# (the LingBot entrypoints predate any timm release), and uv clones it here.
 RUN apt-get update -qq \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl git \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
