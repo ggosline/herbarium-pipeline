@@ -220,6 +220,17 @@ SYNC_FILE_PATTERNS = ("*.py", "*.sh", "pyproject.toml", "uv.lock", "README.md")
 
 # ── handle returned to callers ───────────────────────────────────────────
 
+class PodAuthError(RuntimeError):
+    """sshd rejected our key — a credential problem, not a bad host.
+
+    Kept distinct from the "bad host" path because the two want opposite
+    responses. A broken-egress host is machine-specific, so recycling onto a
+    different machine is the fix. A rejected key fails identically on every
+    machine in every datacenter, so recycling just burns one pod per attempt
+    and still ends in failure.
+    """
+
+
 @dataclass(frozen=True)
 class PodHandle:
     """Everything the UI needs to know about a running pod.
@@ -342,6 +353,10 @@ class CloudOrchestrator:
         try:
             session = await self._ensure_session(handle, on_log=on_log)
             _, out = await session.exec_capture(cmd)
+        except PodAuthError:
+            # Credential failure, not a host failure — let it abort provisioning
+            # rather than being scored as an unreachable host.
+            raise
         except Exception as e:
             on_log(f"  egress probe could not run: {e}")
             return False
@@ -468,6 +483,19 @@ class CloudOrchestrator:
                 await session.connect()
                 self._sessions[handle.pod_id] = session
                 return session
+            except paramiko.AuthenticationException as e:
+                # Not a startup race: sshd is up and refused the key. RunPod
+                # injects PUBLIC_KEY from the ACCOUNT's SSH keys, so a key that
+                # is not registered there is refused on every pod, and retrying
+                # only delays the same failure.
+                await session.aclose()
+                raise PodAuthError(
+                    f"sshd rejected the SSH key ({e}). RunPod authorizes only "
+                    f"the public keys registered on your ACCOUNT (Settings → "
+                    f"SSH Public Keys), and "
+                    f"{self._key_filename or '(paramiko default keys)'} is not "
+                    f"among them. Add its .pub there, then retry."
+                ) from e
             except (paramiko.SSHException, OSError, EOFError) as e:
                 last_err = e
                 await session.aclose()
@@ -615,7 +643,16 @@ class CloudOrchestrator:
             self._save_state()
 
             handle = self._handle_from_pod(ready)
-            if await self._egress_ok(handle, on_log=on_log):
+            try:
+                reachable = await self._egress_ok(handle, on_log=on_log)
+            except PodAuthError:
+                # This pod is paid for and has no idle watchdog yet (that
+                # starts in `setup`, which we never reached), so it would bill
+                # until someone noticed. Kill it, then surface the real cause.
+                on_log(f"  ✗ pod {pod.id}: SSH key rejected — terminating")
+                await self.terminate(handle, keep_volume=True, on_log=on_log)
+                raise
+            if reachable:
                 return handle
 
             # Bad host. Recycling costs a couple of minutes; keeping it costs
