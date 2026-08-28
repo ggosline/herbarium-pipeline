@@ -62,6 +62,7 @@ SCRIPTS = {
 
 TIMM_MODELS = [
     "vit_large_patch16_dinov3.lvd1689m",
+    "vit_large_patch16_lingbot.robbyant",
     "convnext_base_384_in22ft1k",
     "convnext_large_384_in22ft1k",
     "efficientnet_b4",
