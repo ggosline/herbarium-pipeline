@@ -1377,6 +1377,23 @@ def train(config: dict):
         if hasattr(model_module, "unfreeze_all"):
             model_module.unfreeze_all()
 
+        # torch.compile traced stage 1 with the backbone frozen, so its backward
+        # graph treats those parameters as constants. Flipping requires_grad does
+        # NOT invalidate that graph on torch 2.11: stage 2 then silently trains
+        # the head alone — same loss curve shape, ~3x too fast, and the backbone
+        # comes out bit-identical to the stage-1 checkpoint.
+        #
+        # Re-wrapping in torch.compile() does not help; the cache is keyed on the
+        # underlying code, so a fresh wrapper hits the same stale graph. Only
+        # clearing dynamo's cache forces the retrace that picks up the unfrozen
+        # parameters. Verified both ways on 2.11.0+cu130.
+        # torch.compiler.reset(), not `import torch._dynamo` — a function-local
+        # import of a torch submodule rebinds the name `torch` for this whole
+        # scope, shadowing the module-level import.
+        if config.get("compile_model", True) and num_gpus == 1:
+            torch.compiler.reset()
+            print("compile cache reset — stage 2 retraces with the backbone unfrozen")
+
         # Patience 2 on val_Accuracy. Replayed against the real curves of the last
         # three runs (Rubiaceae, Opiliaceae, Icacinales) this stops 2-3 epochs
         # early and still captures each run's exact peak — the tail buys nothing.
