@@ -140,44 +140,51 @@ def rollout_map(backbone, tensor: torch.Tensor, device) -> np.ndarray:
 # Selection + rendering
 # ---------------------------------------------------------------------------
 
-def pick(df: pd.DataFrame, args) -> pd.DataFrame:
-    """Which specimens to draw: random, one species, or a step-1 contrast."""
+def pick(df: pd.DataFrame, args, level_col: str) -> pd.DataFrame:
+    """Which specimens to draw: random, one taxon, or a step-1 contrast.
+
+    `level_col` is the rank the model predicts — species for the Annonaceae run,
+    family for the Angiosperm one. Everything selected or grouped here has to
+    follow it, or a family-level model gets contrasted on taxa it never scores.
+    """
     rng = np.random.RandomState(args.seed)
-    if args.species:
-        sub = df[df["species"] == args.species]
+    taxon = args.taxon or args.species
+    if taxon:
+        sub = df[df[level_col] == taxon]
         if sub.empty:
-            raise SystemExit(f"ERROR: no held-out specimen of '{args.species}'.")
+            raise SystemExit(f"ERROR: no held-out specimen of {level_col} '{taxon}'.")
         return sub.head(args.n)
     if args.contrast:
-        per_file = Path(args.out) / "perturbation_per_species.csv"
+        per_file = Path(args.out) / "perturbation_per_taxon.csv"
         if not per_file.exists():
-            raise SystemExit("ERROR: --contrast needs perturbation_per_species.csv "
+            raise SystemExit("ERROR: --contrast needs perturbation_per_taxon.csv "
                              "(run probe_perturbations.py first).")
         per = pd.read_csv(per_file)
         if args.contrast not in per.columns:
             raise SystemExit(f"ERROR: '{args.contrast}' is not a condition in "
-                             f"perturbation_per_species.csv. Options: "
-                             f"{', '.join(c for c in per.columns if c not in ('species', 'n'))}")
+                             f"perturbation_per_taxon.csv. Options: "
+                             f"{', '.join(c for c in per.columns if c not in ('taxon', 'n'))}")
         per = per[per["n"] >= 8]
         half = max(1, args.n // 2)
-        # Half the figure from species that survive the condition, half from
-        # species it destroys — the point is to see whether the maps differ.
-        names = (list(per.nlargest(half, args.contrast).species)
-                 + list(per.nsmallest(half, args.contrast).species))
-        # Keep several candidates per species; the caller narrows them to the
+        # Half the figure from taxa that survive the condition, half from
+        # taxa it destroys — the point is to see whether the maps differ.
+        names = (list(per.nlargest(half, args.contrast).taxon)
+                 + list(per.nsmallest(half, args.contrast).taxon))
+        # Keep several candidates per taxon; the caller narrows them to the
         # most confident one. An occlusion map is meaningless on a specimen the
         # model was never confident about — there is no probability to lose.
-        rows = [df[df.species == s].head(args.candidates) for s in names]
+        rows = [df[df[level_col] == s].head(args.candidates) for s in names]
         out = pd.concat([r for r in rows if not r.empty])
-        out["contrast_group"] = np.where(out.species.isin(
-            per.nlargest(half, args.contrast).species), "robust", "fragile")
+        out["contrast_group"] = np.where(out[level_col].isin(
+            per.nlargest(half, args.contrast).taxon), "robust", "fragile")
         return out
     return df.iloc[rng.permutation(len(df))[:args.n]]
 
 
 @torch.inference_mode()
-def most_confident(model, sel: pd.DataFrame, geo_all, names: dict, args, device) -> pd.DataFrame:
-    """One specimen per species: the one the model is most sure of."""
+def most_confident(model, sel: pd.DataFrame, geo_all, names: dict, args, device,
+                   level_col: str) -> pd.DataFrame:
+    """One specimen per taxon: the one the model is most sure of."""
     tf = transforms.Compose([transforms.ToTensor(),
                              transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)])
     scores = []
@@ -189,11 +196,11 @@ def most_confident(model, sel: pd.DataFrame, geo_all, names: dict, args, device)
                             enabled=device.type == "cuda"):
             out = model(batch, g) if g is not None else model(batch)
         logits = out[0] if isinstance(out, tuple) else out
-        idx = names.get(row["species"], -1)
+        idx = names.get(row[level_col], -1)
         p = torch.softmax(logits.float(), dim=1)[0, idx].item() if idx >= 0 else 0.0
         scores.append(p)
     sel = sel.reset_index(drop=True).assign(p_true=scores)
-    kept = sel.sort_values("p_true", ascending=False).groupby("species", as_index=False).head(1)
+    kept = sel.sort_values("p_true", ascending=False).groupby(level_col, as_index=False).head(1)
     print(f"  Picked {len(kept)} specimens, p(true) "
           f"{kept.p_true.min():.2f}-{kept.p_true.max():.2f}")
     return kept.sort_values("contrast_group", ascending=False)
@@ -212,11 +219,13 @@ def main(argv=None) -> int:
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--n", type=int, default=6, help="Specimens to draw.")
-    p.add_argument("--species", help="Restrict to one species.")
+    p.add_argument("--taxon", help="Restrict to one taxon at the model's own rank "
+                                   "(species or family, depending on the checkpoint).")
+    p.add_argument("--species", help="Alias for --taxon, kept for existing commands.")
     p.add_argument("--contrast", help="Split the figure by a step-1 condition, "
                                       "e.g. 'edges': robust species vs fragile ones.")
     p.add_argument("--candidates", type=int, default=4,
-                   help="Specimens per species to score before keeping the most "
+                   help="Specimens per taxon to score before keeping the most "
                         "confident one (--contrast only).")
     p.add_argument("--occ-size", type=int, default=96)
     p.add_argument("--occ-stride", type=int, default=48)
@@ -231,17 +240,20 @@ def main(argv=None) -> int:
 
     out = Path(args.out)
     df = pd.read_csv(out / META_NAME)
-    sel = pick(df, args).reset_index(drop=True)
     device = torch.device(args.device)
-    model, nameslist, temperature, geo_dim = build_full_model(args.checkpoint, device)
+    model, nameslist, temperature, geo_dim, label_level = build_full_model(
+        args.checkpoint, device)
     backbone = getattr(model, "backbone", model)
     names = {n: i for i, n in enumerate(nameslist)}
+    level_col = label_level if label_level in df.columns else "species"
+    sel = pick(df, args, level_col).reset_index(drop=True)
 
     geo_all = (encode_coords(sel["decimalLatitude"], sel["decimalLongitude"])
                if geo_dim else None)
 
     if "contrast_group" in sel.columns and args.candidates > 1:
-        sel = most_confident(model, sel, geo_all, names, args, device).reset_index(drop=True)
+        sel = most_confident(model, sel, geo_all, names, args, device,
+                             level_col).reset_index(drop=True)
         geo_all = (encode_coords(sel["decimalLatitude"], sel["decimalLongitude"])
                    if geo_dim else None)
 
@@ -253,12 +265,12 @@ def main(argv=None) -> int:
 
     for i, row in sel.iterrows():
         img = np.asarray(model_view(row["path"], args.image_sz))
-        true_idx = names.get(row["species"], -1)
+        true_idx = names.get(row[level_col], -1)
         geo = geo_all[i:i + 1] if geo_all is not None else None
         col = 0
         group = f" [{row['contrast_group']}]" if "contrast_group" in sel.columns else ""
         axes[i][col].imshow(img)
-        axes[i][col].set_title(f"{row['species']}{group}", fontsize=6)
+        axes[i][col].set_title(f"{row[level_col]}{group}", fontsize=6)
         col += 1
 
         if args.mode in ("both", "occlusion"):

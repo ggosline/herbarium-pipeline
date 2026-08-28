@@ -159,13 +159,39 @@ class MaskedDataset(InferenceDataset):
 
 
 def build_full_model(ckpt_path: Path, device):
-    """The trained model exactly as identify runs it, plus its metadata."""
+    """The trained model exactly as identify runs it, plus its metadata.
+
+    `label_level` comes back with the rest because a probe cannot score a model
+    without knowing which rank its class indices refer to. The family-level
+    Angiosperm run indexes 235 families, so scoring it against specsin's
+    `species` column matches nothing and every accuracy silently reads 0.0 —
+    quieter and more misleading than a crash. identify_herbarium infers the rank
+    from the nameslist itself (see _infer_label_level), so it is trustworthy
+    even when the checkpoint's stored label_level is not.
+    """
     from identify_herbarium import build_model_from_state
     ckpt = resolve_checkpoint(Path(ckpt_path))
     (state, model_name, num_classes, nameslist, geo_dim, label_level,
      temperature, excluded, class_counts, genus_head, split) = load_model(ckpt, [], 0)
     model = build_model_from_state(state, model_name, num_classes, geo_dim).to(device).eval()
-    return model, nameslist, temperature, geo_dim
+    return model, nameslist, temperature, geo_dim, label_level
+
+
+def truth_labels(df: pd.DataFrame, nameslist: list[str], label_level: str) -> np.ndarray:
+    """Class index per row, -1 where the taxon is not one the model can predict.
+
+    Sparse taxa dropped at training time land at -1 by design; a *wholesale* miss
+    means the wrong column was read, so say so rather than reporting 0.0.
+    """
+    names = {n: i for i, n in enumerate(nameslist)}
+    col = label_level if label_level in df.columns else "species"
+    truth = df[col].map(lambda s: names.get(s, -1)).values
+    if len(df) and (truth >= 0).sum() == 0:
+        raise SystemExit(
+            f"ERROR: none of the {len(df)} rows' {col!r} values are in the "
+            f"checkpoint's {len(nameslist)}-class nameslist (e.g. {nameslist[:3]}). "
+            "The probe would score every condition at 0.0.")
+    return truth
 
 
 @torch.inference_mode()
@@ -197,7 +223,7 @@ def predict(model, paths, geo, image_sz, batch_size, device, workers,
 
 def score(name: str, truth: np.ndarray, top1: np.ndarray, top5: list,
           conf: np.ndarray, base_top1: np.ndarray | None) -> dict:
-    known = truth >= 0                       # species not in the nameslist score as nothing
+    known = truth >= 0                       # taxa not in the nameslist score as nothing
     row = {
         "condition": name,
         "n": int(known.sum()),
@@ -224,9 +250,9 @@ def stage_mask(args) -> None:
     del backbone
     torch.cuda.empty_cache()
 
-    model, nameslist, temperature, geo_dim = build_full_model(args.checkpoint, device)
-    names = {n: i for i, n in enumerate(nameslist)}
-    truth = df["species"].map(lambda s: names.get(s, -1)).values
+    model, nameslist, temperature, geo_dim, label_level = build_full_model(
+        args.checkpoint, device)
+    truth = truth_labels(df, nameslist, label_level)
     geo = encode_coords(df["decimalLatitude"], df["decimalLongitude"]) if geo_dim else None
 
     # Same mask, wrong place: preserves area and shape exactly, so any accuracy
@@ -298,8 +324,7 @@ def stage_geo(args) -> None:
                           if k.startswith("head.")})
     geo_mlp, head = geo_mlp.eval().to(device), head.eval().to(device)
 
-    names = {n: i for i, n in enumerate(nameslist)}
-    truth = df["species"].map(lambda s: names.get(s, -1)).values
+    truth = truth_labels(df, nameslist, label_level)
     x = torch.from_numpy(feats).to(device)
     real = encode_coords(df["decimalLatitude"], df["decimalLongitude"])
     rng = np.random.RandomState(args.seed)
@@ -406,6 +431,11 @@ def stage_probe(args) -> None:
         fit(genus_oh.transform(df[["genus"]]).toarray(), inst, "genus one-hot -> institution"),
         fit(feats, df["species"].values,
             "embedding -> species (reference, random split)", r_tr, r_te),
+        # Family survives the species-disjoint split (unlike species), so it is
+        # the one reference measured on exactly the same rows as the institution
+        # probe — and on a family-level model it is the rank the head predicts.
+        fit(feats, df["family"].values,
+            "embedding -> family (reference, species-disjoint)"),
     ]
     # Majority class and a label permutation: 28 institutions this imbalanced
     # make raw accuracy look impressive on its own.

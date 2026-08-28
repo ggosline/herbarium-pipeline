@@ -460,7 +460,8 @@ def stage_cav(args) -> None:
                       else Path(args.labels))
     df = meta.merge(lab, on="fname")
     device = torch.device(args.device)
-    model, nameslist, temperature, geo_dim = build_full_model(args.checkpoint, device)
+    model, nameslist, temperature, geo_dim, label_level = build_full_model(
+        args.checkpoint, device)
     backbone = getattr(model, "backbone", model)
     _, layer_idx = layer_module(backbone, args.layer)
     names = {n: i for i, n in enumerate(nameslist)}

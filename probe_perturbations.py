@@ -35,7 +35,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from identify_herbarium import InferenceDataset, encode_coords
-from probe_confounds import build_full_model, score
+from probe_confounds import build_full_model, score, truth_labels
 import probe_embeddings as pe
 from probe_embeddings import META_NAME
 
@@ -219,9 +219,9 @@ def main(argv=None) -> int:
     if args.limit:
         df = df.iloc[:args.limit].reset_index(drop=True)
     device = torch.device(args.device)
-    model, nameslist, temperature, geo_dim = build_full_model(args.checkpoint, device)
-    names = {n: i for i, n in enumerate(nameslist)}
-    truth = df["species"].map(lambda s: names.get(s, -1)).values
+    model, nameslist, temperature, geo_dim, label_level = build_full_model(
+        args.checkpoint, device)
+    truth = truth_labels(df, nameslist, label_level)
     geo = encode_coords(df["decimalLatitude"], df["decimalLongitude"]) if geo_dim else None
     paths = df["path"].tolist()
 
@@ -265,13 +265,18 @@ def main(argv=None) -> int:
     res.to_csv(out / "perturbation_conditions.csv", index=False)
     print("\n" + res.to_string(index=False))
 
-    per = pd.DataFrame({"species": df["species"], "true_idx": truth})
+    # Broken down by the rank the model predicts, not always species: a
+    # family-level model has no per-species accuracy to report. The column is
+    # called `taxon` so downstream readers need not know which rank it holds.
+    level_col = label_level if label_level in df.columns else "species"
+    per = pd.DataFrame({"taxon": df[level_col], "true_idx": truth})
     for name, t1 in preds.items():
         per[name] = (t1 == truth)
-    per = per[per.true_idx >= 0].groupby("species").mean(numeric_only=True).drop(columns="true_idx")
-    per["n"] = df[truth >= 0].groupby("species").size()
-    per.to_csv(out / "perturbation_per_species.csv")
-    print(f"  Wrote perturbation_conditions.csv and perturbation_per_species.csv")
+    per = per[per.true_idx >= 0].groupby("taxon").mean(numeric_only=True).drop(columns="true_idx")
+    per["n"] = df[truth >= 0].groupby(df[level_col]).size()
+    per.to_csv(out / "perturbation_per_taxon.csv")
+    print(f"  Wrote perturbation_conditions.csv and perturbation_per_taxon.csv "
+          f"(taxon = {level_col})")
     return 0
 
 
