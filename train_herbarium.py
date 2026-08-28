@@ -163,7 +163,21 @@ class HerbariumData:
                  label_level: str = "species",
                  hierarchical: bool = False,
                  sparse_threshold: int = 5, train_val_split: float = 0.2, seed: int = 42,
-                 max_per_class: int = 0, class_weight_beta: float = 0.0):
+                 max_per_class: int = 0, class_weight_beta: float = 0.0,
+                 split_seed: int | None = None):
+        # `seed` drives initialisation and data order; `split_seed` decides WHICH
+        # specimens land in train vs held-out. They default to the same value, so
+        # every existing invocation — and every checkpoint written before this
+        # split existed — behaves exactly as before.
+        #
+        # Separating them is what makes an init-only rerun possible. With a single
+        # seed, changing it reshuffles the held-out set at the same time as the
+        # starting weights, so a difference in final accuracy cannot be attributed
+        # to either one. Hold split_seed fixed and vary seed to measure run-to-run
+        # variance on a constant evaluation set.
+        if split_seed is None:
+            split_seed = seed
+        self.split_seed = split_seed
         keep_cols = {"fname", "species"}
         coord_cols = {"decimalLatitude", "decimalLongitude"}
         frames = []
@@ -249,7 +263,7 @@ class HerbariumData:
         # covers ~152 of its 344 species, round-robin covers 300.
         if max_per_class and max_per_class > 0:
             sub_col = {"family": "genus", "genus": "species"}.get(rank_col)
-            shuffled = combined.sample(frac=1.0, random_state=seed)
+            shuffled = combined.sample(frac=1.0, random_state=split_seed)
             if sub_col and sub_col in shuffled.columns:
                 # cumcount gives each row its rank within its sub-taxon; a stable sort
                 # on it interleaves the sub-taxa, so head(cap) takes one from each in
@@ -320,7 +334,7 @@ class HerbariumData:
 
         df_train, df_valid = train_test_split(
             combined, test_size=train_val_split,
-            stratify=combined[index_col], random_state=seed
+            stratify=combined[index_col], random_state=split_seed
         )
         self.train_files  = list(df_train["abs_path"])
         self.valid_files  = list(df_valid["abs_path"])
@@ -610,6 +624,10 @@ class LitHerbarium(pl.LightningModule):
             "train": sorted(Path(p).name for p in getattr(data, "train_files", [])),
             "valid": sorted(Path(p).name for p in getattr(data, "valid_files", [])),
             "seed": int(config.get("seed", 42)),
+            # Recorded separately so a later comparison can tell whether two
+            # checkpoints share an evaluation set (same split_seed) even when
+            # their initialisation differed (different seed).
+            "split_seed": int(config.get("split_seed") or config.get("seed", 42)),
         }
 
         num_classes = data.num_classes
@@ -1138,6 +1156,7 @@ def train(config: dict):
         sparse_threshold=config.get("sparse_threshold", 5),
         train_val_split=config.get("train_val_split", 0.2),
         seed=config["seed"],
+        split_seed=config.get("split_seed"),
         max_per_class=config.get("max_per_class", 0),
         class_weight_beta=config.get("class_weight_beta", 0.0),
     )
@@ -1514,6 +1533,7 @@ def train(config: dict):
 
 DEFAULT_CONFIG = dict(
     seed=42,
+    split_seed=None,      # None → follow --seed (previous behaviour)
     train_val_split=0.2,
     sparse_threshold=5,
     model_name="vit_large_patch16_dinov3.lvd1689m",
@@ -1577,7 +1597,14 @@ def parse_args():
                         "Also improves calibration and robustness to noisy labels.")
     p.add_argument("--num-gpus", type=int, default=DEFAULT_CONFIG["num_gpus"])
     p.add_argument("--num-workers", type=int, default=DEFAULT_CONFIG["num_workers"])
-    p.add_argument("--seed", type=int, default=DEFAULT_CONFIG["seed"])
+    p.add_argument("--seed", type=int, default=DEFAULT_CONFIG["seed"],
+                   help="Seeds initialisation, data order and augmentation.")
+    p.add_argument("--split-seed", type=int, default=DEFAULT_CONFIG["split_seed"],
+                   metavar="N",
+                   help="Seed for the train/held-out split (and the --max-per-class "
+                        "subsample). Defaults to --seed. Pin it across runs to vary "
+                        "only the starting weights while every run is scored on the "
+                        "same held-out specimens.")
     p.add_argument("--sparse-threshold", type=int, default=DEFAULT_CONFIG["sparse_threshold"])
     p.add_argument("--class-weight-beta", type=float,
                    default=DEFAULT_CONFIG["class_weight_beta"], metavar="BETA",
@@ -1700,6 +1727,7 @@ if __name__ == "__main__":
         num_gpus=args.num_gpus,
         num_workers=args.num_workers,
         seed=args.seed,
+        split_seed=args.split_seed,
         sparse_threshold=args.sparse_threshold,
         class_weight_beta=args.class_weight_beta,
         aum=args.aum,
