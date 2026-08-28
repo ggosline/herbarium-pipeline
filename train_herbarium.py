@@ -640,7 +640,20 @@ class LitHerbarium(pl.LightningModule):
                  "F1":        F1Score(task="multiclass", num_classes=n, average="weighted")}
             if k > 1:
                 m["Top5"] = Accuracy(task="multiclass", num_classes=n, top_k=k)
-            return MetricCollection(m).clone(prefix=prefix)
+            # compute_groups=False is load-bearing, not a micro-optimisation to
+            # undo. torchmetrics' default groups metrics whose states match after
+            # the first batch and then computes ONE of them, copying the result to
+            # the rest. Accuracy, Top5, Precision, Recall and F1 all carry the same
+            # (tp, fp, tn, fn) state, so whenever the first validation batch makes
+            # two of them agree they are merged for the whole epoch and report the
+            # same number thereafter.
+            #
+            # Observed: a run logged val_Top5 bit-identical to val_Accuracy
+            # (0.714286) for every epoch while an otherwise identical run on a
+            # different backbone reported a healthy 0.9158. It depends on the first
+            # batch, so it strikes one run and not another and looks like a model
+            # property rather than an instrumentation fault.
+            return MetricCollection(m, compute_groups=False).clone(prefix=prefix)
 
         self.train_metrics = _metrics(num_classes, "train_")
         self.valid_metrics = _metrics(num_classes, "val_")
