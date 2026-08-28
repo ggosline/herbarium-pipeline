@@ -421,9 +421,13 @@ def stage_umap(args) -> None:
 
     # A panel whose column holds one value everywhere says nothing — the split
     # panel is blank whenever extract ran on a single split, which is the norm.
-    panels = [("genus", args.top_labels), ("species", args.top_labels),
-              ("institutionCode", args.top_labels), ("split", 3),
-              ("countryCode", args.top_labels)]
+    # Ordered by how much a panel can show, coarsest taxon first: family is the
+    # rank the Angiosperm checkpoint predicts, and with 6,094 species in that run
+    # a species panel is 6,094 reused colours. Constant columns drop out below,
+    # so a single-family run (Annonaceae) silently falls back to genus/species.
+    panels = [("family", args.top_labels), ("genus", args.top_labels),
+              ("institutionCode", args.top_labels), ("countryCode", args.top_labels),
+              ("species", args.top_labels), ("split", 3)]
     panels = [(c, n) for c, n in panels
               if c in df.columns and df[c].fillna("(missing)").nunique() > 1][:4]
     fig, axes = plt.subplots(2, 2, figsize=(13, 12))
@@ -470,7 +474,10 @@ def stage_retrieve(args) -> None:
     nn = neighbour_table(feats, args.k, device)
 
     rows = []
-    for col in ("species", "genus", "institutionCode", "countryCode"):
+    # family included because on a family-level checkpoint it is the rank the
+    # head predicts — the retrieval number the classification accuracy is
+    # actually comparable to.
+    for col in ("species", "genus", "family", "institutionCode", "countryCode"):
         if col in df.columns:
             hit, chance = agreement(df, nn, col)
             rows.append({"field": col, "top1_agreement": round(hit, 4),

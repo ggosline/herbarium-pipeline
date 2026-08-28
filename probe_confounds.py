@@ -33,7 +33,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from PIL import Image
+from PIL import Image, ImageFilter
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -158,6 +158,58 @@ class MaskedDataset(InferenceDataset):
         return img, str(path), geo
 
 
+class RegionDataset(InferenceDataset):
+    """Blur one region of the sheet and blank another, before normalisation.
+
+    Separating the two is what makes a text test possible. Blanking alone cannot
+    answer "does it read the label", because the label region also holds paper
+    tone, rules, stamps and institution layout; blurring alone cannot, because a
+    blurred quadrant also blurs any leaf lying in it. Blurring `blur` while
+    blanking `blank` lets the caller keep the plant out of both.
+
+    Blur is applied to the whole image and composited back through the mask, so
+    the boundary stays soft — a hard-edged blur patch is its own artefact.
+    """
+
+    def __init__(self, paths, image_sz, geo_coords, blank: np.ndarray | None,
+                 blur: np.ndarray | None, sigma: float):
+        super().__init__(paths, image_sz, geo_coords)
+        self.blank, self.blur, self.sigma = blank, blur, sigma
+
+    def _grid_to_px(self, grid) -> np.ndarray:
+        return np.array(Image.fromarray(grid.astype(np.uint8) * 255)
+                        .resize((self.image_sz, self.image_sz), Image.NEAREST)) > 127
+
+    def __getitem__(self, idx):
+        path = self.paths[idx]
+        geo = self.geo[idx] if self.geo is not None else torch.zeros(4)
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception:
+            return torch.zeros(3, self.image_sz, self.image_sz), str(path), geo
+        for t in self.transform.transforms[:2]:      # Resize, CenterCrop only
+            img = t(img)
+
+        if self.blur is not None and self.sigma > 0:
+            m = self._grid_to_px(self.blur[idx])
+            arr = np.asarray(img).copy()
+            soft = np.asarray(img.filter(ImageFilter.GaussianBlur(self.sigma)))
+            arr[m] = soft[m]
+            img = Image.fromarray(arr)
+
+        if self.blank is not None:
+            m = self._grid_to_px(self.blank[idx])
+            arr = np.asarray(img).copy()
+            keep = arr[~m]
+            fill = np.median(keep, axis=0) if keep.size else np.array([200, 200, 190])
+            arr[m] = fill.astype(arr.dtype)
+            img = Image.fromarray(arr)
+
+        for t in self.transform.transforms[2:]:      # ToTensor, Normalize
+            img = t(img)
+        return img, str(path), geo
+
+
 def build_full_model(ckpt_path: Path, device):
     """The trained model exactly as identify runs it, plus its metadata.
 
@@ -196,8 +248,9 @@ def truth_labels(df: pd.DataFrame, nameslist: list[str], label_level: str) -> np
 
 @torch.inference_mode()
 def predict(model, paths, geo, image_sz, batch_size, device, workers,
-            masks=None, invert=False, temperature=1.0):
-    ds = MaskedDataset([Path(p) for p in paths], image_sz, geo, masks, invert)
+            masks=None, invert=False, temperature=1.0, dataset=None):
+    ds = dataset if dataset is not None else MaskedDataset(
+        [Path(p) for p in paths], image_sz, geo, masks, invert)
     loader = DataLoader(ds, batch_size=batch_size, num_workers=workers,
                         pin_memory=True, shuffle=False)
     top1, top5, conf = [], [], []
@@ -392,6 +445,84 @@ def stage_geo(args) -> None:
 # Linear probes
 # ---------------------------------------------------------------------------
 
+def stage_text(args) -> None:
+    """Is the label region's standalone power textual, or just institution style?
+
+    `label_only` keeps the bottom-right quadrant MINUS the plant, so no leaf is
+    in the frame; `label_only_blur` blurs exactly that region hard enough to
+    destroy 8-10 px type while leaving paper tone, rules, stamps and layout
+    intact. The gap between them is what the written text is worth.
+
+    `plant_only_blur` is the control the comparison needs: blur is itself out of
+    distribution, so a drop under blur means nothing until you know what the
+    same blur costs a channel that carries no text. And `text_blur_insitu`
+    destroys the type on an otherwise untouched sheet — the in-situ marginal
+    value, which redundancy with the plant will keep small either way.
+    """
+    device = torch.device(args.device)
+    out = Path(args.out)
+    df = pd.read_csv(out / META_NAME)
+    if args.limit:
+        df = df.iloc[:args.limit].reset_index(drop=True)
+
+    mpath = out / "plant_masks.npz"
+    if not mpath.exists():
+        raise SystemExit("ERROR: needs plant_masks.npz — run `probe_confounds.py mask` first.")
+    plant = np.load(mpath)["masks"]
+    if len(plant) != len(df):
+        raise SystemExit(f"ERROR: plant_masks.npz has {len(plant)} masks but meta.csv "
+                         f"has {len(df)} rows — they must come from the same extract.")
+
+    n, gh, gw = plant.shape
+    quad = np.repeat(quadrant_mask(gh, gw)[None], n, axis=0)
+    label = quad & ~plant                    # the label region, plant excluded
+    print(f"  Label region (quadrant minus plant) covers "
+          f"{100 * label.mean():.1f}% of the sheet on average")
+
+    model, nameslist, temperature, geo_dim, label_level = build_full_model(
+        args.checkpoint, device)
+    truth = truth_labels(df, nameslist, label_level)
+    geo = encode_coords(df["decimalLatitude"], df["decimalLongitude"]) if geo_dim else None
+    paths = df["path"].tolist()
+
+    def ds(blank, blur):
+        return RegionDataset([Path(x) for x in paths], args.image_sz, geo,
+                             blank, blur, args.sigma)
+
+    conditions = [
+        ("baseline",          ds(None, None)),
+        ("label_only",        ds(~label, None)),
+        ("label_only_blur",   ds(~label, label)),
+        ("plant_only_blur",   ds(~plant, plant)),
+        ("text_blur_insitu",  ds(None, label)),
+    ]
+
+    rows, base_top1 = [], None
+    for name, dataset in conditions:
+        print(f"  {name} ...", flush=True)
+        t1, t5, c = predict(model, paths, geo, args.image_sz, args.batch_size,
+                            device, args.num_workers, temperature=temperature,
+                            dataset=dataset)
+        rows.append(score(name, truth, t1, t5, c, base_top1))
+        if base_top1 is None:
+            base_top1 = t1
+        print("   ", rows[-1], flush=True)
+
+    res = pd.DataFrame(rows)
+    base = res.loc[res.condition == "baseline", "top1"].iloc[0]
+    res["delta_vs_baseline"] = (res.top1 - base).round(4)
+    res["sigma"] = args.sigma
+    res.to_csv(out / "text_conditions.csv", index=False)
+    print("\n" + res.to_string(index=False))
+
+    lo = res.loc[res.condition == "label_only", "top1"].iloc[0]
+    lob = res.loc[res.condition == "label_only_blur", "top1"].iloc[0]
+    print(f"\n  Text is worth {lo - lob:+.4f} to the label channel "
+          f"({lo:.4f} -> {lob:.4f}). Compare that with what the same blur costs "
+          f"the plant channel before calling it text.")
+    print(f"  Wrote text_conditions.csv")
+
+
 def stage_probe(args) -> None:
     from sklearn.linear_model import LogisticRegression
     from sklearn.model_selection import GroupShuffleSplit
@@ -482,6 +613,16 @@ def parse_args(argv=None):
     common(g, True)
     g.add_argument("--min-country", type=int, default=30)
     g.set_defaults(func=stage_geo)
+
+    t = sub.add_parser("text", help="Blur the label text; is the label region "
+                                    "readable type or institution style?")
+    common(t, True)
+    t.add_argument("--sigma", type=float, default=3.0,
+                   help="Gaussian blur sigma in pixels at --image-sz. Label type "
+                        "is ~8-10 px tall in the model's view, so 3 destroys it "
+                        "while leaving paper tone and layout.")
+    t.add_argument("--limit", type=int, default=0)
+    t.set_defaults(func=stage_text)
 
     b = sub.add_parser("probe", help="Linear probe to institutionCode.")
     common(b, False)
