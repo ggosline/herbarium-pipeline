@@ -263,9 +263,17 @@ def main(argv=None) -> int:
     tf = transforms.Compose([transforms.ToTensor(),
                              transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)])
 
+    # Collected so the maps survive as numbers, not only as rendered pixels.
+    # The figure normalises each occlusion map to its own maximum, which makes
+    # colours incomparable between specimens and sizes unreadable anywhere —
+    # so any claim about how large a negative cell is has to come from here.
+    saved = {"fname": [], "taxon": [], "p_true": [], "occlusion": [], "rollout": []}
+
     for i, row in sel.iterrows():
         img = np.asarray(model_view(row["path"], args.image_sz))
         true_idx = names.get(row[level_col], -1)
+        saved["fname"].append(row["fname"])
+        saved["taxon"].append(row[level_col])
         geo = geo_all[i:i + 1] if geo_all is not None else None
         col = 0
         group = f" [{row['contrast_group']}]" if "contrast_group" in sel.columns else ""
@@ -285,6 +293,8 @@ def main(argv=None) -> int:
                                     cmap="RdBu_r", vmin=-lim, vmax=lim, alpha=0.55,
                                     extent=(0, args.image_sz, args.image_sz, 0))
                 axes[i][col].set_title(f"occlusion  p(true)={base:.2f}", fontsize=6)
+                saved["occlusion"].append(grid)
+                saved["p_true"].append(base)
             col += 1
 
         if args.mode in ("both", "rollout"):
@@ -298,6 +308,7 @@ def main(argv=None) -> int:
                                 extent=(0, args.image_sz, args.image_sz, 0))
             axes[i][col].set_title(f"attention rollout (top-5 tokens hold "
                                    f"{concentration:.0%})", fontsize=6)
+            saved["rollout"].append(r)
         print(f"  {row['species']} done", flush=True)
 
     for ax in axes.ravel():
@@ -307,7 +318,26 @@ def main(argv=None) -> int:
     dest = out / f"saliency_{tag.replace(' ', '_')}.png"
     fig.savefig(dest, dpi=args.dpi)
     plt.close(fig)
+
+    maps = dest.with_name(dest.stem + "_maps.npz")
+    np.savez_compressed(
+        maps,
+        fname=np.array(saved["fname"]),
+        taxon=np.array(saved["taxon"]),
+        p_true=np.array(saved["p_true"], dtype=np.float32),
+        # Stacked only when every specimen produced one; a row skipped for a
+        # missing true class would otherwise silently shift the alignment.
+        occlusion=(np.stack(saved["occlusion"]).astype(np.float32)
+                   if len(saved["occlusion"]) == len(saved["fname"])
+                   else np.array([], dtype=np.float32)),
+        rollout=(np.stack(saved["rollout"]).astype(np.float32)
+                 if len(saved["rollout"]) == len(saved["fname"])
+                 else np.array([], dtype=np.float32)),
+        occ_size=args.occ_size, occ_stride=args.occ_stride, image_sz=args.image_sz,
+    )
     print(f"  Wrote {dest}")
+    print(f"  Wrote {maps} (occlusion values are drops in p(true): "
+          f"positive = evidence, negative = covering it RAISED p(true))")
     return 0
 
 

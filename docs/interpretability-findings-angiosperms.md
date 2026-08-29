@@ -257,12 +257,27 @@ Rollout is again dominated by a few high-norm outlier tokens — the top 5 hold
 11–16% of the mass, the same 11–16% seen on Annonaceae — so it needs percentile
 clipping to be legible at all.
 
-**Negative occlusion cells are prominent here.** Many cells are blue: covering
-them *raises* p(true), meaning part of the specimen actively misleads the model.
-Cardiopteridaceae shows this across most of its leaf area despite p(true)=0.88.
-The Annonaceae study flagged this as worth following up; at 15,092 specimens and
-235 families it is clearly not a one-off, and it is the most interesting open
-thread from either study.
+**Negative occlusion cells are mostly noise.** Roughly half the cells are blue —
+covering them *raises* p(true) — which looks dramatic in the figure and is close
+to what a coin flip around zero would produce. `saliency_edges_maps.npz` holds
+the grids, so this can be measured rather than eyeballed:
+
+| | share of cells | % negative | mean effect | mean size when negative |
+|---|---|---|---|---|
+| on plant | 37.2% | 47.9% | **+0.00504** | 0.01029 |
+| off plant | 62.8% | 54.1% | −0.00094 | 0.00686 |
+
+Off-plant cells sit at essentially zero mean with magnitudes under 0.007: no
+effect, not misleading content. On-plant cells are net *positive*, which is the
+expected result. Only 4 of 1,152 cells exceed −0.05, and the largest negative
+(−0.103) is dwarfed by the largest positive (+0.328). Non-plant cells inside the
+label quadrant are 49.4% negative against 54.1% for off-plant cells generally —
+**no enrichment**, so the negatives are not a label effect either.
+
+Two things survive. On-plant negatives are fewer but about 1.5× larger than
+off-plant ones (0.0103 vs 0.0069). And **Cardiopteridaceae is a real outlier**:
+negative mass 4.5× its positive mass, 114 of 144 cells negative, at p(true)=0.88.
+One specimen, so a lead rather than a finding.
 
 ---
 
@@ -270,6 +285,12 @@ thread from either study.
 
 Additions to the notes in the companion document.
 
+- **Never read magnitude off a per-specimen colormap.** The occlusion panels
+  renormalise to each sheet's own maximum (`vmin=-lim, vmax=+lim`), so a cell
+  worth −0.005 on a flat sheet renders as vividly as one worth −0.16 elsewhere.
+  Reading "prominent negative cells" off the figure inverted the actual
+  conclusion; the grids are now saved to `saliency_<tag>_maps.npz` so claims
+  about size come from numbers.
 - **A quadrant is not a label.** `quadrant_only` = 0.5845 read as a label
   measurement overstates the label 5× — the quadrant is full of plant. Region
   masks must be intersected with the foreground mask before they measure what
@@ -294,8 +315,10 @@ Additions to the notes in the companion document.
 
 ## Still open
 
-- **Negative occlusion cells** — covering part of a specimen raises p(true).
-  Prominent at family rank across many sheets; no explanation yet.
+- **Negative occlusion cells** — measured (§4) and mostly noise around zero on
+  background, contrary to the impression the figure gives. The live questions are
+  the larger on-plant negatives and the Cardiopteridaceae outlier, both of which
+  need many more specimens and a proper null before they mean anything.
 - **The non-plant residual.** `plant_removed` = 0.3105 with only 0.1181
   attributable to the label quadrant. What carries the rest is unidentified —
   mounting style, paper, stamps and tape are the candidates, and the institution
