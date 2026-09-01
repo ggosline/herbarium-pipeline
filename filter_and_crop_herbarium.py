@@ -2,6 +2,10 @@
 filter_and_crop_herbarium.py — Post-download herbarium image cleanup.
 
 Steps:
+  0. Verify: quarantine files that are not decodable images at all — an HTML
+     error page saved as .jpg by a failed GBIF download, a truncated file.
+     These abort the DALI decoder mid-epoch during training, so they are caught
+     here, moved to corrupt/, and marked hasfile=False.
   1. Filter: reject field/living-plant photos, keep genuine herbarium scans.
      - CLIP zero-shot (default, GPU) or HSV heuristic (--filter-method hsv)
   2. Crop: remove dark scanning-bed border by scanning inward from each edge.
@@ -28,6 +32,7 @@ Usage examples:
 """
 
 import argparse
+import json
 import shutil
 import sys
 import time
@@ -38,6 +43,8 @@ import cv2
 import numpy as np
 from PIL import Image
 Image.MAX_IMAGE_PIXELS = None  # herbarium scans are legitimately large
+
+from image_checks import scan_images
 
 try:
     from tqdm import tqdm
@@ -556,22 +563,36 @@ def crop_images(paths: list[Path],
 
 def update_specsin(specsin_path: Path,
                    live: list[Path],
-                   rejected: list[Path]):
-    """Set hasfile=False for live and rejected images in specsin.csv."""
+                   rejected: list[Path],
+                   corrupt: list[Path] | None = None):
+    """Set hasfile=False for live, rejected and corrupt images in specsin.csv.
+
+    Corrupt files are marked the same way as the others rather than with
+    `invalid=True`: `invalid` is a curatorial judgement a human makes in Review
+    ("this specimen is not usable"), whereas a corrupt file is a failed
+    *download* of a specimen that is probably fine. hasfile=False excludes it
+    from training and identify while leaving it eligible for a re-download,
+    which is exactly the desired outcome.
+    """
     try:
         import pandas as pd
     except ImportError:
         print("[warn] pandas not available; skipping specsin update.")
         return
 
+    corrupt = corrupt or []
     df = pd.read_csv(specsin_path)
-    all_non_herb = {p.name for p in live} | {p.name for p in rejected}
-    mask = df["fname"].isin(all_non_herb)
+    all_unusable = ({p.name for p in live} | {p.name for p in rejected}
+                    | {p.name for p in corrupt})
+    mask = df["fname"].isin(all_unusable)
     n_updated = mask.sum()
     df.loc[mask, "hasfile"] = False
     df.to_csv(specsin_path, index=False)
+    detail = f"{len(live)} live, {len(rejected)} rejected"
+    if corrupt:
+        detail += f", {len(corrupt)} corrupt"
     print(f"  specsin: set hasfile=False for {n_updated} row(s) "
-          f"({len(live)} live, {len(rejected)} rejected) → {specsin_path}")
+          f"({detail}) → {specsin_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +616,12 @@ def parse_args():
     p.add_argument("--specsin", type=Path, default=None,
                    help="specsin.csv to update hasfile=False for rejected images")
 
+    p.add_argument("--no-verify", action="store_true",
+                   help="Skip the decodable-image check. The check reads 16 bytes from the "
+                        "front and 2 KB from the back of each file to catch failed downloads "
+                        "(an HTML error page saved as .jpg, a truncated image). Those abort "
+                        "DALI's decoder mid-epoch during training, so leaving it on is "
+                        "strongly advised.")
     p.add_argument("--no-filter", action="store_true",
                    help="Skip herbarium/field classification")
     p.add_argument("--no-crop",   action="store_true",
@@ -642,6 +669,7 @@ def main():
     base_dir     = input_dir if in_place else output_dir
     rejected_dir = base_dir / "rejected"   # slides and other junk
     live_dir     = base_dir / "live"       # field/living-plant photos for other use
+    corrupt_dir  = base_dir / "corrupt"    # not decodable images at all (failed downloads)
 
     # Manifest file tracks processed filenames for in-place re-run skipping
     manifest_path = input_dir / ".filter_crop_done"
@@ -664,7 +692,7 @@ def main():
         if not in_place:
             # Skip any image whose output already exists in output_dir, live_dir, or rejected_dir
             already: set[str] = set()
-            for d in (output_dir, live_dir, rejected_dir):
+            for d in (output_dir, live_dir, rejected_dir, corrupt_dir):
                 if d and d.is_dir():
                     already |= {f.name for f in d.iterdir()
                                  if f.suffix.lower() in {".jpg", ".jpeg"}}
@@ -686,6 +714,53 @@ def main():
     if not all_paths:
         elapsed = time.time() - t_start
         print(f"\nNothing new to do. ({elapsed:.1f}s)")
+        return
+
+    # ------------------------------------------------------------------ 1c. Verify decodable
+    # Do this before any decoding work: these files are not images, so every
+    # downstream stage would either waste effort on them or fall over. The CLIP
+    # and HSV workers would each log an opaque decode failure, and — more to the
+    # point — a survivor reaching training aborts DALI's decoder mid-epoch and
+    # kills the run. One cheap header read here removes the whole class.
+    corrupt: list[Path] = []
+    if not args.no_verify:
+        defects = scan_images(all_paths)
+        if defects:
+            corrupt = [p for p in all_paths if p in defects]
+            all_paths = [p for p in all_paths if p not in defects]
+            verb = "moving" if in_place else "copying"
+            print(f"\n  [warn] {len(corrupt):,} file(s) are not decodable images "
+                  f"— {verb} to {corrupt_dir.name}/")
+            for p in corrupt[:5]:
+                print(f"           {p.name}: {defects[p]}")
+            if len(corrupt) > 5:
+                print(f"           ... and {len(corrupt) - 5:,} more")
+            corrupt_dir.mkdir(parents=True, exist_ok=True)
+            for p in corrupt:
+                # Same convention the live/ and rejected/ buckets use: --in-place
+                # is the destructive mode, otherwise the source directory is left
+                # untouched and specsin's hasfile=False is what keeps the file out
+                # of training.
+                try:
+                    if in_place:
+                        shutil.move(str(p), corrupt_dir / p.name)
+                    else:
+                        shutil.copy2(p, corrupt_dir / p.name)
+                except OSError as exc:
+                    print(f"           [warn] could not quarantine {p.name}: {exc}")
+            # A record of what was wrong with each, next to the images.
+            try:
+                (corrupt_dir / "reasons.json").write_text(json.dumps(
+                    {p.name: defects[p] for p in corrupt}, indent=2))
+            except OSError as exc:
+                print(f"           [warn] could not write reasons.json: {exc}")
+
+    n_new = len(all_paths)
+    if not all_paths:
+        if args.specsin and corrupt:
+            print(f"\nUpdating specsin: {args.specsin}")
+            update_specsin(args.specsin, [], [], corrupt)
+        print("\nNothing decodable left to process.")
         return
 
     # Output path for each image (where 'keep' images are written)
@@ -759,16 +834,17 @@ def main():
                                          padding=args.crop_padding, workers=args.workers)
 
     # ------------------------------------------------------------------ 4. specsin
-    if args.specsin and (live or rejected):
+    if args.specsin and (live or rejected or corrupt):
         print(f"\nUpdating specsin: {args.specsin}")
-        update_specsin(args.specsin, live, rejected)
+        update_specsin(args.specsin, live, rejected, corrupt)
 
     # ------------------------------------------------------------------ 5. Manifest
     if in_place and not args.force:
         existing_done: set[str] = set()
         if manifest_path.exists():
             existing_done = set(manifest_path.read_text().splitlines())
-        existing_done |= {p.name for p in keep} | {p.name for p in live} | {p.name for p in rejected}
+        existing_done |= ({p.name for p in keep} | {p.name for p in live}
+                          | {p.name for p in rejected} | {p.name for p in corrupt})
         manifest_path.write_text("\n".join(sorted(existing_done)))
 
     # ------------------------------------------------------------------ 6. Summary
@@ -787,6 +863,8 @@ def main():
     if n_skipped:
         print(f"  Already processed       : {n_skipped:>6,}  (skipped)")
     print(f"  Newly processed         : {n_new:>6,}")
+    if corrupt:
+        print(f"  Not decodable images    : {len(corrupt):>6,}  → corrupt/")
     if not args.no_filter:
         print(f"  --- Filter results ---")
         print(f"  Herbarium sheets kept   : {len(keep):>6,}  ({_pct(len(keep), n_new)})")
