@@ -53,6 +53,12 @@ from pytorch_lightning.strategies import DDPStrategy
 from sklearn.model_selection import train_test_split
 from torchmetrics import MetricCollection, Accuracy, Precision, Recall, F1Score
 
+# Pre-flight image validation, shared with filter_and_crop_herbarium.py (which is
+# where bad files are meant to be caught and marked in specsin). Kept here as a
+# guard for sources that never went through the filter step: DALI's decoder has
+# no per-sample error tolerance, so one bad file kills the run mid-epoch.
+from image_checks import scan_images as _scan_images
+
 import nvidia.dali as dali
 from nvidia.dali import pipeline_def
 import nvidia.dali.fn as fn
@@ -109,7 +115,7 @@ def make_early_stop(config: dict, patience: int) -> EarlyStopping:
     return EarlyStopping(
         monitor=metric,
         patience=pat,
-        min_delta=float(config.get("early_stop_min_delta", 0.002)),
+        min_delta=float(config.get("early_stop_min_delta", 0.005)),
         mode=mode,
         verbose=True,
     )
@@ -164,7 +170,8 @@ class HerbariumData:
                  hierarchical: bool = False,
                  sparse_threshold: int = 5, train_val_split: float = 0.2, seed: int = 42,
                  max_per_class: int = 0, class_weight_beta: float = 0.0,
-                 split_seed: int | None = None):
+                 split_seed: int | None = None, check_images: bool = True,
+                 test_split: float = 0.0):
         # `seed` drives initialisation and data order; `split_seed` decides WHICH
         # specimens land in train vs held-out. They default to the same value, so
         # every existing invocation — and every checkpoint written before this
@@ -178,6 +185,9 @@ class HerbariumData:
         if split_seed is None:
             split_seed = seed
         self.split_seed = split_seed
+        # path → why it is unusable; written to a sidecar by train() so the bad
+        # rows can be re-downloaded or marked hasfile=False in specsin.
+        self.bad_images: dict[str, str] = {}
         keep_cols = {"fname", "species"}
         coord_cols = {"decimalLatitude", "decimalLongitude"}
         frames = []
@@ -191,10 +201,22 @@ class HerbariumData:
             available |= coord_cols & set(df.columns)
             df = df.loc[mask, list(available)].copy()
             df["abs_path"] = df["fname"].apply(lambda f: str(img_dir / f))
-            missing = ~df["abs_path"].apply(lambda p: Path(p).exists())
-            if missing.any():
-                print(f"  [warn] {missing.sum()} files listed in CSV but missing on disk — skipping")
-                df = df[~missing]
+            defects = _scan_images(list(df["abs_path"]), check_headers=check_images)
+            if defects:
+                bad = df["abs_path"].isin(defects)
+                n_missing = sum(1 for r in defects.values() if r == "missing")
+                if n_missing:
+                    print(f"  [warn] {n_missing} files listed in CSV but missing on disk — skipping")
+                if len(defects) > n_missing:
+                    print(f"  [warn] {len(defects) - n_missing} files present but not decodable "
+                          f"— skipping (they would abort the DALI pipeline mid-run)")
+                    shown = [(p_, r) for p_, r in defects.items() if r != "missing"]
+                    for p_, r in shown[:5]:
+                        print(f"           {Path(p_).name}: {r}")
+                    if len(shown) > 5:
+                        print(f"           ... and {len(shown) - 5} more")
+                self.bad_images.update(defects)
+                df = df[~bad]
             frames.append(df)
             print(f"  {str(img_dir)[-30:]:>30s}: {len(df):5,} specimens")
 
@@ -288,12 +310,6 @@ class HerbariumData:
         self.num_classes = len(self.nameslist)
         self.weights = getweights(combined[index_col], class_weight_beta)
 
-        # Per-class image counts aligned with nameslist. Embedded in every
-        # checkpoint so identify can undo the training-time class weighting
-        # post-hoc (--logit-adjust) without re-deriving counts from specsin.
-        _idx_counts = combined[index_col].value_counts()
-        self.class_counts = [int(_idx_counts[n]) for n in self.nameslist]
-
         w_max, w_min = float(self.weights.max()), float(self.weights.min())
         ratio = w_max / max(w_min, 1e-12)
         print(f"  Class weights: beta={class_weight_beta} "
@@ -327,10 +343,51 @@ class HerbariumData:
                 family_dict = {f: i for i, f in enumerate(family_names)}
                 self.family_nameslist = family_names
                 self.num_family = len(family_names)
+                # .first() silently picks a winner when sources disagree about a
+                # species' family — a real data problem (a merge of two specsin
+                # files with different taxonomies) that would otherwise train a
+                # family head against labels that are wrong for some specimens.
+                fam_per_species = combined.groupby("species")["family"].nunique()
+                conflicted = fam_per_species[fam_per_species > 1]
+                if len(conflicted):
+                    print(f"  [warn] {len(conflicted)} species map to MORE THAN ONE family "
+                          f"across the sources; taking the first seen. Fix the taxonomy in "
+                          f"specsin — the family head is being taught both.")
+                    for sp_name in list(conflicted.index)[:5]:
+                        fams = sorted(combined.loc[combined["species"] == sp_name,
+                                                   "family"].unique())
+                        print(f"           {sp_name}: {', '.join(map(str, fams))}")
                 species_family = combined.groupby("species")["family"].first()
                 self.species_to_family = torch.tensor(
                     [family_dict[species_family[s]] for s in self.nameslist], dtype=torch.long
                 )
+
+        # Optional held-out TEST set, carved off before anything else sees the data.
+        #
+        # Checkpoint selection, early stopping and the calibration temperature all
+        # read the validation split, so val_Accuracy is chosen-on-and-reported-from
+        # the same specimens and is an optimistically biased estimate of what the
+        # model does on unseen material. That is the number that ends up in write-
+        # ups. A test set touched by nothing gives an honest one.
+        #
+        # Split off with `split_seed`, so it is stable across runs that vary only
+        # --seed: two checkpoints with the same split_seed are scored on identical
+        # held-out specimens and are directly comparable.
+        df_test = None
+        n_all = len(combined)          # before the test set is carved off
+        if test_split and test_split > 0:
+            try:
+                combined, df_test = train_test_split(
+                    combined, test_size=test_split,
+                    stratify=combined[index_col], random_state=split_seed)
+            except ValueError as exc:
+                # Raised when a class has too few members to appear in both parts.
+                print(f"  [warn] stratified test split failed ({exc}); "
+                      f"falling back to an unstratified split")
+                combined, df_test = train_test_split(
+                    combined, test_size=test_split, random_state=split_seed)
+            combined = combined.reset_index(drop=True)
+            df_test = df_test.reset_index(drop=True)
 
         df_train, df_valid = train_test_split(
             combined, test_size=train_val_split,
@@ -341,8 +398,29 @@ class HerbariumData:
         self.train_labels = [self.namesdict[n] for n in df_train[index_col]]
         self.valid_labels = [self.namesdict[n] for n in df_valid[index_col]]
 
+        # Per-class image counts aligned with nameslist. Embedded in every
+        # checkpoint so identify can undo the training-time class weighting
+        # post-hoc (--logit-adjust) without re-deriving counts from specsin.
+        #
+        # Counted over the TRAINING split alone. It used to count `combined`,
+        # i.e. train + val (+ test), which is not what the name or the
+        # --logit-adjust help text says: that flag treats these as the class
+        # prior the model was fitted to, and the model is fitted to train only.
+        # The two are near-proportional so the correction barely moves, but a
+        # number labelled "training images per class" should be one.
+        _idx_counts = df_train[index_col].value_counts()
+        self.class_counts = [int(_idx_counts.get(n, 0)) for n in self.nameslist]
+
         self.train_coords = _encode_coords(df_train.reset_index(drop=True))
         self.valid_coords = _encode_coords(df_valid.reset_index(drop=True))
+
+        self.test_files:  list[str] = []
+        self.test_labels: list[int] = []
+        self.test_coords = torch.zeros(0, 4)
+        if df_test is not None and len(df_test):
+            self.test_files  = list(df_test["abs_path"])
+            self.test_labels = [self.namesdict[n] for n in df_test[index_col]]
+            self.test_coords = _encode_coords(df_test)
 
         # Store per-category counts for downstream logging
         self.species_counts = dict(combined["species"].value_counts().sort_index())
@@ -350,11 +428,16 @@ class HerbariumData:
         self.family_counts  = (dict(combined["family"].value_counts().sort_index())
                                if "family" in combined.columns else {})
 
-        print(f"\n  Combined: {len(combined):,} specimens, {self.num_classes} {index_col} classes")
+        # n_all, not len(combined): `combined` has had the test set removed by now,
+        # so printing it would under-report the data set by exactly the held-out
+        # fraction.
+        print(f"\n  Combined: {n_all:,} specimens, {self.num_classes} {index_col} classes")
         if hierarchical:
             print(f"  Hierarchical heads: {self.num_genus} genera"
                   + (f", {self.num_family} families" if self.num_family else ""))
-        print(f"  Train: {len(self.train_files):,}  |  Valid: {len(self.valid_files):,}")
+        print(f"  Train: {len(self.train_files):,}  |  Valid: {len(self.valid_files):,}"
+              + (f"  |  Test (held out, untouched): {len(self.test_files):,}"
+                 if self.test_files else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +447,7 @@ class HerbariumData:
 @pipeline_def(enable_conditionals=True)
 def create_dali_pipeline(files, labels, crop, size, shard_id, num_shards,
                          file_root="", dali_cpu=False, is_training=True,
-                         use_mmap=False):
+                         use_mmap=False, scale_jitter=1.0, random_crop=False):
     images, labels = fn.readers.file(
         files=files, labels=labels, file_root=file_root,
         shard_id=shard_id, num_shards=num_shards,
@@ -385,8 +468,20 @@ def create_dali_pipeline(files, labels, crop, size, shard_id, num_shards,
             images, device=decoder_device, output_type=types.RGB,
             preallocate_width_hint=pw, preallocate_height_hint=ph,
         )
-        images = fn.resize(images, device=dali_device, size=size,
-                           mode="not_smaller", interp_type=types.INTERP_TRIANGULAR)
+        # Scale jitter. `resize_shorter` accepts a random DataNode, so the short
+        # side lands somewhere in [size, size*scale_jitter] and the fixed-size
+        # crop below therefore covers a randomly varying FRACTION of the sheet.
+        # scale_jitter=1.0 reproduces the old `size=size, mode="not_smaller"`
+        # exactly, which is why it is the disable value.
+        if scale_jitter > 1.0:
+            images = fn.resize(
+                images, device=dali_device,
+                resize_shorter=fn.random.uniform(range=[float(size),
+                                                        float(size) * scale_jitter]),
+                interp_type=types.INTERP_TRIANGULAR)
+        else:
+            images = fn.resize(images, device=dali_device, size=size,
+                               mode="not_smaller", interp_type=types.INTERP_TRIANGULAR)
         images = images.gpu()
         images = trivial_augment.trivial_augment_wide(images)
         mirror  = fn.random.coin_flip(probability=0.5)
@@ -400,10 +495,25 @@ def create_dali_pipeline(files, labels, crop, size, shard_id, num_shards,
         images = images.gpu()
         mirror  = False
 
+    # crop_mirror_normalize centres the crop by default (crop_pos = 0.5), so
+    # before this the training and validation branches produced the SAME
+    # deterministic centre crop — the only geometric augmentation in the whole
+    # pipeline was the mirror. On herbarium sheets, where the specimen sits at a
+    # variable position and scale within a fixed sheet, that leaves the model
+    # free to key on absolute position within the frame. Randomising the crop
+    # window (translation) alongside the scale jitter above is the missing
+    # augmentation. Validation stays centred and deterministic.
+    if is_training and random_crop:
+        crop_pos_x = fn.random.uniform(range=[0.0, 1.0])
+        crop_pos_y = fn.random.uniform(range=[0.0, 1.0])
+    else:
+        crop_pos_x = crop_pos_y = 0.5
+
     images = fn.crop_mirror_normalize(
         images.gpu(),
         dtype=types.FLOAT, output_layout="CHW",
         crop=(crop, crop),
+        crop_pos_x=crop_pos_x, crop_pos_y=crop_pos_y,
         mean=[0.485 * 255, 0.456 * 255, 0.406 * 255],
         std =[0.229 * 255, 0.224 * 255, 0.225 * 255],
         mirror=mirror,
@@ -569,19 +679,32 @@ class LitHerbarium(pl.LightningModule):
         self._index_batches = self.use_location or self.aum
 
         if self._index_batches:
+            # persistent=False: these are per-example lookups sized to THIS run's
+            # split, not learned weights. Saving them bloated every checkpoint and
+            # was the only reason a cross-run resume hit shape mismatches — the
+            # freshly built ones are always the correct ones to use.
             self.register_buffer("train_labels_t",
-                                 torch.tensor(data.train_labels, dtype=torch.long))
+                                 torch.tensor(data.train_labels, dtype=torch.long),
+                                 persistent=False)
             self.register_buffer("valid_labels_t",
-                                 torch.tensor(data.valid_labels, dtype=torch.long))
+                                 torch.tensor(data.valid_labels, dtype=torch.long),
+                                 persistent=False)
+            self.register_buffer("test_labels_t",
+                                 torch.tensor(data.test_labels or [0], dtype=torch.long),
+                                 persistent=False)
         if self.use_location:
-            self.register_buffer("train_coords_t", data.train_coords)
-            self.register_buffer("valid_coords_t", data.valid_coords)
+            self.register_buffer("train_coords_t", data.train_coords, persistent=False)
+            self.register_buffer("valid_coords_t", data.valid_coords, persistent=False)
+            self.register_buffer("test_coords_t", data.test_coords, persistent=False)
 
         if self.aum:
             # Running total of each training specimen's margin, and how many
             # epochs it has been seen. persistent=False: the per-epoch running
             # state does not belong in state_dict; the finished AUM is embedded
             # by on_save_checkpoint instead.
+            #
+            # _aum_active gates accumulation by stage — see reset_aum().
+            self._aum_active = True
             n_train = len(data.train_files)
             self.register_buffer("_aum_sum", torch.zeros(n_train), persistent=False)
             self.register_buffer("_aum_n",
@@ -628,6 +751,9 @@ class LitHerbarium(pl.LightningModule):
             # checkpoints share an evaluation set (same split_seed) even when
             # their initialisation differed (different seed).
             "split_seed": int(config.get("split_seed") or config.get("seed", 42)),
+            # Empty unless --test-split was used. Recorded so a later analysis can
+            # prove a number came from specimens nothing in training ever saw.
+            "test": sorted(Path(p).name for p in getattr(data, "test_files", [])),
         }
 
         num_classes = data.num_classes
@@ -688,6 +814,27 @@ class LitHerbarium(pl.LightningModule):
             else:
                 self.species_to_family = None
 
+    def reset_aum(self, active: bool = True) -> None:
+        """Restart AUM accumulation, and choose whether it runs at all.
+
+        AUM separates mislabels from clean labels by how EARLY a specimen's
+        margin goes positive, so it is only meaningful over the stage that
+        actually learns the classes. Pooling stage 1 into the average dilutes
+        exactly that signal: with the backbone frozen, margins are near-noise for
+        every specimen alike, and 4 such epochs averaged against ~10 stage-2 ones
+        pull every score toward the same middle — mislabels included. The
+        cool-down is the mirror problem at the other end: by then the network has
+        memorised the training set, so every specimen (right or wrong) carries a
+        large positive margin and the extra epochs compress the ranking.
+
+        So: reset at the start of stage 2, and switch off for the cool-down.
+        """
+        if not self.aum:
+            return
+        self._aum_active = bool(active)
+        self._aum_sum.zero_()
+        self._aum_n.zero_()
+
     def _aum_payload(self) -> dict:
         """Mean margin per training specimen, for mislabel triage.
 
@@ -707,8 +854,9 @@ class LitHerbarium(pl.LightningModule):
             "fname": [Path(p).name for p in self.data.train_files],
             "aum": [round(float(v), 4) for v in aum],
             "epochs_seen": n.cpu().tolist(),
-            "note": "mean margin over training epochs; LOW/NEGATIVE = candidate "
-                    "mislabel. Ranks training specimens only.",
+            "note": "mean margin over stage-2 epochs (stage 1 and the cool-down are "
+                    "excluded); LOW/NEGATIVE = candidate mislabel. Ranks training "
+                    "specimens only.",
         }
 
     def on_save_checkpoint(self, checkpoint):
@@ -726,11 +874,13 @@ class LitHerbarium(pl.LightningModule):
         checkpoint["temperature"] = getattr(self, "temperature", 1.0)
 
     def on_load_checkpoint(self, checkpoint):
-        sd = checkpoint["state_dict"]
-        if any("._orig_mod" in k for k in sd) and not any("._orig_mod" in k for k in self.state_dict()):
-            checkpoint["state_dict"] = {k.replace("._orig_mod", ""): v for k, v in sd.items()}
-        elif not any("._orig_mod" in k for k in sd) and any("._orig_mod" in k for k in self.state_dict()):
-            checkpoint["state_dict"] = {k.replace("model.model.", "model._orig_mod.model."): v for k, v in sd.items()}
+        # Same _orig_mod. reconciliation as the manual weight loads take, so a
+        # ckpt_path= resume and a --reset-optimizer load behave identically.
+        # (The old inline version only rewrote "model.model.", which is the
+        # non-hierarchical layout; a hierarchical checkpoint is "model.backbone."
+        # and went unfixed.)
+        checkpoint["state_dict"] = _align_compile_prefix(self.state_dict(),
+                                                         checkpoint["state_dict"])
 
     def _hierarchical_loss(self, outputs: dict, species_target: torch.Tensor):
         """Compute weighted multi-head loss; return total_loss and species logits."""
@@ -762,7 +912,7 @@ class LitHerbarium(pl.LightningModule):
     def setup(self, stage=None):
         # Always rebuild DALI pipelines — stale pipelines from a previous Trainer
         # (or process) will deadlock in DDP.
-        for attr in ("train_loader", "val_loader"):
+        for attr in ("train_loader", "val_loader", "test_loader"):
             if hasattr(self, attr):
                 try:
                     getattr(self, attr).reset()
@@ -781,6 +931,13 @@ class LitHerbarium(pl.LightningModule):
         # This guarantees every DDP rank's DALI shard has exactly the same number
         # of complete batches — unequal batch counts cause one rank to exit the
         # epoch early while the other is still in a gradient all-reduce, hanging.
+        #
+        # It costs up to batch×world−1 specimens for the whole run. That is not a
+        # biased loss: train_files comes out of train_test_split, which shuffles,
+        # so the discarded tail is already a random subset (seeded by split_seed)
+        # rather than whatever sat at the end of the CSV. The one imperfection is
+        # that it is the SAME random subset every epoch instead of being resampled
+        # — not worth trading the DDP hang guarantee for.
         total = len(self.data.train_files)
         keep  = (total // (batch * world)) * (batch * world)
         train_files  = self.data.train_files[:keep]
@@ -799,6 +956,13 @@ class LitHerbarium(pl.LightningModule):
 
         prefetch = max(1, int(cfg.get("prefetch_queue", 2)))
         use_mmap = bool(cfg.get("use_mmap", False))
+        # DALI defaults to seed=-1, i.e. a fresh random seed per process: without
+        # this, shuffle order and every TrivialAugment draw differ between runs no
+        # matter what seed_everything() was given. That silently breaks the one
+        # thing --split-seed exists for — holding the evaluation set fixed and
+        # varying ONLY initialisation, to measure run-to-run variance. Each rank
+        # gets its own offset so the shards don't augment in lockstep.
+        dali_seed = int(cfg.get("seed", 42)) + 1000 * self.global_rank
         try:
             pipe = create_dali_pipeline(
                 batch_size=batch, num_threads=cfg["num_workers"],
@@ -806,7 +970,9 @@ class LitHerbarium(pl.LightningModule):
                 num_shards=world, file_root=self.data.imagepath,
                 files=train_files, labels=train_dali_labels,
                 crop=sz, size=sz, dali_cpu=False, is_training=True,
-                use_mmap=use_mmap,
+                use_mmap=use_mmap, seed=dali_seed,
+                scale_jitter=float(cfg.get("aug_scale_jitter", 1.0)),
+                random_crop=bool(cfg.get("aug_random_crop", False)),
                 prefetch_queue_depth=prefetch,
             )
             self.train_loader = DALIClassificationIterator(pipe, reader_name="Reader",
@@ -823,15 +989,46 @@ class LitHerbarium(pl.LightningModule):
                 num_shards=world, file_root=self.data.imagepath,
                 files=self.data.valid_files, labels=valid_dali_labels,
                 crop=sz, size=sz, dali_cpu=False, is_training=False,
-                use_mmap=use_mmap,
+                use_mmap=use_mmap, seed=dali_seed,
                 prefetch_queue_depth=prefetch,
             )
+            # PARTIAL, not FILL. The reader pads the final batch (pad_last_batch=True
+            # equalises shard sizes so DDP ranks stay in step), and FILL hands those
+            # padded duplicates to the iterator, which counts them in the metrics —
+            # so val_Accuracy was computed over a handful of samples scored twice,
+            # once per rank. PARTIAL trims them and yields a short final batch.
             self.val_loader = DALIClassificationIterator(pipe, reader_name="Reader",
-                                                         last_batch_policy=LastBatchPolicy.FILL,
+                                                         last_batch_policy=LastBatchPolicy.PARTIAL,
                                                          auto_reset=True)
         except Exception as exc:
             self._log(f"ERROR building val DALI pipeline: {exc}")
             raise
+
+        # Held-out test pipeline (--test-split). Built here so it shares the DALI
+        # device/seed setup, but it is never handed to the Trainer: no callback,
+        # no early stopping and no temperature fit can see it. PARTIAL rather than
+        # FILL because a reported test number must not double-count the samples
+        # DALI pads the final batch with.
+        self.test_loader = None
+        if getattr(self.data, "test_files", None):
+            test_dali_labels = (list(range(len(self.data.test_files)))
+                                if self._index_batches else self.data.test_labels)
+            try:
+                pipe = create_dali_pipeline(
+                    batch_size=batch, num_threads=cfg["num_workers"],
+                    device_id=self.local_rank, shard_id=self.global_rank,
+                    num_shards=world, file_root=self.data.imagepath,
+                    files=self.data.test_files, labels=test_dali_labels,
+                    crop=sz, size=sz, dali_cpu=False, is_training=False,
+                    use_mmap=use_mmap, seed=dali_seed,
+                    prefetch_queue_depth=prefetch,
+                )
+                self.test_loader = DALIClassificationIterator(
+                    pipe, reader_name="Reader",
+                    last_batch_policy=LastBatchPolicy.PARTIAL, auto_reset=True)
+            except Exception as exc:
+                self._log(f"ERROR building test DALI pipeline: {exc}")
+                raise
 
         n_train = keep // (batch * world)
         n_val   = len(self.data.valid_files)
@@ -904,15 +1101,17 @@ class LitHerbarium(pl.LightningModule):
         self.lr    = lr
         self.t_max = t_max
 
-    def _step(self, batch, is_train: bool = True):
+    def _step(self, batch, split: str = "train"):
         image = batch[0]["data"]
         raw   = batch[0]["label"].squeeze(-1).long()
         idx   = None
         if self._index_batches:
-            labels_t = self.train_labels_t if is_train else self.valid_labels_t
-            target = labels_t[raw]
+            # Buffers are named <split>_labels_t / <split>_coords_t. The coords
+            # lookup stays behind use_location: those buffers are only registered
+            # when geo fusion is on.
+            target = getattr(self, f"{split}_labels_t")[raw]
             idx    = raw                       # the specimen's row in train_files
-            geo    = ((self.train_coords_t if is_train else self.valid_coords_t)[raw]
+            geo    = (getattr(self, f"{split}_coords_t")[raw]
                       if self.use_location else None)
         else:
             target = raw
@@ -955,12 +1154,12 @@ class LitHerbarium(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         try:
-            loss, outputs, target, idx = self._step(batch, is_train=True)
+            loss, outputs, target, idx = self._step(batch, split="train")
         except Exception as exc:
             self._log(f"ERROR in training_step epoch {self.current_epoch} "
                       f"batch {batch_idx}: {exc}")
             raise
-        if self.aum and idx is not None:
+        if self.aum and getattr(self, "_aum_active", True) and idx is not None:
             self._accumulate_aum(outputs, target, idx)
         if self.hierarchical:
             self._update_hierarchical_metrics(outputs, target,
@@ -975,7 +1174,7 @@ class LitHerbarium(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         try:
-            loss, outputs, target, _idx = self._step(batch, is_train=False)
+            loss, outputs, target, _idx = self._step(batch, split="valid")
         except Exception as exc:
             self._log(f"ERROR in validation_step epoch {self.current_epoch} "
                       f"batch {batch_idx}: {exc}")
@@ -993,9 +1192,63 @@ class LitHerbarium(pl.LightningModule):
         self._cal_targets.append(target.detach().cpu())
         self.log("valid_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
+    @torch.no_grad()
+    def collect_val_logits(self, split: str = "valid") -> int:
+        """Re-run a split with the CURRENT weights, refilling _cal_*.
+
+        Needed because the logits stashed during training belong to whichever
+        epoch happened to run last, and early stopping guarantees that is not the
+        epoch whose weights got selected — patience 2 means it is typically two
+        epochs past the peak. Fitting a temperature on one model and stamping it
+        into another is exactly the mismatch this avoids: T is refitted against
+        each checkpoint's own weights before it is embedded.
+
+        Runs the DALI val pipeline directly rather than trainer.validate() so it
+        stays out of Lightning's logging (no phantom metric points after the run)
+        and involves no collectives, which is what makes it safe to call on rank 0
+        alone. Returns the number of samples seen.
+
+        split="test" runs the held-out set instead (--test-split). Nothing during
+        training ever touches that loader, which is the entire point of it.
+        """
+        loader = {"valid": lambda: self.val_loader,
+                  "test":  lambda: getattr(self, "test_loader", None)}[split]()
+        if loader is None:
+            return 0
+        self._cal_logits = []
+        self._cal_targets = []
+        was_training = self.training
+        self.eval()
+        if self.config.get("grad_checkpoint", True):
+            try:
+                self.model.set_grad_checkpointing(False)
+            except Exception:
+                pass
+        n = 0
+        try:
+            for batch in loader:
+                _loss, outputs, target, _idx = self._step(batch, split=split)
+                logits = outputs["species"] if isinstance(outputs, dict) else outputs
+                self._cal_logits.append(logits.detach().float().cpu())
+                self._cal_targets.append(target.detach().cpu())
+                n += int(target.numel())
+        finally:
+            if self.config.get("grad_checkpoint", True):
+                try:
+                    self.model.set_grad_checkpointing(True)
+                except Exception:
+                    pass
+            if was_training:
+                self.train()
+        return n
+
     def fit_temperature(self, max_iter: int = 100) -> float:
-        """Fit a single softmax temperature on the last validation epoch's logits
+        """Fit a single softmax temperature on the logits currently in _cal_*
         (temperature scaling, Guo et al. 2017).
+
+        Those logits come from collect_val_logits(), which re-runs validation
+        under a specific checkpoint's weights — so the T returned belongs to that
+        checkpoint, not to whichever epoch happened to finish the run.
 
         Minimises validation NLL over a scalar T, applied as softmax(logits / T).
         T > 1 means the raw model was over-confident and probabilities get
@@ -1036,6 +1289,22 @@ class LitHerbarium(pl.LightningModule):
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+
+def _score_logits(logits: torch.Tensor, targets: torch.Tensor,
+                  temperature: float = 1.0) -> dict:
+    """Top-1 / top-5 / mean confidence for a finished set of logits."""
+    if logits.numel() == 0:
+        return {}
+    k = min(5, logits.shape[1])
+    top1 = (logits.argmax(1) == targets).float().mean().item()
+    out = {"n": int(targets.numel()), "top1": top1}
+    if k > 1:
+        topk = logits.topk(k, dim=1).indices
+        out[f"top{k}"] = (topk == targets.view(-1, 1)).any(1).float().mean().item()
+    probs = torch.softmax(logits / max(temperature, 1e-6), dim=1)
+    out["mean_confidence"] = probs.max(1).values.mean().item()
+    return out
+
 
 class _TextProgressCallback(pl.Callback):
     """Plain newline-terminated progress for pipe / webui output (no tqdm)."""
@@ -1113,6 +1382,25 @@ def build_trainer(config: dict, output_dir: Path, logger, callbacks: list,
     )
 
 
+def _align_compile_prefix(live: dict, state_dict: dict) -> dict:
+    """Reconcile the `_orig_mod.` prefix torch.compile inserts into key names.
+
+    A run with --no-compile writes `model.model.blocks...`; a compiled run wants
+    `model._orig_mod.model.blocks...`. The names differ only by that segment, so
+    load_state_dict(strict=False) matches nothing at all and reports success.
+    """
+    ck_compiled   = any("._orig_mod." in k for k in state_dict)
+    live_compiled = any("._orig_mod." in k for k in live)
+    if ck_compiled and not live_compiled:
+        print("  checkpoint was written by a compiled run; stripping _orig_mod. prefix")
+        return {k.replace("._orig_mod.", "."): v for k, v in state_dict.items()}
+    if live_compiled and not ck_compiled:
+        print("  checkpoint predates torch.compile wrapping; inserting _orig_mod. prefix")
+        return {k.replace("model.", "model._orig_mod.", 1) if k.startswith("model.") else k: v
+                for k, v in state_dict.items()}
+    return state_dict
+
+
 def _load_compatible_state_dict(module, state_dict: dict) -> None:
     """load_state_dict(..., strict=False), but also drop any key whose shape
     doesn't match the live module.
@@ -1131,14 +1419,79 @@ def _load_compatible_state_dict(module, state_dict: dict) -> None:
     should be used, not stale ones from a different dataset.
     """
     live = module.state_dict()
+    state_dict = _align_compile_prefix(live, state_dict)
     compatible = {}
+    shape_skipped = set()
     for k, v in state_dict.items():
         if k in live and live[k].shape != v.shape:
             print(f"  skipping {k}: checkpoint shape {tuple(v.shape)} != "
                   f"current shape {tuple(live[k].shape)}")
+            shape_skipped.add(k)
             continue
         compatible[k] = v
-    module.load_state_dict(compatible, strict=False)
+    result = module.load_state_dict(compatible, strict=False)
+
+    # strict=False is silent by design, and that silence is dangerous here: if the
+    # names don't line up (the classic case is a checkpoint written by an
+    # uncompiled run being loaded into a compiled one, or vice versa — every
+    # backbone key gains or loses an `_orig_mod.`), NOTHING loads and the run
+    # continues from pretrained init while the log still says "loading weights
+    # from <ckpt>". _align_compile_prefix above fixes the known case; this counts
+    # what actually landed so an unknown one can't pass unnoticed.
+    # Shape-skipped keys are excluded from the denominator: dropping the head
+    # because the class count changed is intended, and must not count against
+    # the guard. What is left measures purely whether the NAMES line up.
+    weight_keys  = [k for k in live if k.startswith("model.") and k not in shape_skipped]
+    loaded_keys  = [k for k in weight_keys if k in compatible]
+    missing      = [k for k in getattr(result, "missing_keys", [])
+                    if k.startswith("model.") and k not in shape_skipped]
+    unexpected   = list(getattr(result, "unexpected_keys", []))
+    frac = len(loaded_keys) / max(len(weight_keys), 1)
+    print(f"  loaded {len(loaded_keys)}/{len(weight_keys)} model tensors "
+          f"({frac:.0%}) from checkpoint"
+          + (f", {len(shape_skipped)} skipped on shape" if shape_skipped else ""))
+    if missing:
+        head = ", ".join(missing[:5])
+        print(f"  [warn] {len(missing)} model tensors NOT in the checkpoint: {head}"
+              + (" ..." if len(missing) > 5 else ""))
+    if unexpected:
+        print(f"  [warn] {len(unexpected)} checkpoint tensors had no home in this model "
+              f"(first: {unexpected[0]})")
+    if weight_keys and frac < 0.5:
+        raise RuntimeError(
+            f"Refusing to continue: only {len(loaded_keys)} of {len(weight_keys)} model "
+            f"tensors matched the checkpoint ({frac:.0%}). The weights did not load — "
+            f"training would silently restart from the pretrained initialisation. "
+            f"Check that the checkpoint matches --model / --hierarchical / --use-location.")
+
+
+def _fit(trainer: Trainer, lit, **kwargs) -> None:
+    """trainer.fit with a decode failure translated into something actionable.
+
+    The pre-flight scan catches failed downloads, but it is a header check, so
+    corruption in the middle of a well-formed file still reaches the decoder —
+    and DALI's abort message names the pipeline, never the file. Point at the
+    one tool that can find it.
+    """
+    try:
+        trainer.fit(lit, **kwargs)
+    except RuntimeError as exc:
+        text = str(exc)
+        if "nvImageCodec" not in text and "decoders.image" not in text:
+            raise
+        raise RuntimeError(
+            "DALI aborted: an image could not be decoded. The pre-flight header "
+            "check passed for every file, so this is corruption inside an "
+            "otherwise well-formed image rather than a failed download (or the "
+            "check was disabled with --no-image-check).\n"
+            "Find it with a full decode pass — this stops at the first bad file "
+            "and names it in the traceback:\n"
+            "  python -c \"import sys, glob; from PIL import Image; "
+            "Image.MAX_IMAGE_PIXELS = None; "
+            "[Image.open(f).load() for f in sorted(glob.glob(sys.argv[1] + '/*'))]\" "
+            "<image_dir>\n"
+            "Then set hasfile=False for it in specsin.csv, or re-download it."
+        ) from exc
 
 
 def train(config: dict):
@@ -1172,8 +1525,19 @@ def train(config: dict):
         split_seed=config.get("split_seed"),
         max_per_class=config.get("max_per_class", 0),
         class_weight_beta=config.get("class_weight_beta", 0.0),
+        check_images=config.get("check_images", True),
+        test_split=config.get("test_split", 0.0),
     )
     config["num_classes"] = data.num_classes
+
+    # Sidecar listing every file dropped as unusable, so a bad download can be
+    # re-fetched (or marked hasfile=False) instead of being rediscovered by the
+    # next run. Written only when there is something to report.
+    if getattr(data, "bad_images", None):
+        bad_path = output_dir / "unreadable_images.json"
+        bad_path.write_text(json.dumps(
+            {Path(k).name: v for k, v in sorted(data.bad_images.items())}, indent=2))
+        print(f"Saved unreadable-image list ({len(data.bad_images)}) → {bad_path}")
 
     # Save nameslist for the identify step
     nameslist_path = output_dir / "nameslist.json"
@@ -1316,10 +1680,19 @@ def train(config: dict):
         if hasattr(model_module, "freeze_backbone"):
             model_module.freeze_backbone()
 
+        # enable_version_counter=False on every save_last=True callback below.
+        # Each stage builds its OWN ModelCheckpoint into the same directory, and
+        # Lightning's version counter refuses to reuse a name that already exists
+        # — so the three of them produced last.ckpt (stage 1), last-v1.ckpt
+        # (stage 2) and last-v2.ckpt (cool-down). "last.ckpt" therefore held the
+        # FROZEN-BACKBONE warm-up model, which is the one thing it must never be:
+        # identify falls back to it, push_model.py can publish it, and it is
+        # documented as "most recent". Overwriting is the intended behaviour.
         s1_ckpt_cb = ModelCheckpoint(
             dirpath=str(output_dir / "checkpoints"),
             filename="s1-{epoch:02d}-{valid_loss:.4f}",
             monitor="valid_loss", save_top_k=1, save_last=True, mode="min",
+            enable_version_counter=False,
         )
         # Parallel best-by-accuracy tracker. Lightning keeps both top files
         # independently in the same dir; loss-best and acc-best can diverge
@@ -1340,7 +1713,7 @@ def train(config: dict):
                                    [s1_ckpt_cb, s1_acc_cb,
                                     make_early_stop(config, patience=5)],
                                    stage1_epochs, num_gpus)
-        s1_trainer.fit(lit)
+        _fit(s1_trainer, lit)
         last_trainer = s1_trainer
         if use_wandb:
             _step_offset[0] += s1_trainer.global_step
@@ -1361,6 +1734,10 @@ def train(config: dict):
         if s2_batch > 0 and s2_batch != config["batch_size"]:
             print(f"  Stage 2 batch size overridden: {config['batch_size']} → {s2_batch}")
             config["batch_size"] = s2_batch
+            # save_hyperparameters() copied config at construction, so mutating the
+            # dict alone leaves every checkpoint from here on claiming the stage-1
+            # batch size. Keep the recorded value honest.
+            lit.hparams["batch_size"] = s2_batch
         lit.set_stage2(lr=config["stage2_lr"], t_max=stage2_epochs)
         print(f"\n{'='*50}\n"
               f"STAGE 2: full fine-tune, {stage2_epochs} epochs, lr={config['stage2_lr']}, "
@@ -1371,6 +1748,7 @@ def train(config: dict):
             dirpath=str(output_dir / "checkpoints"),
             filename="{epoch:02d}-{valid_loss:.4f}",
             monitor="valid_loss", save_top_k=1, save_last=True, mode="min",
+            enable_version_counter=False,
         )
         acc_ckpt_cb = ModelCheckpoint(
             dirpath=str(output_dir / "checkpoints"),
@@ -1407,6 +1785,10 @@ def train(config: dict):
             torch.compiler.reset()
             print("compile cache reset — stage 2 retraces with the backbone unfrozen")
 
+        # Discard any margins accumulated during the frozen-backbone warm-up:
+        # they are noise for every specimen equally and only blur the ranking.
+        lit.reset_aum(active=True)
+
         # Patience 2 on val_Accuracy. Replayed against the real curves of the last
         # three runs (Rubiaceae, Opiliaceae, Icacinales) this stops 2-3 epochs
         # early and still captures each run's exact peak — the tail buys nothing.
@@ -1414,7 +1796,7 @@ def train(config: dict):
                                    [checkpoint_cb, acc_ckpt_cb,
                                     make_early_stop(config, patience=2)],
                                    stage2_epochs, num_gpus)
-        s2_trainer.fit(lit, ckpt_path=fit_ckpt)
+        _fit(s2_trainer, lit, ckpt_path=fit_ckpt)
         last_trainer = s2_trainer
         if use_wandb:
             _step_offset[0] += s2_trainer.global_step
@@ -1425,7 +1807,16 @@ def train(config: dict):
         cooldown_batch = config.get("cooldown_batch_size", config["batch_size"])
         cooldown_lr    = config.get("cooldown_lr",         config["stage2_lr"])
         cooldown_accum = config.get("cooldown_accum",      config["accum"])
-        best_so_far    = (checkpoint_cb.best_model_path if checkpoint_cb else None) or str(output_dir / "checkpoints" / "last.ckpt")
+        # Resume the cool-down from the ACCURACY-best, not the loss-best. Every
+        # other selection in this run keys on val_Accuracy — early stopping, and
+        # identify's checkpoint auto-select — for the reason in make_early_stop:
+        # late on, the model grows more confident and valid_loss drifts up on hard
+        # examples while accuracy holds or improves. This was the last place still
+        # steering by the old metric, so the cool-down could start from a strictly
+        # worse model than the one the run would go on to publish.
+        best_so_far = ((acc_ckpt_cb.best_model_path if acc_ckpt_cb else None)
+                       or (checkpoint_cb.best_model_path if checkpoint_cb else None)
+                       or str(output_dir / "checkpoints" / "last.ckpt"))
 
         print(f"\n{'='*50}\n"
               f"COOL-DOWN: {cooldown_epochs} epochs, "
@@ -1435,6 +1826,8 @@ def train(config: dict):
 
         config["batch_size"] = cooldown_batch
         config["accum"]      = cooldown_accum
+        lit.hparams["batch_size"] = cooldown_batch
+        lit.hparams["accum"]      = cooldown_accum
         lit.set_stage2(lr=cooldown_lr, t_max=cooldown_epochs)
 
         # Load model weights only — do NOT use ckpt_path on the new trainer, because
@@ -1448,6 +1841,7 @@ def train(config: dict):
             dirpath=str(output_dir / "checkpoints"),
             filename="cd-{epoch:02d}-{valid_loss:.4f}",
             monitor="valid_loss", save_top_k=1, save_last=True, mode="min",
+            enable_version_counter=False,
         )
         cooldown_acc_cb = ModelCheckpoint(
             dirpath=str(output_dir / "checkpoints"),
@@ -1460,7 +1854,13 @@ def train(config: dict):
              make_early_stop(config, patience=2)],
             cooldown_epochs, num_gpus,
         )
-        cooldown_trainer.fit(lit)
+        # Keep the stage-2 AUM as the reported score; post-memorisation margins
+        # would only compress the ranking (see LitHerbarium.reset_aum).
+        if lit.aum:
+            lit._aum_active = False
+        _fit(cooldown_trainer, lit)
+        if lit.aum:
+            lit._aum_active = True
         last_trainer = cooldown_trainer
         if use_wandb:
             _step_offset[0] += cooldown_trainer.global_step
@@ -1484,35 +1884,111 @@ def train(config: dict):
     # Raw cross-entropy makes the network over-confident (top-1 ≈ 100%);
     # temperature scaling divides logits by a single T fitted on validation so
     # the reported probabilities are honest. Argmax/accuracy are unchanged.
-    # Only rank 0 fits and rewrites files (avoids DDP write races).
+    #
+    # EACH checkpoint gets its OWN T, fitted against its OWN weights. The logits
+    # stashed during training belong to whichever epoch ran last, and early
+    # stopping (patience 2 on val_Accuracy) guarantees that is not the epoch the
+    # acc-best checkpoint came from — so the previous single-fit version stamped
+    # one model's calibration into a different model's file. T is sensitive to
+    # exactly the thing that differs between those epochs (how confident the
+    # network has become), so it was wrong in the direction that matters.
+    #
+    # Only rank 0 fits and rewrites files (avoids DDP write races). It therefore
+    # fits on its own validation shard — plenty for a single scalar.
+    temperature = 1.0
     if last_trainer is None or last_trainer.is_global_zero:
-        temperature = lit.fit_temperature()
-        lit.temperature = temperature
-        print(f"\n  Calibration temp   : {temperature:.3f}  (identify uses softmax(logits / T))")
-
-        # Patch the checkpoints written during training so identify picks up the
-        # temperature automatically (they were saved with the placeholder 1.0).
-        ckpt_paths: set[str] = set()
+        ckpt_paths: list[str] = []
         for cb in (checkpoint_cb, acc_ckpt_cb):
             if cb is not None and getattr(cb, "best_model_path", ""):
-                ckpt_paths.add(cb.best_model_path)
+                if cb.best_model_path not in ckpt_paths:
+                    ckpt_paths.append(cb.best_model_path)
         last_ck = output_dir / "checkpoints" / "last.ckpt"
-        if last_ck.exists():
-            ckpt_paths.add(str(last_ck))
-        for p in ckpt_paths:
-            try:
-                cd = torch.load(p, map_location="cpu", weights_only=False)
-                cd["temperature"] = temperature
-                torch.save(cd, p)
-            except Exception as exc:
-                print(f"  WARNING: could not embed temperature into {p}: {exc}")
+        if last_ck.exists() and str(last_ck) not in ckpt_paths:
+            ckpt_paths.append(str(last_ck))
 
-        # Also drop a small sidecar next to the nameslist for quick reference.
+        # Lightning's strategy teardown moves the module to CPU when fit() ends,
+        # but the DALI val pipeline still emits on cuda:local_rank.
+        cal_device = (torch.device(f"cuda:{local_rank}") if torch.cuda.is_available()
+                      else torch.device("cpu"))
+        can_revalidate = hasattr(lit, "val_loader")
+        if can_revalidate:
+            lit.to(cal_device)
+
+        temps: dict[str, float] = {}
+        print(f"\n  Calibrating {len(ckpt_paths)} checkpoint(s) — "
+              f"refitting T on each one's own weights")
+        for ck_path in ckpt_paths:
+            try:
+                cd = torch.load(ck_path, map_location="cpu", weights_only=False)
+            except Exception as exc:
+                print(f"  WARNING: could not read {ck_path}: {exc}")
+                continue
+            T = 1.0
+            try:
+                if can_revalidate:
+                    _load_compatible_state_dict(lit, cd["state_dict"])
+                    n_seen = lit.collect_val_logits()
+                    if n_seen == 0:
+                        print(f"  WARNING: no validation samples for {Path(ck_path).name}; T=1.0")
+                # If the val pipeline is unavailable, fall back to whatever the
+                # last validation epoch stashed — the old behaviour, and clearly
+                # labelled as approximate.
+                T = lit.fit_temperature()
+            except Exception as exc:
+                print(f"  WARNING: calibration failed for {Path(ck_path).name} "
+                      f"({exc}); T=1.0")
+                T = 1.0
+            temps[ck_path] = T
+            print(f"    {Path(ck_path).name:<40s} T={T:.3f}")
+            try:
+                cd["temperature"] = T
+                torch.save(cd, ck_path)
+            except Exception as exc:
+                print(f"  WARNING: could not embed temperature into {ck_path}: {exc}")
+
+        # Headline T is the one belonging to the checkpoint identify will pick.
+        head_path = (acc_ckpt_cb.best_model_path
+                     if acc_ckpt_cb is not None and acc_ckpt_cb.best_model_path
+                     else best_ckpt)
+        temperature = temps.get(head_path, temps.get(best_ckpt, 1.0))
+        lit.temperature = temperature
+        print(f"  Calibration temp   : {temperature:.3f}  (identify uses softmax(logits / T))")
+
+        # Sidecar for quick reference. "temperature" stays the scalar older
+        # consumers (push_model.py, calibrate_temperature.py) expect; the
+        # per-checkpoint map is additive.
         try:
-            (output_dir / "temperature.json").write_text(
-                json.dumps({"temperature": temperature}, indent=2))
+            (output_dir / "temperature.json").write_text(json.dumps({
+                "temperature": temperature,
+                "checkpoint": head_path,
+                "per_checkpoint": {Path(k).name: v for k, v in temps.items()},
+            }, indent=2))
         except Exception as exc:
             print(f"  WARNING: could not write temperature.json: {exc}")
+
+    # ── Held-out test evaluation (--test-split) ──────────────────────────────
+    # Scored on the checkpoint identify will actually pick, with that checkpoint's
+    # own fitted temperature, on specimens no callback ever saw. This is the number
+    # to quote: val_Accuracy above is what checkpoint selection and early stopping
+    # optimised against, so it is biased upward by construction.
+    test_report: dict = {}
+    if (last_trainer is None or last_trainer.is_global_zero) and getattr(lit, "test_loader", None):
+        head_path = (acc_ckpt_cb.best_model_path
+                     if acc_ckpt_cb is not None and acc_ckpt_cb.best_model_path
+                     else best_ckpt)
+        try:
+            cd = torch.load(head_path, map_location="cpu", weights_only=False)
+            _load_compatible_state_dict(lit, cd["state_dict"])
+            n_seen = lit.collect_val_logits(split="test")
+            if n_seen:
+                test_report = _score_logits(torch.cat(lit._cal_logits),
+                                            torch.cat(lit._cal_targets),
+                                            temperature=temperature)
+                test_report["checkpoint"] = Path(head_path).name
+                (output_dir / "test_metrics.json").write_text(
+                    json.dumps(test_report, indent=2))
+        except Exception as exc:
+            print(f"  WARNING: held-out test evaluation failed: {exc}")
 
     # Pull the last-epoch metrics off the trainer that actually ran most
     # recently. callback_metrics is populated as logs flow through the
@@ -1553,6 +2029,13 @@ def train(config: dict):
         score = acc_ckpt_cb.best_model_score
         score_str = f"{float(score):.4f}" if score is not None else "n/a"
         print(f"  Best by val_Accuracy ({score_str}): {acc_ckpt_cb.best_model_path}")
+    if test_report:
+        k5 = next((k for k in test_report if k.startswith("top") and k != "top1"), None)
+        print(f"  --- Held-out test set ({test_report['n']:,} specimens, seen by nothing) ---")
+        print(f"  Test accuracy      : {test_report['top1']:.4f}"
+              + (f"   (top-{k5[3:]}: {test_report[k5]:.4f})" if k5 else ""))
+        print(f"  Mean confidence    : {test_report['mean_confidence']:.4f}  (at T={temperature:.3f})")
+        print(f"  Scored checkpoint  : {test_report['checkpoint']}")
     print(f"  Nameslist          : {nameslist_path}")
     print(f"{'='*50}")
 
@@ -1591,6 +2074,12 @@ DEFAULT_CONFIG = dict(
     resume=None,
     max_per_class=0,
     class_weight_beta=0.0,
+    check_images=True,           # pre-flight header scan; one bad file kills a run
+    # Geometric augmentation. Both were absent: train and val saw the identical
+    # deterministic centre crop, so the mirror was the only geometric transform.
+    test_split=0.0,              # >0 holds out a set no callback ever sees
+    aug_scale_jitter=1.15,       # 1.0 = the old fixed resize
+    aug_random_crop=True,        # False = centre crop, as validation uses
     aum=True,                    # free, and it is the only way to find mis-IDs in train
     early_stop_metric="val_Accuracy",
     early_stop_patience=0,       # 0 = per-stage default (s1 5, s2 2, cool-down 2)
@@ -1688,6 +2177,38 @@ def parse_args():
     p.add_argument("--prefetch-queue", type=int, default=2, metavar="N",
                    help="DALI prefetch queue depth (default 2). Higher hides I/O latency at "
                         "the cost of VRAM; 4 helps on slow / network filesystems.")
+    p.add_argument("--test-split", type=float, default=DEFAULT_CONFIG["test_split"],
+                   metavar="F",
+                   help="Hold out this fraction as a TEST set that nothing in training "
+                        "touches — no checkpoint selection, no early stopping, no "
+                        "temperature fit (0 = off, the default). Everything else is scored "
+                        "on the validation split, which those three all read, so "
+                        "val_Accuracy is optimistically biased; this reports an honest "
+                        "number for the selected checkpoint. Split by --split-seed, so runs "
+                        "sharing it are scored on identical specimens. Try 0.1.")
+    p.add_argument("--aug-scale-jitter", type=float, default=DEFAULT_CONFIG["aug_scale_jitter"],
+                   metavar="F",
+                   help="Random scale augmentation: the short side is resized into "
+                        "[image-sz, image-sz*F] before the fixed-size crop, so each epoch "
+                        "sees the sheet at a slightly different zoom. 1.0 disables it and "
+                        "restores the previous fixed resize. Keep it mild (~1.15): a large "
+                        "value crops the specimen out of the frame.")
+    p.add_argument("--no-crop-aug", dest="aug_random_crop", action="store_false",
+                   help="Take the training crop from the centre, as validation does. "
+                        "By default the crop WINDOW is placed at random, which together "
+                        "with --aug-scale-jitter is the only geometric augmentation "
+                        "besides the mirror. Before this existed, train and val saw the "
+                        "identical deterministic centre crop, leaving the model free to "
+                        "key on absolute position within the sheet.")
+    p.add_argument("--no-image-check", dest="check_images", action="store_false",
+                   help="Skip the pre-flight image header check. The check exists because "
+                        "DALI's GPU decoder has no per-sample error tolerance: a single "
+                        "undecodable file (an HTML error page saved as .jpg by a failed GBIF "
+                        "download, or a truncated image) aborts the pipeline mid-epoch and "
+                        "kills the run after the GPU time has been spent. It reads 16 bytes "
+                        "from the front and 2 KB from the back of each file, in place of the "
+                        "stat() it replaces. Skip it only on a data set you have already "
+                        "trained on cleanly.")
     p.add_argument("--use-mmap", action="store_true",
                    help="Enable mmap in DALI file reader. Faster on local NVMe / tmpfs; "
                         "do not use on MooseFS / NFS.")
@@ -1774,6 +2295,10 @@ if __name__ == "__main__":
         grad_checkpoint=not args.no_grad_checkpoint,
         prefetch_queue=args.prefetch_queue,
         use_mmap=args.use_mmap,
+        check_images=args.check_images,
+        test_split=args.test_split,
+        aug_scale_jitter=args.aug_scale_jitter,
+        aug_random_crop=args.aug_random_crop,
         pretrained=True,
         precision="bf16-mixed",
         label_level=args.label_level,
