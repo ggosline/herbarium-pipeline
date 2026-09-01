@@ -98,7 +98,7 @@ require_project_match() {
 # network volume is slower than container-disk NVMe. In practice the
 # import-time penalty is sub-second per process, far less than the
 # cold-cache `uv sync` cost it replaces.
-export UV_CACHE_DIR=/workspace/.cache/uv
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/workspace/.cache/uv}"
 export UV_PROJECT_ENVIRONMENT=/workspace/venv
 export HF_HOME=/workspace/.cache/huggingface
 # uv installs its own Python interpreter when the project's requires-python
@@ -137,7 +137,29 @@ RCLONE_CACHE_FLAGS=(
   --exclude 'builds-v*/**'
 )
 
+# uv's cache must NOT be dereferenced. Its wheels-v6/index/<hash>/<pkg>/<ver>
+# entries are symlinks into the unpacked wheel; --copy-links replaces each one
+# with a real DIRECTORY, and on restore `uv sync` dies trying to write the entry
+# as a file:
+#     failed to rename .../typing-extensions/4.15.0-py3-none-any:
+#     Is a directory (os error 21)
+# That took down a whole training pod after an 11-minute cache pull. --links
+# round-trips symlinks as .rclonelink files instead, preserving the structure.
+# HF keeps --copy-links: there, dereferencing blobs/+snapshots/ into real files
+# is what makes the restored cache usable.
+RCLONE_UV_FLAGS=(
+  --transfers 16 --checkers 16 --fast-list --stats=10s
+  --links
+  --exclude 'builds-v*/**'
+)
+
 cache_pull() {
+  # SKIP_CACHE_PULL=1 bypasses R2 and lets uv fetch from PyPI. Slower, but it
+  # is the escape hatch when the shared cache is poisoned — as it was when a
+  # --copy-links push flattened uv's symlinks into directories.
+  if [ "${SKIP_CACHE_PULL:-0}" = "1" ]; then
+    echo "SKIP_CACHE_PULL=1 — not pulling the shared cache"; return 0
+  fi
   if ! command -v rclone >/dev/null; then
     echo "rclone not installed yet — skipping cache pull"; return 0
   fi
@@ -146,7 +168,7 @@ cache_pull() {
   fi
   echo "→ Pulling shared cache from $CACHE_REMOTE..."
   rclone copy "$CACHE_REMOTE/uv/"          "$UV_CACHE_DIR/" \
-    "${RCLONE_CACHE_FLAGS[@]}" 2>&1 | tail -3 || true
+    "${RCLONE_UV_FLAGS[@]}" 2>&1 | tail -3 || true
   rclone copy "$CACHE_REMOTE/huggingface/" "$HF_HOME/" \
     "${RCLONE_CACHE_FLAGS[@]}" 2>&1 | tail -3 || true
   echo "✓ Cache pull done ($(du -sh "$UV_CACHE_DIR" "$HF_HOME" 2>/dev/null | tr '\n' ' '))"
@@ -170,7 +192,7 @@ cache_push() {
   du -sh "$UV_CACHE_DIR" "$HF_HOME" 2>/dev/null | sed 's/^/    /'
   local rc_uv=0 rc_hf=0
   rclone copy "$UV_CACHE_DIR/" "$CACHE_REMOTE/uv/" \
-    "${RCLONE_CACHE_FLAGS[@]}" --stats-one-line 2>&1 | tail -3 || rc_uv=$?
+    "${RCLONE_UV_FLAGS[@]}" --stats-one-line 2>&1 | tail -3 || rc_uv=$?
   rclone copy "$HF_HOME/"      "$CACHE_REMOTE/huggingface/" \
     "${RCLONE_CACHE_FLAGS[@]}" --stats-one-line 2>&1 | tail -3 || rc_hf=$?
   if [ "$rc_uv" -ne 0 ] || [ "$rc_hf" -ne 0 ]; then
@@ -615,7 +637,14 @@ setup() {
     #     --extra local-ml pulls the full ML stack (torch/timm/transformers/…),
     #     which moved to an optional group so plain `uv sync` stays slim for
     #     local UI installs. The pod always needs it.
-    uv sync --frozen --extra local-ml
+    # A poisoned wheel cache must cost time, not the pod. If the cache makes
+    # uv fail, throw it away and refetch from PyPI rather than dying after the
+    # GPU has already been rented.
+    if ! uv sync --frozen --extra local-ml; then
+      echo "⚠ uv sync failed — discarding the shared wheel cache and retrying from PyPI"
+      rm -rf "${UV_CACHE_DIR:?}"/* 2>/dev/null || true
+      uv sync --frozen --extra local-ml
+    fi
 
     # 6c. DALI — installed outside the lock (it's not in pyproject.toml).
     #     Pinned to the cuda120 wheel regardless of the pod's driver: torch is
@@ -701,7 +730,7 @@ setup() {
     cat >> /root/.bashrc <<'BASHRC'
 
 # herbarium-pipeline env — written by pod_bootstrap.sh setup
-export UV_CACHE_DIR=/workspace/.cache/uv
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/workspace/.cache/uv}"
 export UV_PYTHON_INSTALL_DIR=/workspace/.uv-python
 export HF_HOME=/workspace/.cache/huggingface
 export RCLONE_CONFIG=/workspace/.config/rclone/rclone.conf
@@ -1624,6 +1653,18 @@ train() {
   [ -n "${CLASS_WEIGHT_BETA:-}" ] && EXTRA+=(--class-weight-beta "$CLASS_WEIGHT_BETA")
   [ "${NO_GRAD_CKPT:-0}" = "1" ] && EXTRA+=(--no-grad-checkpoint)
   [ -n "${PREFETCH_QUEUE:-}" ] && EXTRA+=(--prefetch-queue "$PREFETCH_QUEUE")
+  [ -n "${SEED:-}" ] && EXTRA+=(--seed "$SEED")
+  # Pin the train/held-out split independently of --seed so two runs that differ
+  # only in initialisation are scored on identical specimens.
+  [ -n "${SPLIT_SEED:-}" ] && EXTRA+=(--split-seed "$SPLIT_SEED")
+  # Held-out test set that no callback, early stop or temperature fit sees.
+  # Reported in TRAINING COMPLETE and written to $DATA/test_metrics.json.
+  [ -n "${TEST_SPLIT:-}" ] && EXTRA+=(--test-split "$TEST_SPLIT")
+  # Geometric augmentation. Defaults are on; these restore the old fixed
+  # centre crop for an A/B against pre-2026-08 runs.
+  [ -n "${AUG_SCALE_JITTER:-}" ] && EXTRA+=(--aug-scale-jitter "$AUG_SCALE_JITTER")
+  [ "${NO_CROP_AUG:-0}" = "1" ] && EXTRA+=(--no-crop-aug)
+  [ "${NO_IMAGE_CHECK:-0}" = "1" ] && EXTRA+=(--no-image-check)
 
   # Stage images to local storage if requested (escapes MooseFS I/O bottleneck).
   # STAGE_IMAGES=1 → run stage_images now and override the source dir.
