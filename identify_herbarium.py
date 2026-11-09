@@ -33,6 +33,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import timm
+import jem_backbone  # noqa: F401  registers the JEM PlantNet ViT with timm
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image

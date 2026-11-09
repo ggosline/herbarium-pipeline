@@ -44,6 +44,7 @@ import torch.nn as nn
 _print("Loading timm...\n")
 import timm
 import timm.optim
+import jem_backbone  # noqa: F401  registers the JEM PlantNet ViT with timm
 _print("Loading pytorch_lightning...\n")
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer, seed_everything
