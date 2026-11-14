@@ -156,6 +156,17 @@ def getweights(series, beta: float = 0.0):
     return w / w.mean()
 
 
+def _load_split(ckpt_path: str | None) -> dict | None:
+    """The {"train": [...], "valid": [...]} payload a checkpoint carries (--split-from)."""
+    if not ckpt_path:
+        return None
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False, mmap=True)
+    split = ckpt.get("split") or {}
+    if not split.get("valid"):
+        raise ValueError(f"{ckpt_path} has no embedded split to reuse (it predates split recording)")
+    return split
+
+
 class HerbariumData:
     """
     Loads one or more (specsin_csv, image_dir) source pairs and combines them
@@ -172,7 +183,7 @@ class HerbariumData:
                  sparse_threshold: int = 5, train_val_split: float = 0.2, seed: int = 42,
                  max_per_class: int = 0, class_weight_beta: float = 0.0,
                  split_seed: int | None = None, check_images: bool = True,
-                 test_split: float = 0.0):
+                 test_split: float = 0.0, split_from: dict | None = None):
         # `seed` drives initialisation and data order; `split_seed` decides WHICH
         # specimens land in train vs held-out. They default to the same value, so
         # every existing invocation — and every checkpoint written before this
@@ -390,10 +401,29 @@ class HerbariumData:
             combined = combined.reset_index(drop=True)
             df_test = df_test.reset_index(drop=True)
 
-        df_train, df_valid = train_test_split(
-            combined, test_size=train_val_split,
-            stratify=combined[index_col], random_state=split_seed
-        )
+        if split_from:
+            # Reuse another run's train/held-out assignment (--split-from), so two runs
+            # that differ in which rows survive filtering are still scored on the same
+            # specimens. A fresh stratified split over a different set of rows moves
+            # most specimens to the other side, and the older model then gets scored
+            # on sheets it trained on.
+            if df_test is not None:
+                raise ValueError("--split-from cannot be combined with --test-split")
+            names = combined["abs_path"].map(lambda p_: Path(p_).name)
+            tr, va = set(split_from.get("train", [])), set(split_from.get("valid", []))
+            df_train, df_valid = combined[names.isin(tr)], combined[names.isin(va)]
+            unseen = int((~names.isin(tr | va)).sum())
+            print(f"  Split reused from checkpoint: {len(df_train):,} train / {len(df_valid):,} "
+                  f"held-out ({len(tr) - len(df_train):,} / {len(va) - len(df_valid):,} of its "
+                  f"specimens no longer pass the filters)")
+            if unseen:
+                print(f"  [warn] {unseen:,} specimens are in neither side of that split "
+                      f"(new since it was made) — left out of this run")
+        else:
+            df_train, df_valid = train_test_split(
+                combined, test_size=train_val_split,
+                stratify=combined[index_col], random_state=split_seed
+            )
         self.train_files  = list(df_train["abs_path"])
         self.valid_files  = list(df_valid["abs_path"])
         self.train_labels = [self.namesdict[n] for n in df_train[index_col]]
@@ -1528,6 +1558,7 @@ def train(config: dict):
         class_weight_beta=config.get("class_weight_beta", 0.0),
         check_images=config.get("check_images", True),
         test_split=config.get("test_split", 0.0),
+        split_from=_load_split(config.get("split_from")),
     )
     config["num_classes"] = data.num_classes
 
@@ -2048,6 +2079,7 @@ def train(config: dict):
 DEFAULT_CONFIG = dict(
     seed=42,
     split_seed=None,      # None → follow --seed (previous behaviour)
+    split_from=None,      # checkpoint whose embedded train/held-out split to reuse
     train_val_split=0.2,
     sparse_threshold=5,
     model_name="vit_large_patch16_dinov3.lvd1689m",
@@ -2125,6 +2157,11 @@ def parse_args():
                         "subsample). Defaults to --seed. Pin it across runs to vary "
                         "only the starting weights while every run is scored on the "
                         "same held-out specimens.")
+    p.add_argument("--split-from", default=None, metavar="CKPT",
+                   help="Reuse the train/held-out split embedded in this checkpoint instead of "
+                        "drawing a new one. For comparing runs whose filters differ (e.g. after "
+                        "score_material.py): both are then scored on the same specimens, minus "
+                        "any the new filters drop.")
     p.add_argument("--sparse-threshold", type=int, default=DEFAULT_CONFIG["sparse_threshold"])
     p.add_argument("--class-weight-beta", type=float,
                    default=DEFAULT_CONFIG["class_weight_beta"], metavar="BETA",
@@ -2280,6 +2317,7 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         seed=args.seed,
         split_seed=args.split_seed,
+        split_from=args.split_from,
         sparse_threshold=args.sparse_threshold,
         class_weight_beta=args.class_weight_beta,
         aum=args.aum,
