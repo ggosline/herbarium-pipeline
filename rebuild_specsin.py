@@ -20,6 +20,7 @@ SPECSIN_COLS = [
     "institutionID", "institutionCode", "countryCode",
     "decimalLatitude", "decimalLongitude", "coordinateUncertaintyInMeters",
     "gbifID", "indet", "fname", "hasfile", "sparse", "outlier", "invalid",
+    "tissue_frac", "low_material",
 ]
 
 # Column indices (1-based) found in occurrence.txt

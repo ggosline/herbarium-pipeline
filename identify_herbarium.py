@@ -285,7 +285,7 @@ def derive_class_counts(df_all: pd.DataFrame, nameslist: list[str]) -> list[int]
     d = df_all
     if "indet" in d.columns:
         d = d[~d["indet"].astype(str).str.lower().isin(("true", "1"))]
-    for col in ("outlier", "invalid"):
+    for col in ("outlier", "invalid", "low_material"):
         if col in d.columns:
             d = d[~d[col].astype(str).str.lower().isin(("true", "1"))]
 
@@ -717,6 +717,11 @@ def run_inference(
 # Sorting helpers
 # ---------------------------------------------------------------------------
 
+def _is_low_material(row) -> bool:
+    """score_material.py's flag: too little plant on the sheet to identify."""
+    return str(getattr(row, "low_material", "")).lower() in ("true", "1")
+
+
 def copy_image(src: Path, dst_dir: Path) -> None:
     dst_dir.mkdir(parents=True, exist_ok=True)
     dst = dst_dir / src.name
@@ -1009,6 +1014,7 @@ def identify(args):
                 "confidence":     round(probs_k[0], 4),
                 "indet":          True,
                 "flagged":        False,
+                "low_material":   _is_low_material(row),
                 **_topk_columns(preds_k, probs_k),
                 **_genus_topk_columns(gi, gp),
             }
@@ -1049,7 +1055,8 @@ def identify(args):
                 true_at_rank = true_species
             mismatch = (pred_name != true_at_rank) and (conf >= args.threshold)
             low_conf = conf < args.low_conf_threshold if args.low_conf_threshold > 0 else False
-            flagged  = mismatch or low_conf
+            low_material = _is_low_material(row)
+            flagged  = (mismatch or low_conf) and not low_material
 
             if flagged:
                 flagged_count += 1
@@ -1071,6 +1078,7 @@ def identify(args):
                 "confidence":     round(conf, 4),
                 "indet":          False,
                 "flagged":        flagged,
+                "low_material":   low_material,
                 **_topk_columns(preds_k, probs_k),
                 **_genus_topk_columns(gi, gp),
             }
@@ -1114,6 +1122,10 @@ def identify(args):
         print(f"  Total processed : {len(results_df):,}")
         print(f"  Indets sorted   : {results_df['indet'].sum():,}")
         print(f"  Flagged (uncertain/misID): {results_df['flagged'].sum():,}")
+        n_low = int(results_df["low_material"].sum()) if "low_material" in results_df else 0
+        if n_low:
+            print(f"  Low material    : {n_low:,} (too little plant to identify reliably; "
+                  f"see low_material=True — not counted as flagged)")
         print(f"  Mean confidence : {results_df['confidence'].mean():.3f}")
 
 

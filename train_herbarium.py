@@ -195,7 +195,7 @@ class HerbariumData:
         for specsin_path, img_dir in sources:
             df = pd.read_csv(specsin_path)
             mask = ~df["indet"].fillna(False).astype(bool) & df["hasfile"].fillna(False).astype(bool)
-            for col in ("outlier", "invalid"):
+            for col in ("outlier", "invalid", "low_material"):
                 if col in df.columns:
                     mask &= ~df[col].fillna(False).astype(bool)
             available = keep_cols | ({"family"} if "family" in df.columns else set())

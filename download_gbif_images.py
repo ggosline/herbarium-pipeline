@@ -229,6 +229,7 @@ SPECSIN_COLS = [
     "decimalLatitude", "decimalLongitude", "coordinateUncertaintyInMeters",
     "gbifID", "image_url",
     "indet", "fname", "hasfile", "sparse", "outlier", "invalid",
+    "tissue_frac", "low_material",
 ]
 
 VALID_CONTINENTS = {

@@ -273,7 +273,7 @@ def main():
     for csv_p, img_d in sources:
         df = pd.read_csv(csv_p, low_memory=False)
         m = df["hasfile"].fillna(False).astype(bool)
-        for col in ("outlier", "invalid"):
+        for col in ("outlier", "invalid", "low_material"):
             if col in df.columns:
                 m &= ~df[col].fillna(False).astype(bool)
         df = df.loc[m].copy()
