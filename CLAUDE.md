@@ -46,7 +46,7 @@ The application exposes a browser-based web UI built with NiceGUI that lets user
 - Core: catalogNumber, species, family, genus, verbatimName, institutionCode, countryCode
 - Coordinates: decimalLatitude, decimalLongitude, coordinateUncertaintyInMeters
 - Tracking: gbifID, image_url, indet (unknown species), fname, hasfile, sparse (< 5 images), outlier, invalid
-- Material: tissue_frac (share of the visible sheet that is plant tissue), low_material (tissue_frac below the cutoff) — written by `score_material.py`. Training skips low_material rows like invalid ones; identify still predicts them but marks them and does not count them as flagged. It is an AREA score calibrated for broad-leaved woody plants (Diospyros: 5.8% with the ViT-L checkpoint) — a complete sedge or small herb also scores low, so recheck the cutoff per group and per model.
+- Material: tissue_frac (share of the visible sheet that is plant tissue), low_material (tissue_frac below the cutoff) — written by `score_material.py`. Training keeps low_material sheets but never holds them out (so validation accuracy, checkpoint selection and calibration ignore them; `--exclude-low-material` drops them instead — on Diospyros that gained nothing and cost top-5 on sticks); identify still predicts them but marks them and does not count them as flagged. `--split-from CKPT` reuses a checkpoint's train/held-out split for comparisons whose filters differ. It is an AREA score calibrated for broad-leaved woody plants (Diospyros: 5.8% with the ViT-L checkpoint) — a complete sedge or small herb also scores low, so recheck the cutoff per group and per model.
 
 Updated incrementally during Download (new rows), Filter (hasfile, rejected flags), and Identify (predictions added).
 

@@ -5,9 +5,11 @@ that carry too little to identify ("just a stick").
     tissue_frac   share of the visible sheet covered by plant tissue
     low_material  tissue_frac < --cutoff
 
-Training skips low_material rows the way it skips invalid ones, so they also drop
-out of the held-out split; identify still predicts them but marks them. On Diospyros
-the 2% of sheets under 5.8% were identified at 0.71 against 0.93 for the rest.
+Training keeps low_material sheets but never holds them out, so validation accuracy,
+checkpoint selection and calibration ignore them (--exclude-low-material drops them
+instead); identify still predicts them but marks them. On Diospyros the sheets under
+5.8% were identified at 0.71 against 0.93 for the rest, and retraining without them
+gained nothing on normal sheets while dropping top-5 on sticks from 0.95 to 0.80.
 
 How a sheet is scored (both steps are needed):
   1. Specimen region. PC1 of the model's patch tokens is a foreground axis: it

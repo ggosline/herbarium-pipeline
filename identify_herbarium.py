@@ -285,7 +285,7 @@ def derive_class_counts(df_all: pd.DataFrame, nameslist: list[str]) -> list[int]
     d = df_all
     if "indet" in d.columns:
         d = d[~d["indet"].astype(str).str.lower().isin(("true", "1"))]
-    for col in ("outlier", "invalid", "low_material"):
+    for col in ("outlier", "invalid"):
         if col in d.columns:
             d = d[~d[col].astype(str).str.lower().isin(("true", "1"))]
 

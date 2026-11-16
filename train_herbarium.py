@@ -183,7 +183,8 @@ class HerbariumData:
                  sparse_threshold: int = 5, train_val_split: float = 0.2, seed: int = 42,
                  max_per_class: int = 0, class_weight_beta: float = 0.0,
                  split_seed: int | None = None, check_images: bool = True,
-                 test_split: float = 0.0, split_from: dict | None = None):
+                 test_split: float = 0.0, split_from: dict | None = None,
+                 exclude_low_material: bool = False):
         # `seed` drives initialisation and data order; `split_seed` decides WHICH
         # specimens land in train vs held-out. They default to the same value, so
         # every existing invocation — and every checkpoint written before this
@@ -206,11 +207,14 @@ class HerbariumData:
         for specsin_path, img_dir in sources:
             df = pd.read_csv(specsin_path)
             mask = ~df["indet"].fillna(False).astype(bool) & df["hasfile"].fillna(False).astype(bool)
-            for col in ("outlier", "invalid", "low_material"):
+            for col in ("outlier", "invalid"):
                 if col in df.columns:
                     mask &= ~df[col].fillna(False).astype(bool)
+            if exclude_low_material and "low_material" in df.columns:
+                mask &= ~df["low_material"].fillna(False).astype(bool)
             available = keep_cols | ({"family"} if "family" in df.columns else set())
             available |= coord_cols & set(df.columns)
+            available |= {"low_material"} & set(df.columns)
             df = df.loc[mask, list(available)].copy()
             df["abs_path"] = df["fname"].apply(lambda f: str(img_dir / f))
             defects = _scan_images(list(df["abs_path"]), check_headers=check_images)
@@ -387,6 +391,26 @@ class HerbariumData:
         # held-out specimens and are directly comparable.
         df_test = None
         n_all = len(combined)          # before the test set is carved off
+
+        # Sheets with too little plant to identify (low_material, from
+        # score_material.py) are trained on but never held out. Retraining Diospyros
+        # without them gained nothing on normal sheets and dropped top-5 on sticks
+        # from 0.95 to 0.80, so the model keeps learning from them; but in the held-
+        # out set they would only drag down the accuracy that checkpoint selection,
+        # early stopping and the calibration temperature all read, and identify flags
+        # them rather than trusting the guess. --exclude-low-material drops them.
+        low = (combined["low_material"].fillna(False).astype(bool)
+               if "low_material" in combined.columns else pd.Series(False, index=combined.index))
+        train_only = combined[low]
+        combined = combined[~low]
+        # A class left with fewer than 2 usable sheets cannot be stratified; it trains.
+        thin = combined[index_col].map(combined[index_col].value_counts()) < 2
+        if len(train_only) and thin.any():
+            train_only = pd.concat([train_only, combined[thin]])
+            combined = combined[~thin]
+        if len(train_only):
+            print(f"  low_material: {int(low.sum()):,} sheets go to training only, never held out"
+                  + (f" (+{int(thin.sum())} sole usable sheets of their class)" if thin.any() else ""))
         if test_split and test_split > 0:
             try:
                 combined, df_test = train_test_split(
@@ -413,9 +437,13 @@ class HerbariumData:
             tr, va = set(split_from.get("train", [])), set(split_from.get("valid", []))
             df_train, df_valid = combined[names.isin(tr)], combined[names.isin(va)]
             unseen = int((~names.isin(tr | va)).sum())
+            # sticks from either side of the old split train; new ones stay out with the rest
+            only_names = train_only["abs_path"].map(lambda p_: Path(p_).name)
+            unseen += int((~only_names.isin(tr | va)).sum())
+            train_only = train_only[only_names.isin(tr | va)]
             print(f"  Split reused from checkpoint: {len(df_train):,} train / {len(df_valid):,} "
                   f"held-out ({len(tr) - len(df_train):,} / {len(va) - len(df_valid):,} of its "
-                  f"specimens no longer pass the filters)")
+                  f"specimens are filtered out or now train-only as low_material)")
             if unseen:
                 print(f"  [warn] {unseen:,} specimens are in neither side of that split "
                       f"(new since it was made) — left out of this run")
@@ -424,6 +452,7 @@ class HerbariumData:
                 combined, test_size=train_val_split,
                 stratify=combined[index_col], random_state=split_seed
             )
+        df_train = pd.concat([df_train, train_only])
         self.train_files  = list(df_train["abs_path"])
         self.valid_files  = list(df_valid["abs_path"])
         self.train_labels = [self.namesdict[n] for n in df_train[index_col]]
@@ -1559,6 +1588,7 @@ def train(config: dict):
         check_images=config.get("check_images", True),
         test_split=config.get("test_split", 0.0),
         split_from=_load_split(config.get("split_from")),
+        exclude_low_material=config.get("exclude_low_material", False),
     )
     config["num_classes"] = data.num_classes
 
@@ -2080,6 +2110,7 @@ DEFAULT_CONFIG = dict(
     seed=42,
     split_seed=None,      # None → follow --seed (previous behaviour)
     split_from=None,      # checkpoint whose embedded train/held-out split to reuse
+    exclude_low_material=False,  # True drops low_material sheets; default trains on them, never holds them out
     train_val_split=0.2,
     sparse_threshold=5,
     model_name="vit_large_patch16_dinov3.lvd1689m",
@@ -2162,6 +2193,11 @@ def parse_args():
                         "drawing a new one. For comparing runs whose filters differ (e.g. after "
                         "score_material.py): both are then scored on the same specimens, minus "
                         "any the new filters drop.")
+    p.add_argument("--exclude-low-material", action="store_true",
+                   help="Drop sheets flagged low_material by score_material.py from training. "
+                        "By default they are trained on but never held out, so validation "
+                        "accuracy, checkpoint selection and calibration ignore them. On "
+                        "Diospyros dropping them gained nothing and cost top-5 on sticks.")
     p.add_argument("--sparse-threshold", type=int, default=DEFAULT_CONFIG["sparse_threshold"])
     p.add_argument("--class-weight-beta", type=float,
                    default=DEFAULT_CONFIG["class_weight_beta"], metavar="BETA",
@@ -2318,6 +2354,7 @@ if __name__ == "__main__":
         seed=args.seed,
         split_seed=args.split_seed,
         split_from=args.split_from,
+        exclude_low_material=args.exclude_low_material,
         sparse_threshold=args.sparse_threshold,
         class_weight_beta=args.class_weight_beta,
         aum=args.aum,
