@@ -1727,6 +1727,18 @@ def train(config: dict):
     do_stage1    = stage1_epochs > 0 and not resume
 
     lit = LitHerbarium(model, data, config)
+    if config.get("init_from"):
+        # Start from another run's BACKBONE (e.g. a broad all-families model) in
+        # place of the generic pretrained weights. Heads are dropped by name, not
+        # left to the shape filter: two runs with the same class count would
+        # otherwise inherit a head for the wrong classes. Stage 1 still runs and
+        # fits the new head on the frozen, already herbarium-adapted backbone.
+        print(f"Initialising backbone from {config['init_from']}")
+        init_sd = torch.load(config["init_from"], map_location="cpu", weights_only=False)["state_dict"]
+        init_sd = {k: v for k, v in init_sd.items()
+                   if not any(part == "head" or part.startswith(("head_", "geo_mlp"))
+                              for part in k.split("."))}
+        _load_compatible_state_dict(lit, init_sd)
 
     # ── Stage 1: frozen backbone ──────────────────────────────────────────────
     # Run as a separate trainer.fit() so that stage 2 gets its own fresh DDP
@@ -2136,6 +2148,7 @@ DEFAULT_CONFIG = dict(
     wandb_run_name="herbarium_run",
     no_wandb=False,
     resume=None,
+    init_from=None,       # checkpoint whose backbone replaces the pretrained weights
     max_per_class=0,
     class_weight_beta=0.0,
     check_images=True,           # pre-flight header scan; one bad file kills a run
@@ -2238,6 +2251,10 @@ def parse_args():
     p.add_argument("--wandb-project", default=None)
     p.add_argument("--wandb-run-name", default=DEFAULT_CONFIG["wandb_run_name"])
     p.add_argument("--no-wandb", action="store_true")
+    p.add_argument("--init-from", default=None, metavar="CKPT",
+                   help="Initialise the backbone from another run's checkpoint (same --model) "
+                        "instead of the generic pretrained weights, e.g. fine-tune a genus from "
+                        "an all-families model. The head is not reused; both stages run as usual.")
     p.add_argument("--resume", default=None, metavar="CKPT",
                    help="Resume from checkpoint (stage 2)")
     p.add_argument("--reset-optimizer", action="store_true",
@@ -2366,6 +2383,7 @@ if __name__ == "__main__":
         wandb_run_name=args.wandb_run_name,
         no_wandb=args.no_wandb,
         resume=args.resume,
+        init_from=args.init_from,
         reset_optimizer=args.reset_optimizer,
         compile_model=not args.no_compile,
         grad_checkpoint=not args.no_grad_checkpoint,
